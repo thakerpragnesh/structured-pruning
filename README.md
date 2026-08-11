@@ -82,7 +82,7 @@ and how much of the network is pruned, and will not be identical across runs.
 | `saliency.py` — Max-k/L1/L2/random | Unit-tested, 16/16 passing |
 | `surgery.py` — Conv/BN/FFN structural surgery | Unit-tested, verified against a real HF BERT forward pass |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
-| `experiments/01` VGG-CIFAR10 sweep | Pipeline verified in `--smoke`; full run not yet executed on real data |
+| `experiments/01` VGG-CIFAR10 sweep | `--tiny-check` runs the real `torchvision.models.vgg16` class through real `prune_vgg_layer`/`prune_conv_bn` calls end to end (verified, ~3-4 min on CPU); full run (real CIFAR-10 + ImageNet weights) not yet executed |
 | `experiments/02` BERT FFN sweep | Pipeline verified in `--smoke` against real `transformers` model classes; full run not yet executed |
 | `experiments/03` head redundancy | Pipeline verified in `--smoke`; full run needs a fine-tuned checkpoint |
 | `experiments/05` ordering | Scoring-perturbation mechanism verified; full accuracy-drop reproduction not yet run |

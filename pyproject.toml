@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 transformer-experiments = ["transformers>=4.30"]
+vision-experiments = ["torchvision>=0.15"]
 dev = ["pytest>=7.0"]
 
 [project.urls]
