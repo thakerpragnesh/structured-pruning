@@ -471,3 +471,148 @@ there predates even `pruning_framwork_v4` by over a year, further confirming the
   repository" for each).
 
 No findings from the original pass were contradicted or need correction.
+
+---
+
+## 11. Addendum 2 — complete function-by-function read of pruning_framwork_v4
+
+Sections 4–5 above verified D1–D7 by reading the specific functions already
+implicated. This addendum is the result of actually reading all 13 `.py`
+files in `pruning_framwork_v4` in full — every function, not just the ones
+already flagged. It changes the conclusion from "the shared scoring
+functions have bugs" to "none of the five essentially-complete pruning
+pipelines in this repository could have run to completion and produced a
+valid result."
+
+### A systemic bug shared by all six driver scripts
+
+Every `compute_mask` callback (in `channel_pruning_saliency.py`,
+`channel_pruning_distance.py`, `kernel_pruning_similarites.py`, and all three
+`vgg_*.py` variants) decides what to prune by indexing `new_list[layer_number - st]`
+— `layer_number` is meant to track which of the 13 conv layers is currently
+being processed. The line that would update it, `layer_number = st + i`, is
+**commented out in every single one of the six files**:
+
+```
+channel_pruning_distance.py:129:      # layer_number =st+i
+channel_pruning_saliency.py:203:      # layer_number =st+i
+kernel_pruning_similarites.py:123:    # layer_number =st+i
+vgg_channel_pruning_dist.py:116:      # layer_number =st+i
+vgg_channel_pruning_saliency.py:148:  # layer_number =st+i
+vgg_kernel_pruning_dist.py:162:       # layer_number =st+i
+```
+
+`layer_number` is initialized to 0 and never changes for the life of the
+program. Every masking decision across a 13-layer VGG16 is therefore made
+against the candidate-pruning list computed for whichever layer happened to
+be active when `new_list` was last assigned — not the layer actually being
+masked.
+
+### Per-file findings, from "most complete-looking" to "most obviously incomplete"
+
+**`channel_pruning_saliency.py`** — the most complete-looking pipeline in
+the repo (loads data, scores, masks, retrains, saves). The line that would
+actually zero a channel is commented out:
+
+```python
+def compute_mask(self, t, default_mask):
+    mask = default_mask.clone()
+    i = layer_number - layer_base
+    for j in range(len(new_list[i])):
+        k = new_list[i][j][0]
+        print("value of k is:", k)
+        #mask[k] =0                      # <-- commented out
+        break
+    return mask
+```
+
+It prints the channel index and returns the mask unchanged. Stacked on top
+of D1 (wrong score) and the `layer_number` bug above, this script — if run
+to completion — would train and save a model that was never actually pruned
+at all, while the surrounding bookkeeping (feature list shrinking, a smaller
+`temp_model` being constructed, weights being copied into it via the D6-buggy
+`deep_model_copy_channelwise`) proceeds as if it had been.
+
+**`channel_pruning_distance.py`** — structurally complete, but its scoring
+call (`fp.compute_distance_score_channel`) is D5, which raises `IndexError`
+on the first invocation. Never reaches masking or training.
+
+**`kernel_pruning_similarites.py`** — its scoring function
+(`compute_distance_score_kernel`) is one of the only functions in the entire
+repository that reads as correct on inspection (proper indexed assignment
+into `module_buffer`, not the rebinding mistake D5 makes). Doesn't matter:
+the driver loop hits
+
+```python
+temp_model = copy.d
+```
+
+— `copy` is imported, but has no attribute `d`. Reads like an edit that was
+started (`copy.deepcopy(...)`, presumably) and never finished. Crashes
+before completing a single iteration.
+
+**`kernel_pruning_saliency.py` and `vgg_kernel_pruning_saliency.py`** —
+kernel-level saliency pruning was never implemented. Both files' core
+function is a literal placeholder:
+
+```python
+def compute_conv_layer_saliency_kernel_pruning(module_candidate_convolution, block_list_l, block_id, k=1):
+    return module_candidate_convolution + block_list_l + block_id + k
+    # replace the demo code above
+```
+
+Adding a module object, a list, and two ints — this raises `TypeError` the
+moment it's called, and neither file ever calls it or defines a full driver
+loop. `KernelPruningSaliency.compute_mask` in the kernel version just does
+`return 0`; if a raw `0` were ever actually used as a mask against a real
+weight tensor, broadcasting would zero the *entire* layer, not selectively
+prune it.
+
+**`vgg_channel_pruning_saliency.py`** — calls
+`fp.compute_saliency_score_channel(..., k=prune_count[lno])`. The real
+function's parameter is `prune_amount`, not `k` — `TypeError` on first call.
+The file also never invokes its own pruning function or defines a training
+loop; it initializes state and stops.
+
+**`vgg_kernel_pruning_dist.py`** — has two `compute_mask` implementations in
+one file. The second, on an unused class (`ChannelPruningSaliency`), is just
+`return` (returns `None`) — dead code, never applied to anything. The live
+path's `deep_copy` function reproduces D7's exact off-by-one
+(`fin_new = fin_org` then incremented before first use).
+
+### Two additional dead-code bugs (found, but never actually exercised)
+
+- `facilitate_pruning.py::compute_saliency_score_kernel` indexes
+  `kernel_list_saliency[prune_amount]` instead of `[kl]` during its list-fill
+  phase — raises `IndexError` the moment it's called. Confirmed via
+  `grep` that nothing in the repository calls this function.
+- `initialize_pruning.py`'s `vgg11`/`vgg13`/`vgg16`/`vgg19` module-level
+  constants all have a trailing comma, making each a 1-tuple containing a
+  list rather than the list itself. `get_feature_list()`, the only function
+  that returns them, is likewise never called anywhere — every driver script
+  uses `create_feature_list(new_model)` (a different, correctly-implemented
+  function) instead.
+
+### A training-loop bug that would matter if any pipeline reached it
+
+`train_model.py::evaluate()` reassigns `outputs = [...]` inside its batch
+loop instead of appending to it, so it reports metrics from only the *last*
+validation batch, not the full validation set. `fit_one_cycle()` compounds
+this by calling `evaluate()` after every training batch rather than once per
+epoch — the per-epoch accuracy it eventually reports is a single batch's
+result, not an epoch average. No driver script in this repo reaches a
+correct training run for this to have visibly corrupted, but it's worth
+knowing if any of this training code is ever reused.
+
+### Conclusion
+
+Five files in this repository present as complete, end-to-end pruning
+pipelines. None of them could have run to completion and produced a valid
+pruned-and-retrained model: two crash outright (`copy.d`, the `k=` keyword
+mismatch), one silently prunes nothing while otherwise proceeding normally,
+and the two kernel-saliency files never got past a placeholder. This is a
+stronger version of section 4's conclusion, not a new one — it further
+confirms that whatever produced the smooth, plausible accuracy-drop curves
+in the published papers is not, and structurally could not have been, this
+codebase.
+
