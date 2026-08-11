@@ -11,6 +11,11 @@ repos are archived, not deleted; see `ARCHIVE_NOTICE.md` for why and where.
 A consolidated account of what was wrong with them and why this exists is in
 `GITHUB_AUDIT.md`.
 
+**Picking up this codebase for the first time?** Read `KT.md` — it maps every
+non-obvious design choice in `prunelib/` to the specific historical bug it
+prevents, and is honest about what's implemented vs. what's real code that
+just hasn't been run against real data yet.
+
 ## Install
 
 ```bash
