@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the papers below (see PUBLICATIONS.md for full BibTeX)."
+title: structured-pruning
+authors:
+  - family-names: Thaker
+    given-names: Pragnesh
+    orcid: ""
+repository-code: "https://github.com/thakerpragnesh/structured-pruning"
+license: MIT
+version: 0.1.0
+date-released: "2026-08-11"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Thaker
+      given-names: Pragnesh
+    - family-names: Mohan
+      given-names: "Biju R."
+  title: "Channel Pruning of Transfer Learning Models Using Novel Techniques"
+  journal: "IEEE Access"
+  volume: "12"
+  start: "94914"
+  end: "94925"
+  year: 2024
+  doi: "10.1109/ACCESS.2024.3416997"

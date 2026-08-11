@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev,transformer-experiments]"
+      - name: Run tests
+        run: pytest tests/ -v
+      - name: Run smoke experiments
+        run: |
+          python experiments/00_demo.py
+          python experiments/01_vgg_cifar10_sweep.py --smoke
+          python experiments/02_bert_sst2_sweep.py --smoke
+          python experiments/03_head_redundancy.py --smoke
+          python experiments/04_coactivation.py
+          python experiments/05_ordering.py --budget 0.4

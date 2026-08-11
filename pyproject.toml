@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "structured-pruning"
+version = "0.1.0"
+description = "Structured channel/FFN pruning: Max-k saliency, structural surgery, and redundancy scanning for CNNs and Transformers"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Pragnesh Thaker" }]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+transformer-experiments = ["transformers>=4.30"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/thakerpragnesh/structured-pruning"
+
+[tool.setuptools.packages.find]
+include = ["prunelib*"]
