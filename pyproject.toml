@@ -23,4 +23,4 @@ dev = ["pytest>=7.0"]
 Homepage = "https://github.com/thakerpragnesh/structured-pruning"
 
 [tool.setuptools.packages.find]
-include = ["prunelib*"]
+include = ["prunelib*", "legacy_pipeline*"]

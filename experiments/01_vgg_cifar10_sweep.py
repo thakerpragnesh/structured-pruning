@@ -7,15 +7,11 @@ drop, on CIFAR-10.
     python experiments/01_vgg_cifar10_sweep.py --tiny-check     # real torchvision VGG16 + FakeData, no downloads, seconds
     python experiments/01_vgg_cifar10_sweep.py --smoke          # fully synthetic tiny net, no torchvision needed at all
 
-Design note: the original codebase (`load_model.py` / `facilitate_pruning.py`
-in pruning_framwork_v4) rebuilt a whole new VGG from a `feature_list` on every
-pruning step and then manually copied weights channel-by-channel into it
-(`deep_model_copy_channelwise`) — that manual copy loop is where D6 and D7
-lived (a destination index that never incremented, an off-by-one before first
-use). Here there is no reconstruction step: `prunelib.prune_conv_bn` returns
-already-correctly-sized modules, and pruning a layer is just replacing that
-module in-place inside `model.features`. There is no copy loop left to have
-an off-by-one in.
+`build_vgg16` and `prune_vgg_layer` live in `prunelib.vgg` -- shared with
+`legacy_pipeline/pipeline.py`, the corrected replacement for the old
+`channel_pruning_saliency.py` / `channel_pruning_distance.py` drivers. See
+`LEGACY_PIPELINE_MIGRATION.md` for why that pipeline is a rebuild rather than
+a line-by-line bug fix of the original.
 """
 import argparse
 
@@ -23,7 +19,8 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from prunelib import compute_score, count_params, measure_latency, prune_conv_bn, select_prune_indices
+from prunelib import build_vgg16, compute_score, count_params, measure_latency, prune_conv_bn, prune_vgg_layer, select_prune_indices
+from prunelib.vgg import vgg_conv_bn_positions
 
 
 class TinyVGGBlock(nn.Module):
@@ -66,65 +63,6 @@ def run_smoke(prune_step=0.05, n_iterations=5, seed=0):
     print("fine-tuning step and no real dataset here. Run without --smoke for that.")
 
 
-def _vgg_conv_bn_positions(features: nn.Sequential):
-    """List of (conv_idx, bn_idx_or_None) for every Conv2d in a torchvision
-    VGG `.features` Sequential, in forward order."""
-    pairs = []
-    for i, layer in enumerate(features):
-        if isinstance(layer, nn.Conv2d):
-            bn_idx = i + 1 if i + 1 < len(features) and isinstance(features[i + 1], nn.BatchNorm2d) else None
-            pairs.append((i, bn_idx))
-    return pairs
-
-
-def build_vgg16(num_classes=10, pretrained=True):
-    weights = torchvision.models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None
-    model = torchvision.models.vgg16(weights=weights)
-    model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
-    return model
-
-
-def prune_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float, method: str = "max_k") -> int:
-    """Prune the `layer_position`-th conv layer of `model.features` (0-indexed
-    among conv layers). Surgery happens in place: `prunelib.prune_conv_bn`
-    returns already-correctly-sized modules, which are simply substituted
-    back into the Sequential -- no model reconstruction, no manual copy loop.
-
-    Deliberately does not support pruning the *last* conv layer: that one
-    feeds `model.classifier[0]` rather than another Conv2d, which needs its
-    `in_features` resized too. Straightforward to add, not wired up here to
-    keep this function's contract (Conv2d -> Conv2d) simple.
-    """
-    pairs = _vgg_conv_bn_positions(model.features)
-    if layer_position >= len(pairs) - 1:
-        raise ValueError(
-            f"layer_position {layer_position} is the last conv layer (or beyond); "
-            "pruning it requires also resizing model.classifier[0].in_features, "
-            "which this helper doesn't do. Use layer_position < len(pairs) - 1."
-        )
-    conv_idx, bn_idx = pairs[layer_position]
-    next_conv_idx, _ = pairs[layer_position + 1]
-
-    conv = model.features[conv_idx]
-    bn = model.features[bn_idx] if bn_idx is not None else None
-    next_conv = model.features[next_conv_idx]
-
-    n_out = conv.out_channels
-    prune_amount = max(1, int(round(n_out * prune_fraction)))
-    kwargs = {"k": 3} if method == "max_k" else {}
-    scores = compute_score(conv.weight, method=method, **kwargs)
-    prune_idx = set(select_prune_indices(scores, prune_amount).tolist())
-    keep = torch.tensor([i for i in range(n_out) if i not in prune_idx])
-
-    new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep, bn=bn, next_conv=next_conv)
-
-    model.features[conv_idx] = new_conv
-    if bn_idx is not None:
-        model.features[bn_idx] = new_bn
-    model.features[next_conv_idx] = new_next_conv
-    return len(keep)
-
-
 @torch.no_grad()
 def _evaluate(model, loader, device):
     model.eval()
@@ -163,7 +101,7 @@ def run(dataset_factory, pretrained, prune_step=0.05, accuracy_drop_threshold=0.
     for method in methods:
         model = build_vgg16(pretrained=pretrained).to(device)
         baseline_acc = _evaluate(model, test_loader, device)
-        n_prunable = len(_vgg_conv_bn_positions(model.features)) - 1  # last conv excluded, see prune_vgg_layer
+        n_prunable = len(vgg_conv_bn_positions(model.features)) - 1  # last conv excluded, see prune_vgg_layer
 
         print(f"\n=== method={method}  baseline acc={baseline_acc:.4f} ===")
         for it in range(1, max_iterations + 1):

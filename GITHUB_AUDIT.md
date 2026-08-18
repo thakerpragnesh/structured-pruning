@@ -322,24 +322,24 @@ A clean package was built to supersede the four framework repos. This is the
 repository you're reading this file from.
 
 ```
-structured-pruning/
-├── README.md, KT.md, PUBLICATIONS.md     docs — start with KT.md if you're new
-├── CITATION.cff, LICENSE (MIT)
-├── pyproject.toml, .github/workflows/tests.yml  (CI: Python 3.9-3.12)
-├── prunelib/
-│   ├── saliency.py               Max-k (correct), L1, L2, random
-│   ├── surgery.py                conv/BN/FFN structural surgery
-│   ├── scanners.py               weight distance + co-activation
-│   └── evaluate.py               params, encoder-params, measured latency
-├── experiments/
-│   ├── 00_demo.py                runs in seconds
-│   ├── 01_vgg_cifar10_sweep.py   Max3 vs L1 vs L2 vs random; --smoke / --tiny-check / full
-│   ├── 02_bert_sst2_sweep.py     FFN pruning, --smoke against real transformers classes
-│   ├── 03_head_redundancy.py     head similarity across layers
-│   ├── 04_coactivation.py        activation-based redundancy demo
-│   └── 05_ordering.py            does the CNN ordering result transfer?
-├── results/
-└── tests/                        16 tests, each naming the defect it guards
+prunelib/
+    saliency.py   Max-k (correct), L1, L2, random
+    surgery.py    conv/BN/FFN structural surgery
+    masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
+    vgg.py        VGG-specific wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
+    scanners.py   weight distance + co-activation
+    evaluate.py   params, encoder-params, measured latency
+experiments/
+    00_demo.py                  runs in seconds
+    01_vgg_cifar10_sweep.py     Max3 vs L1 vs L2 vs random; --smoke / --tiny-check / full
+    02_bert_sst2_sweep.py       FFN pruning, --smoke against real transformers classes
+    03_head_redundancy.py       head similarity across layers
+    04_coactivation.py          activation-based redundancy demo
+    05_ordering.py              does the CNN ordering result transfer?
+legacy_pipeline/                corrected replacement for the six original driver
+    config.py, data.py, model.py, train.py, pipeline.py    scripts -- see LEGACY_PIPELINE_MIGRATION.md
+results/
+└── tests/                        36 tests, each naming the defect it guards
 ```
 
 Every defect in section 5 is fixed and pinned by a test. See `KT.md` section 6 for

@@ -97,12 +97,41 @@ published, real results. The Transformer-extension experiments are new
 infrastructure — correct and tested, but not yet run against real fine-tuned
 models. Don't claim results those runs haven't produced yet.
 
+## Two-phase pruning: mask, then compress
+
+The original design intent behind the old driver scripts (confirmed
+directly, not inferred) was: mask the weights being pruned during the
+schedule, and once it's done, build a compressed model by copying the
+unmasked (surviving) weights across. `prunelib.masking` implements exactly
+that, using `torch.nn.utils.prune.custom_from_mask` instead of the
+hand-rolled `BasePruningMethod` subclasses that caused the original bugs
+(see `GITHUB_AUDIT.md` section 11 and `LEGACY_PIPELINE_MIGRATION.md`):
+
+```python
+from prunelib import mask_channels, commit_mask, compress_masked_conv_bn, select_prune_indices, compute_score
+
+# Phase 1, safe to call repeatedly across a fine-tuning schedule:
+scores = compute_score(conv.weight, method="max_k", k=3)
+mask_channels(conv, select_prune_indices(scores, n_to_prune))
+# ... fine-tune / evaluate with the mask active as many times as you like ...
+
+# Phase 2, once, when you're ready to commit:
+commit_mask(conv)
+new_conv, new_bn, new_next_conv, keep_idx = compress_masked_conv_bn(conv, bn=bn, next_conv=next_conv)
+```
+
+For a whole VGG16, `legacy_pipeline` wraps this into a complete pipeline —
+see `LEGACY_PIPELINE_MIGRATION.md` for how to run it and exactly what it
+replaces.
+
 ## Repository layout
 
 ```
 prunelib/
     saliency.py   Max-k (correct), L1, L2, random
     surgery.py    conv/BN/FFN structural surgery
+    masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
+    vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
     scanners.py   distance metrics + co-activation scanning
     evaluate.py   parameter counts + measured latency
 experiments/
@@ -112,7 +141,10 @@ experiments/
     03_head_redundancy.py       head similarity across layers
     04_coactivation.py          activation-based redundancy
     05_ordering.py              does the CNN ordering result transfer?
-tests/          16 tests, each naming the defect it guards against
+legacy_pipeline/                corrected replacement for the six original
+    config.py, data.py, model.py,   driver scripts -- see
+    train.py, pipeline.py           LEGACY_PIPELINE_MIGRATION.md
+tests/          36 tests, each naming the defect it guards against
 ```
 
 ## Citation
