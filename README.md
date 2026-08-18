@@ -1,20 +1,44 @@
 # structured-pruning
 
-Reference implementation of the channel-saliency and channel-redundancy
-methods from my Ph.D. work on structured pruning, extended from CNNs to
-Transformer FFN blocks and attention heads. Structural surgery — real
-shape reduction, not zero-masking — so a pruned model is actually smaller
-and faster on ordinary hardware.
+**For the CNN channel-pruning methods from my Ph.D. work — Max-3 saliency,
+L1/SVD/K-means criteria, hybrid multi-criterion sequencing — the canonical
+repo is [`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4).**
+That repo has all five criteria working and verified; this one only has
+Max-k/L1/L2/random. This repo's actual job is the two things below.
 
-This repository supersedes `pruning_framwork` / `_v2` / `_v3` / `_v4`. Those
-repos are archived, not deleted; see `ARCHIVE_NOTICE.md` for why and where.
-A consolidated account of what was wrong with them and why this exists is in
-`GITHUB_AUDIT.md`.
+## What this repo is for
 
-**Picking up this codebase for the first time?** Read `KT.md` — it maps every
-non-obvious design choice in `prunelib/` to the specific historical bug it
-prevents, and is honest about what's implemented vs. what's real code that
-just hasn't been run against real data yet.
+**1. Extending the same saliency and redundancy ideas to Transformers.**
+`experiments/02` through `05` and the corresponding pieces of `prunelib/`
+apply Max-k-style saliency to BERT FFN neurons, and Manhattan/Euclidean/
+Cosine distance to attention heads — the CNN methods don't have a
+Transformer equivalent anywhere else on my account. (Newer, more actively
+developed Transformer work now lives in
+[`transformer_pruning`](https://github.com/thakerpragnesh/transformer_pruning);
+this repo's Transformer experiments are the earlier version of that line
+of work.)
+
+**2. A tested reference implementation of the mask-then-compress design.**
+`prunelib/masking.py` implements the two-phase workflow — mask channels
+during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
+compress once at the end — cleanly and with a real test suite (36 tests,
+CI on every push). If you're implementing that pattern elsewhere
+(including in `pruning_framwork_v4`, which arrived at a similar design
+independently), this is a working, tested reference for it.
+
+**What's now redundant:** `legacy_pipeline/` was a corrected rebuild of
+`pruning_framwork_v4`'s original driver scripts, done in parallel with this
+package. Since then, those same scripts got fixed directly in
+`pruning_framwork_v4` itself — and more completely, since that fix added
+K-means/SVD/hybrid sequencing that `legacy_pipeline` (built on this repo's
+Max-k/L1/L2/random-only `prunelib`) never had. `legacy_pipeline/` is kept
+here for its test suite and as a record of the mask-then-compress design
+being applied to a full VGG16, not as something to run instead of
+`pruning_framwork_v4`.
+
+See `GITHUB_AUDIT.md` for the original bug-by-bug history of why this
+package was built, and `KT.md` if you're extending the code here
+specifically (the Transformer experiments or `prunelib/masking.py`).
 
 ## Install
 
