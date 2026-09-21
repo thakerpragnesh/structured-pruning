@@ -1,15 +1,20 @@
-"""Tests for legacy_pipeline -- the corrected replacement for
-channel_pruning_saliency.py / channel_pruning_distance.py / the vgg_* scaffolds."""
+"""Tests for archive/legacy_pipeline -- the corrected replacement for
+channel_pruning_saliency.py / channel_pruning_distance.py / the vgg_* scaffolds.
+
+Archived (see README.md's "What's now redundant"), not deleted: the tests
+still run in CI as a record of the mask-then-compress design applied to a
+full VGG16, even though pruning_framwork_v4 is the canonical place to run
+this pipeline for real now."""
 import csv
 
 import pytest
 import torch
 
-from legacy_pipeline.config import PruningConfig
-from legacy_pipeline.data import build_dataloaders
-from legacy_pipeline.model import freeze_all_but_classifier, get_device, load_model, unfreeze_all
-from legacy_pipeline.pipeline import run_pruning
-from legacy_pipeline.train import evaluate, fit_one_cycle
+from archive.legacy_pipeline.config import PruningConfig
+from archive.legacy_pipeline.data import build_dataloaders
+from archive.legacy_pipeline.model import freeze_all_but_classifier, get_device, load_model, unfreeze_all
+from archive.legacy_pipeline.pipeline import run_pruning
+from archive.legacy_pipeline.train import evaluate, fit_one_cycle
 from prunelib import count_params
 
 
@@ -84,7 +89,7 @@ def test_layer_number_is_not_a_shared_mutable_global():
     everywhere), so masking was always applied against layer 0's candidate
     list. There is no `layer_number` global in this module at all --
     confirm it structurally doesn't exist to be forgotten."""
-    import legacy_pipeline.pipeline as pipeline_module
+    import archive.legacy_pipeline.pipeline as pipeline_module
 
     assert not hasattr(pipeline_module, "layer_number")
 

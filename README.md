@@ -1,10 +1,14 @@
 # structured-pruning
 
-**For the CNN channel-pruning methods from my Ph.D. work — Max-3 saliency,
+**`structured-pruning` is the library-first repo for pruning modern
+(Transformer) architectures** — a pip-installable `prunelib` package plus
+tested experiments, not a config.ini-driven pipeline you edit and run in
+place. For CNN channel-pruning from my Ph.D. work — Max-3 saliency,
 L1/SVD/K-means criteria, hybrid multi-criterion sequencing — the canonical
-repo is [`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4).**
-That repo has all five criteria working and verified; this one only has
-Max-k/L1/L2/random. This repo's actual job is the two things below.
+repo is [`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4)
+instead: that repo has all five criteria working and verified, where this
+one only has Max-k/L1/L2/random. This repo's actual job is the two things
+below.
 
 ## What this repo is for
 
@@ -26,15 +30,19 @@ CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
 
-**What's now redundant:** `legacy_pipeline/` was a corrected rebuild of
-`pruning_framwork_v4`'s original driver scripts, done in parallel with this
-package. Since then, those same scripts got fixed directly in
-`pruning_framwork_v4` itself — and more completely, since that fix added
-K-means/SVD/hybrid sequencing that `legacy_pipeline` (built on this repo's
-Max-k/L1/L2/random-only `prunelib`) never had. `legacy_pipeline/` is kept
-here for its test suite and as a record of the mask-then-compress design
-being applied to a full VGG16, not as something to run instead of
-`pruning_framwork_v4`.
+**What's now redundant:** `archive/legacy_pipeline/` (moved there 2026-09-21,
+formerly `legacy_pipeline/` at the repo root — see `LEGACY_PIPELINE_MIGRATION.md`)
+was a corrected rebuild of `pruning_framwork_v4`'s original driver scripts,
+done in parallel with this package. Since then, those same scripts got fixed
+directly in `pruning_framwork_v4` itself — and more completely, since that
+fix added K-means/SVD/hybrid sequencing that `legacy_pipeline` (built on this
+repo's Max-k/L1/L2/random-only `prunelib`) never had. It moved under
+`archive/` rather than staying at the top level to make that explicit: this
+repo is `prunelib` plus the Transformer experiments first, with
+`legacy_pipeline` kept only for its test suite and as a record of the
+mask-then-compress design being applied to a full VGG16 — not as something
+to run instead of `pruning_framwork_v4`, and not part of the library's public
+surface (`from prunelib import ...` never touches it).
 
 See `GITHUB_AUDIT.md` for the original bug-by-bug history of why this
 package was built, and `KT.md` if you're extending the code here
@@ -80,6 +88,19 @@ from prunelib import prune_ffn_block
 new_fc1, new_fc2 = prune_ffn_block(fc1, fc2, keep_idx)
 ```
 
+`compute_score` also takes a Linear weight `[out_features, in_features]`
+directly (no reshaping to a fake conv tensor needed) — e.g. `compute_score(
+fc1.weight, method="max_k", k=3)`.
+
+For attention heads:
+
+```python
+from prunelib import prune_attention_heads
+new_q, new_k, new_v, new_out = prune_attention_heads(
+    query, key, value, output, keep_heads=keep_heads, num_heads=num_heads,
+)
+```
+
 For redundancy scanning (channels, attention heads, or arbitrary activation
 patterns):
 
@@ -108,8 +129,8 @@ and how much of the network is pruned, and will not be identical across runs.
 
 | Component | Status |
 |---|---|
-| `saliency.py` — Max-k/L1/L2/random | Unit-tested, 16/16 passing |
-| `surgery.py` — Conv/BN/FFN structural surgery | Unit-tested, verified against a real HF BERT forward pass |
+| `saliency.py` — Max-k/L1/L2/random, Conv2d and Linear weights | Unit-tested, 10/10 passing |
+| `surgery.py` — Conv/BN/FFN/attention-head structural surgery | Unit-tested, verified against a real HF BERT forward pass |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
 | `experiments/01` VGG-CIFAR10 sweep | `--tiny-check` runs the real `torchvision.models.vgg16` class through real `prune_vgg_layer`/`prune_conv_bn` calls end to end (verified, ~3-4 min on CPU); full run (real CIFAR-10 + ImageNet weights) not yet executed |
 | `experiments/02` BERT FFN sweep | Pipeline verified in `--smoke` against real `transformers` model classes; full run not yet executed |
@@ -144,16 +165,16 @@ commit_mask(conv)
 new_conv, new_bn, new_next_conv, keep_idx = compress_masked_conv_bn(conv, bn=bn, next_conv=next_conv)
 ```
 
-For a whole VGG16, `legacy_pipeline` wraps this into a complete pipeline —
-see `LEGACY_PIPELINE_MIGRATION.md` for how to run it and exactly what it
-replaces.
+For a whole VGG16, `archive/legacy_pipeline` wraps this into a complete
+pipeline — see `LEGACY_PIPELINE_MIGRATION.md` for how to run it and exactly
+what it replaces.
 
 ## Repository layout
 
 ```
 prunelib/
-    saliency.py   Max-k (correct), L1, L2, random
-    surgery.py    conv/BN/FFN structural surgery
+    saliency.py   Max-k (correct), L1, L2, random -- Conv2d or Linear weights
+    surgery.py    conv/BN/FFN/attention-head structural surgery
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
     scanners.py   distance metrics + co-activation scanning
@@ -165,10 +186,12 @@ experiments/
     03_head_redundancy.py       head similarity across layers
     04_coactivation.py          activation-based redundancy
     05_ordering.py              does the CNN ordering result transfer?
-legacy_pipeline/                corrected replacement for the six original
-    config.py, data.py, model.py,   driver scripts -- see
-    train.py, pipeline.py           LEGACY_PIPELINE_MIGRATION.md
-tests/          36 tests, each naming the defect it guards against
+archive/
+    legacy_pipeline/            corrected replacement for the six original
+        config.py, data.py, model.py,   driver scripts -- now redundant with
+        train.py, pipeline.py           pruning_framwork_v4, see
+                                         LEGACY_PIPELINE_MIGRATION.md
+tests/          49 tests, each naming the defect it guards against
 ```
 
 ## Citation

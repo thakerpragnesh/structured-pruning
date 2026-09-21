@@ -23,4 +23,7 @@ dev = ["pytest>=7.0"]
 Homepage = "https://github.com/thakerpragnesh/structured-pruning"
 
 [tool.setuptools.packages.find]
-include = ["prunelib*", "legacy_pipeline*"]
+# legacy_pipeline now lives under archive/ (see README.md's "What's now
+# redundant") -- "archive*" picks up the archive.legacy_pipeline subpackage
+# the same way "legacy_pipeline*" used to pick up the top-level one.
+include = ["prunelib*", "archive*"]

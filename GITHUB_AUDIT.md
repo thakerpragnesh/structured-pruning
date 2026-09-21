@@ -323,8 +323,8 @@ repository you're reading this file from.
 
 ```
 prunelib/
-    saliency.py   Max-k (correct), L1, L2, random
-    surgery.py    conv/BN/FFN structural surgery
+    saliency.py   Max-k (correct), L1, L2, random -- Conv2d or Linear weights
+    surgery.py    conv/BN/FFN/attention-head structural surgery
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     vgg.py        VGG-specific wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
     scanners.py   weight distance + co-activation
@@ -336,10 +336,13 @@ experiments/
     03_head_redundancy.py       head similarity across layers
     04_coactivation.py          activation-based redundancy demo
     05_ordering.py              does the CNN ordering result transfer?
-legacy_pipeline/                corrected replacement for the six original driver
-    config.py, data.py, model.py, train.py, pipeline.py    scripts -- see LEGACY_PIPELINE_MIGRATION.md
+archive/
+    legacy_pipeline/            corrected replacement for the six original driver
+        config.py, data.py, model.py, train.py, pipeline.py    scripts -- now
+                                 redundant with pruning_framwork_v4, see
+                                 LEGACY_PIPELINE_MIGRATION.md
 results/
-└── tests/                        36 tests, each naming the defect it guards
+└── tests/                        49 tests, each naming the defect it guards
 ```
 
 Every defect in section 5 is fixed and pinned by a test. See `KT.md` section 6 for

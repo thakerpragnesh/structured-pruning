@@ -53,8 +53,10 @@ place — see the scope note above for where things stand now.
 
 ```
 prunelib/
-    saliency.py   (124 lines)  Max-k / L1 / L2 / random scoring, single dispatch
-    surgery.py    (127 lines)  Conv/BN/FFN structural surgery (in-place substitution)
+    saliency.py   (149 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
+                               Conv2d or Linear weights
+    surgery.py    (216 lines)  Conv/BN/FFN/attention-head structural surgery
+                               (in-place substitution)
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     vgg.py        VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
     scanners.py   (70 lines)   Distance metrics + co-activation scanning
@@ -66,12 +68,14 @@ experiments/
     03_head_redundancy.py      (63 lines)  attention head distance scan
     04_coactivation.py         (44 lines)  synthetic co-activation demo
     05_ordering.py             (69 lines)  does the CNN ordering result transfer?
-legacy_pipeline/            corrected rebuild of pruning_framwork_v4's original
-    config.py, data.py,     driver scripts. Superseded by direct fixes to that
-    model.py, train.py,     repo (which has more complete method coverage) --
-    pipeline.py             kept here as a tested mask-then-compress example,
-                             not a live alternative. See LEGACY_PIPELINE_MIGRATION.md.
-tests/          36 tests across 6 files, one per historical defect or behavior
+archive/
+    legacy_pipeline/        corrected rebuild of pruning_framwork_v4's original
+        config.py, data.py, driver scripts. Superseded by direct fixes to that
+        model.py, train.py, repo (which has more complete method coverage) --
+        pipeline.py         kept here as a tested mask-then-compress example,
+                             not a live alternative. Moved under archive/
+                             2026-09-21. See LEGACY_PIPELINE_MIGRATION.md.
+tests/          49 tests across 6 files, one per historical defect or behavior
 ```
 
 Total: ~2,000 lines. Small on purpose — every module does one thing.
@@ -174,16 +178,20 @@ Both `prune_vgg_layer` and `mask_vgg_layer` refuse to touch the *last*
 conv layer (it feeds `classifier[0]`, a `Linear`, not another `Conv2d` —
 see section 6).
 
-### `legacy_pipeline/`
+### `archive/legacy_pipeline/`
 
-A corrected rebuild of `pruning_framwork_v4`'s original six driver
-scripts, done in parallel with this package, before those scripts got
-fixed directly in that repo. **Now superseded**: `pruning_framwork_v4`'s
-own fix has more complete method coverage (K-means, SVD, hybrid
-sequencing) than `legacy_pipeline` does, since `legacy_pipeline` is built
-on this package's `prunelib` (Max-k/L1/L2/random only). Don't extend
-`legacy_pipeline` to add parity with `pruning_framwork_v4` — that work
-belongs in `pruning_framwork_v4` itself. What's still worth reading here:
+Moved under `archive/` 2026-09-21 (was `legacy_pipeline/` at the repo root;
+import as `archive.legacy_pipeline`) to make explicit that this package is
+`prunelib` plus the Transformer experiments first, not a pipeline you run in
+place — see README.md's opening line. A corrected rebuild of
+`pruning_framwork_v4`'s original six driver scripts, done in parallel with
+this package, before those scripts got fixed directly in that repo. **Now
+superseded**: `pruning_framwork_v4`'s own fix has more complete method
+coverage (K-means, SVD, hybrid sequencing) than `legacy_pipeline` does, since
+`legacy_pipeline` is built on this package's `prunelib` (Max-k/L1/L2/random
+only). Don't extend `legacy_pipeline` to add parity with
+`pruning_framwork_v4` — that work belongs in `pruning_framwork_v4` itself.
+What's still worth reading here:
 `pipeline.py::run_pruning` is a complete, tested example of the
 mask-then-compress workflow applied to a whole VGG16 end to end (mask
 every prunable layer per iteration → fine-tune → evaluate → repeat →
@@ -264,9 +272,9 @@ defect-named test even if you refactor the code it guards, unless you're
 certain the refactor makes the bug class structurally impossible (as, e.g.,
 switching to `torch.topk` made D2 impossible to reintroduce even accidentally).
 
-Run everything: `PYTHONPATH=. pytest tests/ -v` (36 tests; the full suite
-including the `legacy_pipeline` end-to-end tests takes a few minutes since
-those actually train a tiny VGG16 — the pure-`prunelib` tests alone are
+Run everything: `PYTHONPATH=. pytest tests/ -v` (49 tests; the full suite
+including the `archive/legacy_pipeline` end-to-end tests takes a few minutes
+since those actually train a tiny VGG16 — the pure-`prunelib` tests alone are
 still ~2s).
 
 ## 6. Known gaps — read this before claiming something works
@@ -294,19 +302,17 @@ correct public implementation. Current state, honestly:
 - **`experiments/02` and `03` are the same situation** — real
   `transformers` model classes, verified in `--smoke`, never run against a
   real fine-tuned checkpoint or real SST-2 data.
-- **FFN saliency scoring is a reshape hack, not a first-class API.**
-  `experiments/02_bert_sst2_sweep.py::_score_ffn_neurons` reshapes a
-  Linear layer's weight into a fake `[out, in, 1, 1]` conv tensor so it can
-  reuse `compute_score`. It works (k=3 on a 1-element kernel just returns
-  that element, so Max-k degenerates sensibly to something close to
-  magnitude-based selection) but it's a workaround. If FFN/attention-head
-  pruning becomes a real focus, `saliency.py` should grow a native
-  `Linear`-shaped scoring path instead of every experiment reshaping around
-  the conv-shaped one.
-- **No attention-head *pruning* surgery exists**, only distance-based
-  *detection* (`experiments/03`). There's no equivalent of `prune_conv_bn`
-  for physically removing an attention head (which touches Q/K/V and the
-  output projection simultaneously — more moving parts than an FFN block).
+- ~~**FFN saliency scoring is a reshape hack, not a first-class API.**~~
+  **Fixed 2026-09-21.** `saliency.py`'s scorers now accept a 2D Linear weight
+  `[out_features, in_features]` natively (via `_channel_view`), alongside the
+  original 4D Conv2d shape. `experiments/02_bert_sst2_sweep.py::_score_ffn_neurons`
+  no longer reshapes around it.
+- ~~**No attention-head *pruning* surgery exists**~~ **Fixed 2026-09-21.**
+  `surgery.py` now has `prune_attention_heads`, the equivalent of
+  `prune_conv_bn` for a multi-head attention block (touches Q/K/V rows and
+  the output projection's columns simultaneously). `experiments/03` still
+  only *detects* redundancy (distance-based); wiring detected pairs into
+  `prune_attention_heads` calls is still open.
 - **`CoActivationScanner`'s 0.9 firing-rate ceiling is a design choice, not
   a validated threshold.** Only tested against hand-constructed synthetic
   masks so far.
@@ -319,12 +325,14 @@ correct public implementation. Current state, honestly:
   a test in `tests/test_saliency.py` following the existing pattern
   (independent brute-force comparison where feasible, like
   `test_d2_matches_bruteforce_topk`).
-- **New surgery type** (e.g. attention-head removal): add to `surgery.py`,
-  validate the seam and raise before mutating anything (follow
-  `prune_ffn_block`'s pattern exactly), add a test that checks *values*
-  survive correctly post-surgery, not just shapes (see
+- **New surgery type** (`prune_attention_heads` is the worked example now):
+  add to `surgery.py`, validate the seam and raise before mutating anything
+  (follow `prune_ffn_block`'s pattern exactly), add a test that checks
+  *values* survive correctly post-surgery, not just shapes (see
   `test_d6_conv_values_are_correct_not_just_shape` for why shape-only tests
-  aren't enough — that's literally how D6 shipped originally).
+  aren't enough — that's literally how D6 shipped originally), and where
+  feasible verify against a real HF model forward pass, not just plain
+  `nn.Linear` (see `test_prune_attention_heads_against_a_real_hf_bert_model`).
 - **New experiment**: follow the three-tier `--smoke` / `--tiny-check` /
   full pattern from section 4. Add the `--smoke` invocation to
   `.github/workflows/tests.yml` so CI actually exercises it.
@@ -334,12 +342,14 @@ correct public implementation. Current state, honestly:
   this package's `prunelib`. Adding one here would create a second,
   divergent implementation of the same idea — see the scope note at the
   top of section 1.
-- **Transformer-extension work** (new attention-head surgery, FFN scoring
-  that isn't a reshape hack, validating `CoActivationScanner`'s threshold
-  against real activations) is this repo's actual remaining job — see the
-  gaps list in section 6 for what's still open there. Also check
-  `transformer_pruning` first, since it's the newer, more actively
-  developed line of the same work; avoid duplicating effort across both.
+- **Transformer-extension work** (wiring `experiments/03`'s detected
+  redundant-head pairs into actual `prune_attention_heads` calls, deciding
+  a real criterion rather than raw query-weight distance, validating
+  `CoActivationScanner`'s threshold against real activations) is this repo's
+  actual remaining job — see the gaps list in section 6 for what's still
+  open there. Also check `transformer_pruning` first, since it's the newer,
+  more actively developed line of the same work; avoid duplicating effort
+  across both.
 
 ## 8. Onboarding checklist
 
@@ -351,7 +361,7 @@ to add or fix a CNN pruning criterion, you probably want
 git clone https://github.com/thakerpragnesh/structured-pruning.git
 cd structured-pruning
 pip install -e ".[dev,vision-experiments,transformer-experiments]"
-pytest tests/ -v                        # 36 tests
+pytest tests/ -v                        # 49 tests
 python experiments/00_demo.py           # full pipeline, seconds
 python experiments/01_vgg_cifar10_sweep.py --smoke
 ```

@@ -2,8 +2,8 @@
 VGG-specific structural surgery, built on the generic `prune_conv_bn`.
 
 Pulled out of experiments/01_vgg_cifar10_sweep.py so the corrected legacy
-pipeline (legacy_pipeline/pipeline.py) and the experiment script share one
-implementation instead of two copies drifting apart.
+pipeline (archive/legacy_pipeline/pipeline.py) and the experiment script
+share one implementation instead of two copies drifting apart.
 """
 from __future__ import annotations
 

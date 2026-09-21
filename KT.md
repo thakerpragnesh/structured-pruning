@@ -210,19 +210,21 @@ correct public implementation. Current state, honestly:
 - **`experiments/02` and `03` are the same situation** — real
   `transformers` model classes, verified in `--smoke`, never run against a
   real fine-tuned checkpoint or real SST-2 data.
-- **FFN saliency scoring is a reshape hack, not a first-class API.**
-  `experiments/02_bert_sst2_sweep.py::_score_ffn_neurons` reshapes a
-  Linear layer's weight into a fake `[out, in, 1, 1]` conv tensor so it can
-  reuse `compute_score`. It works (k=3 on a 1-element kernel just returns
-  that element, so Max-k degenerates sensibly to something close to
-  magnitude-based selection) but it's a workaround. If FFN/attention-head
-  pruning becomes a real focus, `saliency.py` should grow a native
-  `Linear`-shaped scoring path instead of every experiment reshaping around
-  the conv-shaped one.
-- **No attention-head *pruning* surgery exists**, only distance-based
-  *detection* (`experiments/03`). There's no equivalent of `prune_conv_bn`
-  for physically removing an attention head (which touches Q/K/V and the
-  output projection simultaneously — more moving parts than an FFN block).
+- ~~**FFN saliency scoring is a reshape hack, not a first-class API.**~~
+  **Fixed 2026-09-21.** `saliency.py`'s scorers now accept a 2D Linear weight
+  `[out_features, in_features]` natively (via `_channel_view`), alongside the
+  original 4D Conv2d shape — see `saliency.py`'s module docstring and
+  `tests/test_saliency.py`'s `test_2d_linear_weight_matches_equivalent_4d_conv_weight`.
+  `experiments/02_bert_sst2_sweep.py::_score_ffn_neurons` no longer reshapes
+  around it.
+- ~~**No attention-head *pruning* surgery exists**~~ **Fixed 2026-09-21.**
+  `surgery.py` now has `prune_attention_heads`, the equivalent of
+  `prune_conv_bn` for a multi-head attention block (touches Q/K/V rows and
+  the output projection's columns simultaneously — see its docstring for why
+  that's more moving parts than an FFN block). `experiments/03` still only
+  *detects* redundancy (distance-based); wiring detected pairs into
+  `prune_attention_heads` calls is still open, same as the criterion caveat
+  below.
 - **`CoActivationScanner`'s 0.9 firing-rate ceiling is a design choice, not
   a validated threshold.** Only tested against hand-constructed synthetic
   masks so far.

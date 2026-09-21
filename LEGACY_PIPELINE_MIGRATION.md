@@ -1,6 +1,12 @@
 # Migrating from the original driver scripts to `legacy_pipeline`
 
-`legacy_pipeline/` replaces `channel_pruning_saliency.py`,
+**Since 2026-09-21, `legacy_pipeline/` lives at `archive/legacy_pipeline/`**
+(import as `archive.legacy_pipeline`, run as `python -m
+archive.legacy_pipeline.pipeline`) — see `README.md`'s "What's now redundant"
+for why. Everything below still describes the package itself accurately;
+only its location changed.
+
+`archive/legacy_pipeline/` replaces `channel_pruning_saliency.py`,
 `channel_pruning_distance.py`, `vgg_channel_pruning_saliency.py`,
 `vgg_channel_pruning_dist.py`, and the two never-finished kernel-level
 scripts (`kernel_pruning_saliency.py`, `vgg_kernel_pruning_saliency.py`).
@@ -77,13 +83,13 @@ second and third calls masking far fewer channels than the first.
 
 | Original file | Problem | Fix |
 |---|---|---|
-| `train_model.py::evaluate()` | D14: reassigned `outputs` inside the batch loop instead of accumulating — reported only the last batch | `legacy_pipeline/train.py::evaluate()` accumulates loss/correct/sample counts across the whole loader, divides once at the end |
-| `train_model.py::fit_one_cycle()` | D15: called `evaluate()` once per training batch, not once per epoch | `legacy_pipeline/train.py::fit_one_cycle()` evaluates once, after the epoch's training loop |
-| `train_model.py`'s L1 term | `sum(nn.L1Loss()(param, zeros) for param in model.parameters())` averages *within* each parameter tensor before summing across tensors — implicitly weights a small bias vector the same as a huge weight matrix | `legacy_pipeline/train.py::_l1_penalty()` sums raw magnitudes globally |
-| `load_model.py::freeze()` | Hardcoded a parameter *index* ("if count == 30") correct for exactly one `num_classes` value | `legacy_pipeline/model.py::freeze_all_but_classifier()` freezes everything except `model.classifier` directly — can't drift out of sync with the architecture |
-| `load_dataset.py::data_loader_eval()` | One of its two transform pipelines used `transforms.CenterCrop` as a class, not an instance (`transforms.CenterCrop` instead of `transforms.CenterCrop(224)`) — silently wrong preprocessing, not an error, since `Compose` just calls whatever's handed to it | `legacy_pipeline/data.py` has exactly one `_eval_transform()` builder used everywhere eval-style preprocessing is needed |
+| `train_model.py::evaluate()` | D14: reassigned `outputs` inside the batch loop instead of accumulating — reported only the last batch | `archive/legacy_pipeline/train.py::evaluate()` accumulates loss/correct/sample counts across the whole loader, divides once at the end |
+| `train_model.py::fit_one_cycle()` | D15: called `evaluate()` once per training batch, not once per epoch | `archive/legacy_pipeline/train.py::fit_one_cycle()` evaluates once, after the epoch's training loop |
+| `train_model.py`'s L1 term | `sum(nn.L1Loss()(param, zeros) for param in model.parameters())` averages *within* each parameter tensor before summing across tensors — implicitly weights a small bias vector the same as a huge weight matrix | `archive/legacy_pipeline/train.py::_l1_penalty()` sums raw magnitudes globally |
+| `load_model.py::freeze()` | Hardcoded a parameter *index* ("if count == 30") correct for exactly one `num_classes` value | `archive/legacy_pipeline/model.py::freeze_all_but_classifier()` freezes everything except `model.classifier` directly — can't drift out of sync with the architecture |
+| `load_dataset.py::data_loader_eval()` | One of its two transform pipelines used `transforms.CenterCrop` as a class, not an instance (`transforms.CenterCrop` instead of `transforms.CenterCrop(224)`) — silently wrong preprocessing, not an error, since `Compose` just calls whatever's handed to it | `archive/legacy_pipeline/data.py` has exactly one `_eval_transform()` builder used everywhere eval-style preprocessing is needed |
 | `load_model.py`'s `pretrained=True/False` | Deprecated boolean API, removed in current `torchvision` | `prunelib.build_vgg16` uses `weights=VGG16_Weights.IMAGENET1K_V1` |
-| Six driver scripts' path/config setup | ~15 lines of copy-pasted `dataset_dir`/`logDir`/module-level-global setup duplicated near-verbatim in every file | `legacy_pipeline/config.py::PruningConfig` — one dataclass, constructed once, passed explicitly |
+| Six driver scripts' path/config setup | ~15 lines of copy-pasted `dataset_dir`/`logDir`/module-level-global setup duplicated near-verbatim in every file | `archive/legacy_pipeline/config.py::PruningConfig` — one dataclass, constructed once, passed explicitly |
 
 ## How to run it
 
@@ -91,16 +97,16 @@ second and third calls masking far fewer channels than the first.
 pip install -e ".[vision-experiments,dev]"   # torchvision + pytest
 
 # Mechanical check first -- FakeData, random-init weights, no downloads, ~1-2 min:
-python -m legacy_pipeline.pipeline --tiny-check
+python -m archive.legacy_pipeline.pipeline --tiny-check
 
 # The real thing -- downloads CIFAR-10 + ImageNet VGG16 weights:
-python -m legacy_pipeline.pipeline --method max_k --dataset CIFAR10 --dataset-dir ./data
+python -m archive.legacy_pipeline.pipeline --method max_k --dataset CIFAR10 --dataset-dir ./data
 ```
 
 Or from Python:
 
 ```python
-from legacy_pipeline import PruningConfig, run_pruning
+from archive.legacy_pipeline import PruningConfig, run_pruning
 
 cfg = PruningConfig(dataset_name="CIFAR10", method="max_k")
 results, compressed_model = run_pruning(cfg)
@@ -116,7 +122,7 @@ smaller model.
 ## What's not covered
 
 - **Kernel-level pruning** (as opposed to channel-level) isn't implemented
-  in `prunelib` or `legacy_pipeline` at all. The original
+  in `prunelib` or `archive/legacy_pipeline` at all. The original
   `kernel_pruning_saliency.py` / `vgg_kernel_pruning_saliency.py` never got
   past a placeholder (`GITHUB_AUDIT.md` section 11), and
   `kernel_pruning_similarites.py`'s scoring function
@@ -131,7 +137,7 @@ smaller model.
   clustering + per-cluster selection loop. See `KT.md` section 6/7.
 - **Distance/similarity-based channel selection** for VGG specifically
   (the corrected replacement for `channel_pruning_distance.py` /
-  `vgg_channel_pruning_dist.py`) isn't wired into `legacy_pipeline` — only
+  `vgg_channel_pruning_dist.py`) isn't wired into `archive/legacy_pipeline` — only
   `method="max_k"|"l1"|"l2"|"random"` (saliency-style, one score per
   channel) are. `prunelib.pairwise_distance_matrix` has the metric; a
   `mask_vgg_layer`-equivalent that selects by pairwise similarity rather

@@ -7,7 +7,7 @@ from .saliency import (
     random_saliency,
     select_prune_indices,
 )
-from .surgery import prune_conv_bn, prune_ffn_block
+from .surgery import prune_attention_heads, prune_conv_bn, prune_ffn_block
 from .scanners import CoActivationScanner, pairwise_distance_matrix
 from .evaluate import count_encoder_params, count_params, measure_latency
 from .masking import (
@@ -29,6 +29,7 @@ __all__ = [
     "select_prune_indices",
     "prune_conv_bn",
     "prune_ffn_block",
+    "prune_attention_heads",
     "CoActivationScanner",
     "pairwise_distance_matrix",
     "count_encoder_params",

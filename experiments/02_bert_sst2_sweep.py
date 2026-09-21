@@ -16,11 +16,12 @@ from prunelib import compute_score, count_params, prune_ffn_block, select_prune_
 def _score_ffn_neurons(fc1_weight: torch.Tensor, method: str = "max_k") -> torch.Tensor:
     """Max-k/L1/L2 saliency doesn't require a 4D conv tensor to be meaningful --
     an FFN's `fc1` row is exactly analogous to a conv output channel's flattened
-    kernel. Reuse the same scoring code by reshaping to a fake [out, in, 1, 1]
-    conv weight rather than duplicating the math."""
-    reshaped = fc1_weight.unsqueeze(-1).unsqueeze(-1)  # [hidden, in_features, 1, 1]
+    kernel. `compute_score` takes a Linear weight `[out, in]` natively (see
+    `prunelib/saliency.py`), so this used to reshape to a fake `[out, in, 1, 1]`
+    conv weight before calling it; that workaround is gone now that scoring
+    handles both shapes itself."""
     kwargs = {"k": 3} if method == "max_k" else {}
-    return compute_score(reshaped, method=method, **kwargs)
+    return compute_score(fc1_weight, method=method, **kwargs)
 
 
 def run_smoke(prune_fraction=0.3, seed=0):
