@@ -99,9 +99,9 @@ def zeroed_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
 def surviving_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Complement of `zeroed_channels`: the "unmasked" channels to copy
     across during compression."""
-    n = weight.shape[0]
-    zero_idx = set(zeroed_channels(weight, atol=atol).tolist())
-    return torch.tensor([i for i in range(n) if i not in zero_idx], dtype=torch.long)
+    flat = weight.reshape(weight.shape[0], -1)
+    is_zero = flat.abs().sum(dim=1) <= atol
+    return (~is_zero).nonzero(as_tuple=True)[0]
 
 
 def compress_masked_conv_bn(

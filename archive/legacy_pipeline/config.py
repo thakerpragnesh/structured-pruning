@@ -25,6 +25,8 @@ class PruningConfig:
     image_size: int = 224
     batch_size: int = 32
     num_classes: int = 10
+    fakedata_train_size: int = 32   # only used when dataset_name == "FakeData"
+    fakedata_test_size: int = 16    # only used when dataset_name == "FakeData"
 
     # Model
     load_pretrained: bool = True

@@ -75,11 +75,11 @@ def build_datasets(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
         # path to verify the pipeline mechanically. See
         # LEGACY_PIPELINE_MIGRATION.md for why this exists.
         train = torchvision.datasets.FakeData(
-            size=32, image_size=(3, cfg.image_size, cfg.image_size),
+            size=cfg.fakedata_train_size, image_size=(3, cfg.image_size, cfg.image_size),
             num_classes=cfg.num_classes, transform=transforms.ToTensor(),
         )
         test = torchvision.datasets.FakeData(
-            size=16, image_size=(3, cfg.image_size, cfg.image_size),
+            size=cfg.fakedata_test_size, image_size=(3, cfg.image_size, cfg.image_size),
             num_classes=cfg.num_classes, transform=transforms.ToTensor(),
         )
         return train, test

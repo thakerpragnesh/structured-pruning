@@ -144,6 +144,7 @@ def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tenso
 
 def keep_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
     """Complement of `select_prune_indices`: the channels to keep, ascending order."""
-    prune_idx = set(select_prune_indices(scores, prune_amount).tolist())
-    keep = [i for i in range(scores.numel()) if i not in prune_idx]
-    return torch.tensor(keep, dtype=torch.long)
+    prune_idx = select_prune_indices(scores, prune_amount)
+    keep_mask = torch.ones(scores.numel(), dtype=torch.bool)
+    keep_mask[prune_idx] = False
+    return keep_mask.nonzero(as_tuple=True)[0]

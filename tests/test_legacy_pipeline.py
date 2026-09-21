@@ -72,7 +72,10 @@ def test_fit_one_cycle_evaluates_once_per_epoch_not_once_per_batch():
     """D15: the original called evaluate() inside the per-batch loop. History
     should have exactly one entry per epoch, regardless of how many batches
     are in the training set."""
-    cfg = PruningConfig(dataset_name="FakeData", load_pretrained=False, image_size=32, batch_size=4)
+    cfg = PruningConfig(
+        dataset_name="FakeData", load_pretrained=False, image_size=32, batch_size=4,
+        fakedata_train_size=8, fakedata_test_size=4,
+    )
     device = get_device()
     model = load_model(cfg, device)
     train_loader, test_loader = build_dataloaders(cfg)
@@ -110,6 +113,7 @@ def test_run_pruning_end_to_end_tiny_check(tmp_path):
     cfg = PruningConfig(
         dataset_name="FakeData", load_pretrained=False,
         image_size=32, batch_size=4,
+        fakedata_train_size=8, fakedata_test_size=4,
         max_iterations=1, fine_tune_epochs_per_iteration=1,
         method="max_k", output_dir=tmp_path, run_name="e2e",
     )

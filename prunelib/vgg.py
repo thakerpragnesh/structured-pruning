@@ -151,8 +151,10 @@ def prune_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float
     prune_amount = max(1, int(round(n_out * prune_fraction)))
     kwargs = {"k": 3} if method == "max_k" else {}
     scores = compute_score(conv.weight, method=method, **kwargs)
-    prune_idx = set(select_prune_indices(scores, prune_amount).tolist())
-    keep = torch.tensor([i for i in range(n_out) if i not in prune_idx])
+    prune_idx = select_prune_indices(scores, prune_amount)
+    keep_mask = torch.ones(n_out, dtype=torch.bool)
+    keep_mask[prune_idx] = False
+    keep = keep_mask.nonzero(as_tuple=True)[0]
 
     new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep, bn=bn, next_conv=next_conv)
 
