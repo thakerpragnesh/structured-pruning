@@ -7,7 +7,7 @@ place. For CNN channel-pruning from my Ph.D. work — Max-3 saliency,
 L1/SVD/K-means criteria, hybrid multi-criterion sequencing — the canonical
 repo is [`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4)
 instead: that repo has all five criteria working and verified, where this
-one only has Max-k/L1/L2/random. This repo's actual job is the two things
+one only has Max-k/L1/L2/random. This repo's actual job is the three things
 below.
 
 ## What this repo is for
@@ -25,10 +25,18 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (36 tests,
+compress once at the end — cleanly and with a real test suite (75 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
+
+**3. Architecture-agnostic pruning plus quantization.** `prunelib/graph.py`
+traces any `torch.fx`-traceable model and resolves which layers a prune
+decision couples to (residual adds, `cat`, flatten-into-classifier,
+depthwise convs), so pruning isn't limited to VGG's flat `.features`.
+`prunelib/quantization.py` adds the thesis's three post-training
+quantization methods (Float16, linear INT8, Fixed-Point32) as a separate
+stage applied after pruning. Both are covered below.
 
 **What's now redundant:** `archive/legacy_pipeline/` (moved there 2026-09-21,
 formerly `legacy_pipeline/` at the repo root — see `LEGACY_PIPELINE_MIGRATION.md`)
@@ -66,10 +74,12 @@ params:  38,848 -> 19,456  (49.9% reduction)
 latency: 5.518ms -> 2.591ms  (2.13x)
 ```
 
-Every experiment has a `--smoke` flag that runs the full pipeline on
-synthetic data / randomly-initialized models in seconds, with no downloads —
-useful for verifying the machinery before spending GPU time on the real run,
-and what CI runs on every commit.
+Experiments that touch a real pretrained model (`01`, `02`, `03`, `06`) have
+a `--smoke` flag that runs the full pipeline on synthetic data /
+randomly-initialized models in seconds, with no downloads — useful for
+verifying the machinery before spending GPU time on the real run. The rest
+(`00`, `04`, `05`, `07`) are synthetic already and run in seconds as-is. CI
+runs all of them this way on every commit (see `.github/workflows/tests.yml`).
 
 ## API
 
@@ -198,6 +208,7 @@ and how much of the network is pruned, and will not be identical across runs.
 |---|---|
 | `saliency.py` — Max-k/L1/L2/random, Conv2d and Linear weights | Unit-tested, 10/10 passing |
 | `surgery.py` — Conv/BN/FFN/attention-head structural surgery | Unit-tested, verified against a real HF BERT forward pass |
+| `masking.py` / `vgg.py` — two-phase mask-then-compress | Unit-tested, including a whole-VGG16 mask → compress run |
 | `graph.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), `prune_model`, two-phase `PruningGroup`, `special_handlers` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
 | `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |

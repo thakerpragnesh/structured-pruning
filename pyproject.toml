@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "structured-pruning"
 version = "0.1.0"
-description = "Structured channel/FFN pruning: Max-k saliency, structural surgery, and redundancy scanning for CNNs and Transformers"
+description = "Structured channel/FFN pruning: Max-k saliency, structural surgery, torch.fx dependency-graph pruning, redundancy scanning, and post-training quantization for CNNs and Transformers"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Pragnesh Thaker" }]

@@ -11,9 +11,11 @@ pruning scripts in `pruning_framwork_v4`. Those scripts were subsequently
 fixed *directly, in that repo*, with more complete method coverage
 (K-means, SVD, hybrid sequencing) than this package's `prunelib` has.
 **`pruning_framwork_v4` is now canonical for CNN pruning.** This package's
-job is narrower: the Transformer-extension experiments, and a tested
-reference implementation of the mask-then-compress design (section 4
-covers both). See the top of `README.md` for the current framing — if a
+job is narrower: the Transformer-extension experiments, a tested
+reference implementation of the mask-then-compress design, and — added
+2026-09-22/23 — architecture-agnostic `torch.fx` dependency-graph pruning
+(`graph.py`) plus post-training quantization (`quantization.py`). Section 4
+covers all of them. See the top of `README.md` for the current framing — if a
 change you're considering is "add K-means to `prunelib`," it belongs in
 `pruning_framwork_v4` instead, not here.
 
@@ -72,13 +74,13 @@ prunelib/
     evaluate.py   (59 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                 (76 lines)  full pipeline, seconds, no dependencies beyond torch
-    01_vgg_cifar10_sweep.py   (236 lines)  VGG16/CIFAR-10 — see section 5, this one has three run modes
-    02_bert_sst2_sweep.py      (77 lines)  BERT FFN pruning
+    01_vgg_cifar10_sweep.py   (174 lines)  VGG16/CIFAR-10 — see section 5, this one has three run modes
+    02_bert_sst2_sweep.py      (78 lines)  BERT FFN pruning
     03_head_redundancy.py      (63 lines)  attention head distance scan
     04_coactivation.py         (44 lines)  synthetic co-activation demo
     05_ordering.py             (69 lines)  does the CNN ordering result transfer?
     06_generic_pruning.py     (130 lines)  DependencyGraph on a real ResNet-18
-    07_quantization.py         (85 lines)  prune_model() + all three quantization methods, one pipeline
+    07_quantization.py         (89 lines)  prune_model() + all three quantization methods, one pipeline
 archive/
     legacy_pipeline/        corrected rebuild of pruning_framwork_v4's original
         config.py, data.py, driver scripts. Superseded by direct fixes to that
@@ -89,7 +91,7 @@ archive/
 tests/          75 tests across 9 files, one per historical defect or behavior
 ```
 
-Total: ~2,900 lines. Small on purpose — every module does one thing.
+Total: ~3,800 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
 
 ## 3. Design decisions, and the defect each one prevents
 
@@ -335,8 +337,11 @@ is the right threshold on an actual fine-tuned model.
 ### `prunelib/evaluate.py`
 
 `count_params`, `count_encoder_params` (params under a named submodule, e.g.
-`.encoder`, excluding embeddings), and `measure_latency` (wall-clock,
-warmup + averaged iterations, CPU by default). Nothing subtle here, but
+`.encoder`, excluding embeddings), `measure_latency` (wall-clock,
+warmup + averaged iterations, CPU by default), and `estimate_size_bytes`
+(`count_params * bits_per_param / 8` — a quick way to compare quantization
+precisions, not a substitute for measuring a saved checkpoint, which also
+carries INT8 scale/zero-point metadata). Nothing subtle here, but
 note: `measure_latency`'s numbers are hardware- and batch-size-dependent.
 Don't hardcode a specific multiplier anywhere that isn't clearly labeled
 with the machine/conditions it came from — see the README's note about the
@@ -344,14 +349,19 @@ with the machine/conditions it came from — see the README's note about the
 
 ### `experiments/`
 
-Three-tier pattern used across the VGG and BERT experiments:
+Experiments that touch a real pretrained model class (`01`, `02`, `03`,
+`06`) follow a three-tier pattern. The rest (`00_demo`, `04_coactivation`,
+`05_ordering`, `07_quantization`) are synthetic end to end, run in seconds
+with no flag, and CI runs them as-is.
+
+The three tiers:
 
 - **`--smoke`** — fully synthetic data and a tiny hand-built model (no
   `torchvision`/`transformers` model classes involved for `01`). Runs in
   under a second. This is what CI runs on every push.
-- **`--tiny-check`** (currently only on `01`) — the *real* model class
-  (`torchvision.models.vgg16`) with randomly-initialized weights and
-  `FakeData` instead of a real dataset. No network access needed, but it
+- **`--tiny-check`** (on `01` and `06`) — the *real* model class
+  (`torchvision.models.vgg16` / `resnet18`) with randomly-initialized
+  weights and `FakeData` or random input instead of a real dataset. No network access needed, but it
   exercises the actual code path `run_full()` uses. Takes minutes, not
   seconds — not run in CI, but should be run manually after any change to
   `prune_vgg_layer` or `build_vgg16`.
@@ -360,7 +370,7 @@ Three-tier pattern used across the VGG and BERT experiments:
   yet (see section 6) — everything up to this point has only been verified
   mechanically.
 
-If you add a fourth experiment that touches a real pretrained model, follow
+If you add a new experiment that touches a real pretrained model, follow
 this same three-tier pattern rather than inventing a new one.
 
 ## 5. Testing conventions
@@ -602,10 +612,11 @@ scanning, and hybrid pruning all trace back to it, and the numbers in
 `README.md` and `PUBLICATIONS.md` are drawn from it. This section covers what
 the thesis describes that **isn't** implemented or documented anywhere in
 this codebase: methods `prunelib` doesn't have (SVD pruning, kernel-level
-pruning, FC-neuron pruning, custom regularization, quantization), the
+pruning, FC-neuron pruning, custom regularization), the
 original framework design the current code replaced, and results (external
 benchmark comparison, future work) not summarized elsewhere in this repo's
-docs. General ML background from the thesis — CNN architecture history
+docs. (Quantization was on this list until 2026-09-23; section 10.2 now
+records how it was implemented.) General ML background from the thesis — CNN architecture history
 (LeNet through ResNet), optimizer survey (SGD through Adam), training
 techniques (dropout, batch norm, cyclic LR), and the literature review of
 other authors' pruning papers — is deliberately left out here as generic
