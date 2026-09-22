@@ -31,3 +31,5 @@ jobs:
           python experiments/03_head_redundancy.py --smoke
           python experiments/04_coactivation.py
           python experiments/05_ordering.py --budget 0.4
+          python experiments/06_generic_pruning.py --smoke
+          python experiments/07_quantization.py

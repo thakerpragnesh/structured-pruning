@@ -111,6 +111,73 @@ scanner = CoActivationScanner(firing_rate_ceiling=0.9)
 similarity = scanner.jaccard(activation_mask)
 ```
 
+Everything above needs the caller to already know the seam (`next_conv=`,
+which two Linears form an FFN block). `prunelib.graph.DependencyGraph`
+doesn't — it traces an arbitrary model with `torch.fx` and works out which
+other layers a prune decision couples to (a residual/skip partner, a
+downstream conv/Linear, a `cat`, a flatten into a classifier head) on its
+own:
+
+```python
+from prunelib import DependencyGraph
+
+dep = DependencyGraph(model, example_input)          # traced once, reused for as many prunes as you like
+group = dep.get_pruning_group(model.layer2[0].conv2, keep_idx)
+group.prune()                                         # mutates model in place -- see graph.py's docstring for why
+```
+
+It handles Conv2d/BatchNorm/Linear chains coupled by elementwise add,
+`torch.cat`, the conv-output-flattened-into-Linear boundary, and depthwise
+convs — see `prunelib/graph.py`'s module docstring for exactly what it does
+and doesn't handle (it does not attempt *automatic* attention-block
+discovery; a `special_handlers` hook lets you register one manually, see
+below).
+
+`prune_model` is the one-call convenience on top of `DependencyGraph` —
+score, select, and prune a layer plus everything it's coupled to, for any
+model the graph can trace (not just VGG's flat `.features`):
+
+```python
+from prunelib import prune_model
+
+group = prune_model(model, example_input, model.layer2[0].conv2, prune_fraction=0.3, method="l1")
+```
+
+`DependencyGraph` also has a two-phase mode, mirroring the mask-then-compress
+workflow below at the level of a whole dependency group instead of one layer:
+
+```python
+group = dep.get_pruning_group(layer, keep_idx)
+group.mask()                 # zero the group's channels, shapes unchanged -- safe to fine-tune against
+# ... fine-tune / evaluate ...
+group.commit_and_compress()  # bake the zeros in and physically shrink everything the group touches
+```
+
+And for attention blocks specifically -- which `DependencyGraph` can't wire
+up on its own, since `prune_attention_heads` needs four Linears rewired
+together at once, not one module resized -- `special_handlers` registers a
+handler that takes over when a given block type is the *starting* layer of
+a `get_pruning_group` call:
+
+```python
+from prunelib import DependencyGraph, LeafTracer
+
+def handle_attention_block(block, keep_heads):
+    block.query, block.key, block.value, block.out = prune_attention_heads(
+        block.query, block.key, block.value, block.out,
+        keep_heads=keep_heads, num_heads=block.num_heads,
+    )
+    block.num_heads = keep_heads.numel()
+    return block
+
+dep = DependencyGraph(
+    model, example_input,
+    tracer=LeafTracer([MyAttentionBlockClass]),  # needed so the block traces as one node
+    special_handlers={MyAttentionBlockClass: handle_attention_block},
+)
+dep.get_pruning_group(model.attn, keep_heads).prune()
+```
+
 ## Results
 
 CNN results below are the published, peer-reviewed figures (see
@@ -131,6 +198,8 @@ and how much of the network is pruned, and will not be identical across runs.
 |---|---|
 | `saliency.py` — Max-k/L1/L2/random, Conv2d and Linear weights | Unit-tested, 10/10 passing |
 | `surgery.py` — Conv/BN/FFN/attention-head structural surgery | Unit-tested, verified against a real HF BERT forward pass |
+| `graph.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), `prune_model`, two-phase `PruningGroup`, `special_handlers` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
+| `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
 | `experiments/01` VGG-CIFAR10 sweep | `--tiny-check` runs the real `torchvision.models.vgg16` class through real `prune_vgg_layer`/`prune_conv_bn` calls end to end (verified, ~3-4 min on CPU); full run (real CIFAR-10 + ImageNet weights) not yet executed |
 | `experiments/02` BERT FFN sweep | Pipeline verified in `--smoke` against real `transformers` model classes; full run not yet executed |
@@ -169,6 +238,36 @@ For a whole VGG16, `archive/legacy_pipeline` wraps this into a complete
 pipeline — see `LEGACY_PIPELINE_MIGRATION.md` for how to run it and exactly
 what it replaces.
 
+## Quantization
+
+`prunelib.quantization` implements the three post-training quantization
+methods from the thesis this repo is based on (Ch. 6.6) as a separate
+compression stage, applied *after* pruning:
+
+```python
+from prunelib import quantize_model_, quantize_int8_linear, dequantize_int8_linear, estimate_size_bytes
+
+# Float16 or Fixed-Point32: in-place, round-trips every Linear/Conv2d/BatchNorm
+# weight and bias through the target precision, cast back to float32.
+quantize_model_(pruned_model, method="float16")
+quantize_model_(pruned_model, method="fixed_point32", integer_bits=3, fractional_bits=28)
+
+# Linear INT8: per-tensor scale/zero-point, since realizing its actual
+# memory savings means storing int8 values plus that metadata, not a
+# same-shape float tensor you can substitute in place.
+q = quantize_int8_linear(conv.weight)
+approx_weight = dequantize_int8_linear(q)
+
+estimate_size_bytes(pruned_model, bits_per_param=16)  # compare precision options without writing a checkpoint per option
+```
+
+See `experiments/07_quantization.py` for the whole pipeline (`prune_model`
+then all three methods) end to end, and `KT.md` section 10.2 for the
+thesis's own numbers (Float16: 1.34% accuracy drop for half the memory;
+Fixed-Point32: 3.26%, markedly worse, since a fixed exponent can't adapt to
+a layer's actual weight distribution) — not yet reproduced against a real
+fine-tuned model in this codebase, only verified mechanically so far.
+
 ## Repository layout
 
 ```
@@ -176,9 +275,13 @@ prunelib/
     saliency.py   Max-k (correct), L1, L2, random -- Conv2d or Linear weights
     surgery.py    conv/BN/FFN/attention-head structural surgery
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
+    graph.py      torch.fx dependency resolution -- generic add/cat/flatten/depthwise
+                  surgery; prune_model, PruningGroup.mask()/.commit_and_compress(),
+                  special_handlers/LeafTracer (attention-block hook)
+    quantization.py  Float16 / linear INT8 / Fixed-Point32 post-training quantization
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
     scanners.py   distance metrics + co-activation scanning
-    evaluate.py   parameter counts + measured latency
+    evaluate.py   parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                  runs in seconds
     01_vgg_cifar10_sweep.py     Max3 vs L1 vs L2 vs random
@@ -186,12 +289,14 @@ experiments/
     03_head_redundancy.py       head similarity across layers
     04_coactivation.py          activation-based redundancy
     05_ordering.py              does the CNN ordering result transfer?
+    06_generic_pruning.py       DependencyGraph on a real ResNet-18, no seam passed by hand
+    07_quantization.py          prune_model() + all three quantization methods, one pipeline
 archive/
     legacy_pipeline/            corrected replacement for the six original
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          49 tests, each naming the defect it guards against
+tests/          75 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

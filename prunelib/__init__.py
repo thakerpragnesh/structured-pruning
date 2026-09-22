@@ -9,7 +9,7 @@ from .saliency import (
 )
 from .surgery import prune_attention_heads, prune_conv_bn, prune_ffn_block
 from .scanners import CoActivationScanner, pairwise_distance_matrix
-from .evaluate import count_encoder_params, count_params, measure_latency
+from .evaluate import count_encoder_params, count_params, estimate_size_bytes, measure_latency
 from .masking import (
     build_channel_mask,
     commit_mask,
@@ -17,6 +17,16 @@ from .masking import (
     mask_channels,
     surviving_channels,
     zeroed_channels,
+)
+from .graph import DependencyGraph, LeafTracer, PruningGroup, prune_model
+from .quantization import (
+    Int8Tensor,
+    dequantize_float16,
+    dequantize_int8_linear,
+    quantize_fixed_point32,
+    quantize_float16,
+    quantize_int8_linear,
+    quantize_model_,
 )
 
 __all__ = [
@@ -34,6 +44,7 @@ __all__ = [
     "pairwise_distance_matrix",
     "count_encoder_params",
     "count_params",
+    "estimate_size_bytes",
     "measure_latency",
     "build_channel_mask",
     "commit_mask",
@@ -41,6 +52,17 @@ __all__ = [
     "mask_channels",
     "surviving_channels",
     "zeroed_channels",
+    "DependencyGraph",
+    "PruningGroup",
+    "LeafTracer",
+    "prune_model",
+    "Int8Tensor",
+    "quantize_float16",
+    "dequantize_float16",
+    "quantize_int8_linear",
+    "dequantize_int8_linear",
+    "quantize_fixed_point32",
+    "quantize_model_",
 ]
 
 # vgg.py imports torchvision, which is an optional dependency (`pip install
