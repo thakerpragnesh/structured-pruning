@@ -97,8 +97,8 @@ import torch.fx as fx
 import torch.nn as nn
 from torch.fx.passes.shape_prop import ShapeProp
 
+from .clustering import select_prune_indices_by_method
 from .masking import commit_mask, mask_channels
-from .saliency import compute_score, keep_indices
 
 _ADD_FUNCTIONS = {torch.add, operator.add, operator.iadd}
 _CAT_FUNCTIONS = {torch.cat, torch.concat}
@@ -620,7 +620,7 @@ def prune_model(
     prune_fraction: float,
     method: str = "max_k",
     dependency_graph: DependencyGraph | None = None,
-    **score_kwargs,
+    **method_kwargs,
 ) -> PruningGroup:
     """One-shot generic pruning for an arbitrary model: score `layer`'s
     output channels/neurons (`saliency.compute_score`), keep everything
@@ -640,6 +640,11 @@ def prune_model(
     counts do, same as a `DependencyGraph` used directly). Otherwise a new
     one is traced from `example_input`.
 
+    `method` is a saliency scorer (`"max_k"`, `"l1"`, `"l2"`, `"random"`)
+    or `"kmeans"` (cluster channels by weight, prune the lowest-L1 ones
+    within each cluster -- see `clustering.kmeans_prune_indices`);
+    `method_kwargs` are forwarded to it.
+
     Returns the `PruningGroup` this prune decision implied, already
     `.prune()`d -- inspect `group.output_targets`/`group.input_targets` to
     see what else got touched.
@@ -652,9 +657,10 @@ def prune_model(
         raise TypeError(f"{layer!r} ({type(module).__name__}) has no .weight to score")
 
     dep = dependency_graph or DependencyGraph(model, example_input)
-    scores = compute_score(module.weight, method=method, **score_kwargs)
-    n_to_prune = int(round(prune_fraction * scores.numel()))
-    to_keep = keep_indices(scores, n_to_prune)
+    n_out = module.weight.shape[0]
+    n_to_prune = int(round(prune_fraction * n_out))
+    prune_idx = select_prune_indices_by_method(module.weight, n_to_prune, method=method, **method_kwargs)
+    to_keep = _keep_complement(n_out, prune_idx)
 
     group = dep.get_pruning_group(layer, to_keep)
     group.prune()

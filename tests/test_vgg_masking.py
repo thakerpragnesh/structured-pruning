@@ -1,7 +1,7 @@
 import torch
 import torch.nn.utils.prune as prune
 
-from prunelib import build_vgg16, compress_masked_vgg, count_params, mask_vgg_layer
+from prunelib import build_vgg16, compress_masked_vgg, count_params, mask_vgg_layer, prune_vgg_layer
 from prunelib.masking import surviving_channels
 from prunelib.vgg import vgg_conv_bn_positions
 
@@ -107,3 +107,69 @@ def test_compress_masked_vgg_propagates_through_unmasked_layers():
     conv0_idx, _ = pairs[0]
     conv1_idx, _ = pairs[1]
     assert model.features[conv1_idx].in_channels == model.features[conv0_idx].out_channels
+
+
+def test_prune_vgg_layer_can_prune_the_last_conv_layer():
+    """The last conv feeds classifier[0] (a Linear over the flattened 7x7
+    avgpool output), not another conv. Pruning it must also drop that
+    channel's 49 input columns from classifier[0] -- and give the same output
+    as the unpruned model with that channel zeroed."""
+    torch.manual_seed(0)
+    model = _tiny_vgg().eval()
+    pairs = vgg_conv_bn_positions(model.features)
+    last = len(pairs) - 1
+    conv_idx, _ = pairs[last]
+    x = torch.randn(1, 3, 32, 32)
+
+    reference = _tiny_vgg().eval()
+    reference.load_state_dict(model.state_dict())
+
+    kept = prune_vgg_layer(model, last, prune_fraction=0.25, method="l1")
+
+    new_conv = model.features[conv_idx]
+    assert new_conv.out_channels == kept == 384
+    assert model.classifier[0].in_features == kept * 49
+
+    removed = sorted(set(range(512)) - set(_matching_rows(reference.features[conv_idx].weight, new_conv.weight)))
+    with torch.no_grad():
+        reference.features[conv_idx].weight[removed] = 0
+        reference.features[conv_idx].bias[removed] = 0
+        assert torch.allclose(model(x), reference(x), atol=1e-4)
+
+
+def _matching_rows(original: torch.Tensor, pruned: torch.Tensor) -> list[int]:
+    """Which rows of `original` survived into `pruned`, by exact value."""
+    flat_o = original.reshape(original.shape[0], -1)
+    flat_p = pruned.reshape(pruned.shape[0], -1)
+    return [int((flat_o == row).all(dim=1).nonzero()[0]) for row in flat_p]
+
+
+def test_mask_and_compress_the_last_conv_layer_matches_masked_output():
+    torch.manual_seed(0)
+    model = _tiny_vgg().eval()
+    last = len(vgg_conv_bn_positions(model.features)) - 1
+    x = torch.randn(1, 3, 32, 32)
+
+    mask_vgg_layer(model, last, prune_fraction=0.5, method="max_k")
+    with torch.no_grad():
+        out_masked = model(x)
+
+    assert compress_masked_vgg(model) == 256
+    assert model.classifier[0].in_features == 256 * 49
+    with torch.no_grad():
+        assert torch.allclose(model(x), out_masked, atol=1e-4)
+
+
+def test_kmeans_method_works_through_both_vgg_pruning_paths():
+    torch.manual_seed(0)
+    model = _tiny_vgg().eval()
+    conv_idx, _ = vgg_conv_bn_positions(model.features)[0]
+
+    kept = prune_vgg_layer(model, 0, prune_fraction=0.25, method="kmeans", metric="manhattan")
+    assert kept == model.features[conv_idx].out_channels == 48
+
+    first = mask_vgg_layer(model, 1, prune_fraction=0.25, method="kmeans", metric="euclidean")
+    second = mask_vgg_layer(model, 1, prune_fraction=0.25, method="kmeans", metric="euclidean")
+    assert first == second == 16  # second call clusters survivors only, so both calls count
+    compress_masked_vgg(model)
+    assert model(torch.randn(1, 3, 32, 32)).shape == (1, 5)

@@ -18,6 +18,7 @@ from .masking import (
     surviving_channels,
     zeroed_channels,
 )
+from .clustering import kmeans, kmeans_prune_indices, select_prune_indices_by_method
 from .graph import DependencyGraph, LeafTracer, PruningGroup, prune_model
 from .quantization import (
     Int8Tensor,
@@ -42,6 +43,9 @@ __all__ = [
     "prune_attention_heads",
     "CoActivationScanner",
     "pairwise_distance_matrix",
+    "kmeans",
+    "kmeans_prune_indices",
+    "select_prune_indices_by_method",
     "count_encoder_params",
     "count_params",
     "estimate_size_bytes",

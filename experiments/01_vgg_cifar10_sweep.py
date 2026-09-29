@@ -1,6 +1,7 @@
 """
 01_vgg_cifar10_sweep.py — reproduces the paper's comparison: Max-3 vs L1 vs L2
-vs random channel selection, iteratively pruning VGG16 and tracking accuracy
+vs random vs K-Means (Manhattan; prune the lowest-L1 channels within each
+cluster) channel selection, iteratively pruning VGG16 and tracking accuracy
 drop, on CIFAR-10.
 
     python experiments/01_vgg_cifar10_sweep.py                 # full run: downloads CIFAR-10 + ImageNet VGG16 weights
@@ -19,7 +20,7 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from prunelib import build_vgg16, compute_score, count_params, measure_latency, prune_conv_bn, prune_vgg_layer, select_prune_indices
+from prunelib import build_vgg16, count_params, measure_latency, prune_conv_bn, prune_vgg_layer, select_prune_indices_by_method
 from prunelib.vgg import vgg_conv_bn_positions
 
 
@@ -44,15 +45,14 @@ def run_smoke(prune_step=0.05, n_iterations=5, seed=0):
     example_input = torch.randn(2, 3, 32, 32)
 
     print(f"{'iter':>4} {'method':<8} {'channels':>9} {'params':>8} {'latency(ms)':>12}")
-    for method in ("max_k", "l1", "l2", "random"):
+    for method in ("max_k", "l1", "l2", "random", "kmeans"):
         m = TinyVGGBlock(ch=32)
         m.load_state_dict(model.state_dict())
         for it in range(n_iterations):
             n_ch = m.conv1.out_channels
             prune_amount = max(1, int(round(32 * prune_step)))
-            kwargs = {"k": 3} if method == "max_k" else {}
-            scores = compute_score(m.conv1.weight, method=method, **kwargs)
-            keep = torch.tensor([i for i in range(n_ch) if i not in set(select_prune_indices(scores, prune_amount).tolist())])
+            prune_idx = set(select_prune_indices_by_method(m.conv1.weight, prune_amount, method=method).tolist())
+            keep = torch.tensor([i for i in range(n_ch) if i not in prune_idx])
             new_conv1, new_bn1, new_conv2 = prune_conv_bn(m.conv1, keep, bn=m.bn1, next_conv=m.conv2)
             m = TinyVGGBlock(ch=len(keep))
             m.conv1, m.bn1, m.conv2 = new_conv1, new_bn1, new_conv2
@@ -87,9 +87,10 @@ def _fine_tune(model, loader, device, epochs, lr=1e-4):
 
 
 def run(dataset_factory, pretrained, prune_step=0.05, accuracy_drop_threshold=0.01,
-        max_iterations=15, fine_tune_epochs=1, methods=("max_k", "l1", "l2", "random"), device=None):
-    """The actual iterative-pruning experiment: for each scoring method,
-    prune every (non-final) conv layer by `prune_step`, fine-tune, evaluate,
+        max_iterations=15, fine_tune_epochs=1, methods=("max_k", "l1", "l2", "random", "kmeans"), device=None):
+    """The actual iterative-pruning experiment: for each selection method,
+    prune every conv layer (including the last, which also resizes
+    `classifier[0]`) by `prune_step`, fine-tune, evaluate,
     and stop when accuracy drop exceeds `accuracy_drop_threshold` -- the same
     schedule as Algorithm 1 in the IEEE Access paper (5% per iteration, 1%
     accuracy-drop stop criterion, defaults here match that)."""
@@ -101,7 +102,7 @@ def run(dataset_factory, pretrained, prune_step=0.05, accuracy_drop_threshold=0.
     for method in methods:
         model = build_vgg16(pretrained=pretrained).to(device)
         baseline_acc = _evaluate(model, test_loader, device)
-        n_prunable = len(vgg_conv_bn_positions(model.features)) - 1  # last conv excluded, see prune_vgg_layer
+        n_prunable = len(vgg_conv_bn_positions(model.features))
 
         print(f"\n=== method={method}  baseline acc={baseline_acc:.4f} ===")
         for it in range(1, max_iterations + 1):
@@ -152,7 +153,7 @@ def run_tiny_check():
         test = torchvision.datasets.FakeData(size=8, image_size=(3, 224, 224), num_classes=10, transform=transform)
         return train, test
 
-    run(fake_data, pretrained=False, max_iterations=2, fine_tune_epochs=1, methods=("max_k", "l1"))
+    run(fake_data, pretrained=False, max_iterations=2, fine_tune_epochs=1, methods=("max_k", "l1", "kmeans"))
     print("\ntiny-check complete: the real VGG16 class and real prune_vgg_layer/")
     print("prune_conv_bn calls ran end to end with no shape errors. Numbers above")
     print("are meaningless (random weights, fake data) -- run without any flag,")

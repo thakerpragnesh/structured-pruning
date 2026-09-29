@@ -7,7 +7,8 @@ place. For CNN channel-pruning from my Ph.D. work — Max-3 saliency,
 L1/SVD/K-means criteria, hybrid multi-criterion sequencing — the canonical
 repo is [`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4)
 instead: that repo has all five criteria working and verified, where this
-one only has Max-k/L1/L2/random. This repo's actual job is the three things
+one has Max-k/L1/L2/random plus K-Means clustering selection (no SVD or
+hybrid sequencing). This repo's actual job is the three things
 below.
 
 ## What this repo is for
@@ -25,7 +26,7 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (75 tests,
+compress once at the end — cleanly and with a real test suite (92 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
@@ -212,9 +213,10 @@ and how much of the network is pruned, and will not be identical across runs.
 | `graph.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), `prune_model`, two-phase `PruningGroup`, `special_handlers` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
 | `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
+| `clustering.py` — K-Means (Manhattan/Euclidean/Cosine) selection, prune lowest-L1 within each cluster | Unit-tested, including a brute-force check of the selection rule and end-to-end through `prune_model` and both VGG paths; paper's accuracy numbers not yet reproduced here |
 | `experiments/01` VGG-CIFAR10 sweep | `--tiny-check` runs the real `torchvision.models.vgg16` class through real `prune_vgg_layer`/`prune_conv_bn` calls end to end (verified, ~3-4 min on CPU); full run (real CIFAR-10 + ImageNet weights) not yet executed |
 | `experiments/02` BERT FFN sweep | Pipeline verified in `--smoke` against real `transformers` model classes; full run not yet executed |
-| `experiments/03` head redundancy | Pipeline verified in `--smoke`; full run needs a fine-tuned checkpoint |
+| `experiments/03` head redundancy | Distance scan plus K-Means head pruning (`prune_attention_heads`) verified in `--smoke` against a real HF BERT forward pass; full run needs a fine-tuned checkpoint |
 | `experiments/05` ordering | Scoring-perturbation mechanism verified; full accuracy-drop reproduction not yet run |
 
 That last column is deliberately explicit: the CNN numbers above are the
@@ -291,6 +293,7 @@ prunelib/
                   special_handlers/LeafTracer (attention-block hook)
     quantization.py  Float16 / linear INT8 / Fixed-Point32 post-training quantization
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
+    clustering.py K-Means channel selection: prune lowest-L1 within each cluster
     scanners.py   distance metrics + co-activation scanning
     evaluate.py   parameter counts, measured latency, estimated size at a bit-width
 experiments/
@@ -307,7 +310,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          75 tests, each naming the defect or behavior it guards against
+tests/          92 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

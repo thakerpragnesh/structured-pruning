@@ -133,8 +133,10 @@ smaller model.
   input-channel group without removing the whole output channel), which
   `prunelib.surgery` doesn't have an equivalent of.
 - **K-Means clustering-based selection** (Paper 2's Manhattan/Euclidean/
-  Cosine comparison) — `prunelib.scanners` has the distance metrics, not the
-  clustering + per-cluster selection loop. See `KT.md` section 6/7.
+  Cosine comparison) now exists in `prunelib.clustering` (2026-09-30) and
+  works with `prunelib.prune_vgg_layer`/`mask_vgg_layer` via
+  `method="kmeans"`. It is still not wired into `archive/legacy_pipeline`'s
+  config, since that package is frozen. See `KT.md` section 4.
 - **Distance/similarity-based channel selection** for VGG specifically
   (the corrected replacement for `channel_pruning_distance.py` /
   `vgg_channel_pruning_dist.py`) isn't wired into `archive/legacy_pipeline` — only

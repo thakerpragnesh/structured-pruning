@@ -14,10 +14,12 @@ fixed *directly, in that repo*, with more complete method coverage
 job is narrower: the Transformer-extension experiments, a tested
 reference implementation of the mask-then-compress design, and — added
 2026-09-22/23 — architecture-agnostic `torch.fx` dependency-graph pruning
-(`graph.py`) plus post-training quantization (`quantization.py`). Section 4
-covers all of them. See the top of `README.md` for the current framing — if a
-change you're considering is "add K-means to `prunelib`," it belongs in
-`pruning_framwork_v4` instead, not here.
+(`graph.py`) plus post-training quantization (`quantization.py`), and —
+added 2026-09-30 at the author's request — K-Means clustering-based channel
+selection (`clustering.py`), so the cluster-then-prune-lowest-L1 rule is
+usable with `graph.py`, the VGG helpers, and the attention-head experiments
+in this package. Section 4 covers all of them. SVD and hybrid sequencing
+still live only in `pruning_framwork_v4`; add those there, not here.
 
 The history below is why the code looks the way it does; it's not a claim
 about what this repo currently supersedes.
@@ -70,13 +72,16 @@ prunelib/
                                quantization (thesis Ch. 6.6) -- separate compression
                                stage from pruning, applied after it
     vgg.py        VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
+                               (every conv layer, including the last -> classifier[0])
+    clustering.py (208 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
+                               prune the lowest-L1 channels within each cluster
     scanners.py   (70 lines)   Distance metrics + co-activation scanning
     evaluate.py   (59 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                 (76 lines)  full pipeline, seconds, no dependencies beyond torch
     01_vgg_cifar10_sweep.py   (174 lines)  VGG16/CIFAR-10 — see section 5, this one has three run modes
     02_bert_sst2_sweep.py      (78 lines)  BERT FFN pruning
-    03_head_redundancy.py      (63 lines)  attention head distance scan
+    03_head_redundancy.py     (110 lines)  attention head distance scan + K-Means head pruning
     04_coactivation.py         (44 lines)  synthetic co-activation demo
     05_ordering.py             (69 lines)  does the CNN ordering result transfer?
     06_generic_pruning.py     (130 lines)  DependencyGraph on a real ResNet-18
@@ -88,7 +93,7 @@ archive/
         pipeline.py         kept here as a tested mask-then-compress example,
                              not a live alternative. Moved under archive/
                              2026-09-21. See LEGACY_PIPELINE_MIGRATION.md.
-tests/          75 tests across 9 files, one per historical defect or behavior
+tests/          92 tests across 10 files, one per historical defect or behavior
 ```
 
 Total: ~3,800 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
@@ -286,9 +291,13 @@ one-shot version (score → select → surgery, immediately). `mask_vgg_layer`
 table in section 3 for the correctness fix `mask_vgg_layer` needed
 (excluding already-masked channels from re-selection).
 
-Both `prune_vgg_layer` and `mask_vgg_layer` refuse to touch the *last*
-conv layer (it feeds `classifier[0]`, a `Linear`, not another `Conv2d` —
-see section 6).
+Every conv layer can be pruned, including the last one (added
+2026-09-30): it feeds `classifier[0]`, a `Linear` over the flattened
+`[C, 7, 7]` avgpool output, so pruning channel `c` also drops that Linear's
+input columns `[c*49, (c+1)*49)` (`_shrink_classifier_input`, the VGG-
+specific version of `graph.py`'s flatten handling). Both
+`prune_vgg_layer` and `mask_vgg_layer` take any `method=` that
+`clustering.select_prune_indices_by_method` accepts, including `"kmeans"`.
 
 ### `archive/legacy_pipeline/`
 
@@ -314,14 +323,35 @@ defect-by-defect mapping from the original scripts.
 
 
 `pairwise_distance_matrix(vectors, metric)` implements Manhattan/Euclidean/
-Cosine — the three metrics compared in Paper 2. **Important gap:** this
-computes *distances only*. It does not implement K-Means clustering itself,
-or the "keep the highest-L1-norm channel from each cluster" selection rule
-the paper actually uses for K-Means-based pruning. If you need to reproduce
-that specific experiment, you'll need to add a `k_means_select()` function
-(sklearn's `KMeans` on the distance-derived feature matrix, or normalized
-channel vectors directly, then select per-cluster by L1 norm) — see section
-6 for where this fits.
+Cosine — the three metrics compared in Paper 2. It computes distances only;
+the clustering and selection live in `clustering.py` (below).
+
+### `prunelib/clustering.py`
+
+Added 2026-09-30. `kmeans(vectors, n_clusters, metric)` is plain-torch
+K-Means (no scikit-learn dependency) with K-Means++ seeding. Each metric
+uses the centroid update that actually minimizes it: mean for Euclidean,
+**coordinate-wise median for Manhattan** (K-Medians; the mean minimizes
+squared L2, not L1), and normalized mean for Cosine (spherical K-Means).
+Empty clusters are re-seeded, so every cluster always has at least one
+member.
+
+`kmeans_prune_indices(weight, prune_amount, n_clusters=None, metric=...)` is
+the paper's selection rule. It clusters output channels on their flattened
+weights and prunes the **lowest-L1 channels within each cluster**, keeping
+each cluster's highest-L1 member as its representative. The default is
+`n_clusters = out - prune_amount`, which leaves exactly one survivor per
+cluster. A smaller `n_clusters` still protects one representative per
+cluster and prunes the lowest-L1 channels among the rest. It raises rather
+than empty a cluster.
+
+`select_prune_indices_by_method(weight, n, method, **kwargs)` is the single
+dispatcher `vgg.py` and `graph.prune_model` call. `"kmeans"` goes to the
+function above; every other method goes through `compute_score` →
+`select_prune_indices` exactly as before, so the D1 guarantee (one score,
+one selection) still holds for the saliency methods. A cluster-based rule
+isn't a per-channel score, which is why it sits beside `compute_score`
+rather than inside it.
 
 `CoActivationScanner` computes pairwise Jaccard similarity on boolean firing
 masks, with a `firing_rate_ceiling` (default 0.9) that excludes near-
@@ -392,7 +422,7 @@ defect-named test even if you refactor the code it guards, unless you're
 certain the refactor makes the bug class structurally impossible (as, e.g.,
 switching to `torch.topk` made D2 impossible to reintroduce even accidentally).
 
-Run everything: `PYTHONPATH=. pytest tests/ -v` (75 tests, ~30-35s total on
+Run everything: `PYTHONPATH=. pytest tests/ -v` (92 tests, ~30-35s total on
 CPU; the pure-`prunelib` tests alone (including `test_graph.py`,
 `test_quantization.py`, and `test_evaluate.py`, none of which need
 `torchvision`/`transformers`) are still ~2-3s, the rest is the handful
@@ -418,17 +448,20 @@ Being explicit about what's *not* done is as important as documenting
 what is, given this project's history of a paper's headline result having no
 correct public implementation. Current state, honestly:
 
-- **K-Means, SVD, and hybrid-sequencing criteria are not in this package's
-  `prunelib`, and that's now by design, not a gap to fill here.** They
-  exist, fixed and tested, in `pruning_framwork_v4`. `scanners.py` has the
-  distance metrics `pairwise_distance_matrix` needs, but adding a
-  `k_means_select()` here would create a second, competing implementation
-  of something `pruning_framwork_v4` already does more completely — if you
-  want K-means/SVD/hybrid pruning, use that repo, don't rebuild it here.
-- **`prune_vgg_layer` can't prune the last conv layer** — it feeds
-  `classifier[0]` rather than another `Conv2d`, and resizing that Linear
-  layer's `in_features` isn't wired up. Straightforward to add; just not
-  done.
+- ~~**K-Means clustering selection is not in `prunelib`.**~~ **Added
+  2026-09-30** (`clustering.py`, see section 4), usable via `method="kmeans"`
+  in `prune_model`, `prune_vgg_layer`, `mask_vgg_layer`, and `experiments/01`.
+  Still true: its accuracy numbers (Manhattan's 35.15% params / 49.11% FLOPs
+  on VGG16) haven't been reproduced here, same caveat as `run_full()` below.
+  `pruning_framwork_v4` has its own K-Means implementation; the two haven't
+  been cross-checked against each other on the same weights yet. **SVD and
+  hybrid sequencing are still only in `pruning_framwork_v4`, by design.**
+- ~~**`prune_vgg_layer` can't prune the last conv layer**~~ **Fixed
+  2026-09-30.** `prune_vgg_layer`, `mask_vgg_layer` and `compress_masked_vgg`
+  all resize `classifier[0]`'s input columns to match. `experiments/01`'s
+  `run()` now prunes every conv layer, including the last one.
+  `archive/legacy_pipeline` still skips it (`n_prunable = len(...) - 1`),
+  deliberately, since that package is frozen.
 - **`run_full()` in `experiments/01` has never been executed.** It's real
   code, verified mechanically via `--tiny-check` (real model class, no
   network), but nobody has run it against actual CIFAR-10 and actual
@@ -445,9 +478,14 @@ correct public implementation. Current state, honestly:
 - ~~**No attention-head *pruning* surgery exists**~~ **Fixed 2026-09-21.**
   `surgery.py` now has `prune_attention_heads`, the equivalent of
   `prune_conv_bn` for a multi-head attention block (touches Q/K/V rows and
-  the output projection's columns simultaneously). `experiments/03` still
-  only *detects* redundancy (distance-based); wiring detected pairs into
-  `prune_attention_heads` calls is still open.
+  the output projection's columns simultaneously). ~~`experiments/03` still
+  only *detects* redundancy~~ **Wired up 2026-09-30:** `experiments/03`'s
+  `prune_redundant_heads` clusters each layer's heads (K-Means/Manhattan on
+  concatenated Q/K/V slices), prunes the lowest-L1 head within each
+  cluster via `prune_attention_heads`, and the smoke run checks the pruned
+  HF BERT still runs a forward pass. Whether weight-space clustering is the
+  *right* redundancy criterion for heads is still open, since it's untested
+  on a fine-tuned checkpoint.
 - **`CoActivationScanner`'s 0.9 firing-rate ceiling is a design choice, not
   a validated threshold.** Only tested against hand-constructed synthetic
   masks so far.
@@ -534,8 +572,12 @@ correct public implementation. Current state, honestly:
   it into `quantize_model_`'s `_MODEL_METHODS`; if it needs a struct like
   INT8 does, document why it's excluded from `quantize_model_`, the way
   `quantize_model_`'s own docstring does for INT8.
-- **A new CNN pruning criterion (K-means, SVD, second-order, anything
-  matching the papers) belongs in `pruning_framwork_v4`, not here.** That
+- **A new cluster-based selection rule** (e.g. a different
+  within-cluster tiebreak than L1, or agglomerative clustering): add it to
+  `clustering.py` and route it through `select_prune_indices_by_method`,
+  so every caller gets it without growing its own branch.
+- **A new CNN pruning criterion (SVD, second-order, anything matching the
+  papers other than K-Means) belongs in `pruning_framwork_v4`, not here.** That
   repo is canonical for CNN methods and already has more coverage than
   this package's `prunelib`. Adding one here would create a second,
   divergent implementation of the same idea — see the scope note at the
@@ -560,7 +602,7 @@ to add or fix a CNN pruning criterion, you probably want
 git clone https://github.com/thakerpragnesh/structured-pruning.git
 cd structured-pruning
 pip install -e ".[dev,vision-experiments,transformer-experiments]"
-pytest tests/ -v                        # 75 tests
+pytest tests/ -v                        # 92 tests
 python experiments/00_demo.py           # full pipeline, seconds
 python experiments/01_vgg_cifar10_sweep.py --smoke
 python experiments/06_generic_pruning.py --smoke
