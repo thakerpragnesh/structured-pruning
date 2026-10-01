@@ -72,6 +72,8 @@ def test_registry_basics():
 
 
 def test_built_in_names_cannot_be_silently_shadowed():
+    with pytest.raises(ValueError, match="module rule Conv2d is already registered"):
+        MODULE_RULES.register(nn.Conv2d, MODULE_RULES.get(nn.Conv2d))
     with pytest.raises(ValueError, match="already registered"):
         register_saliency_method("l1", l1_saliency)
     with pytest.raises(ValueError, match="already registered"):
@@ -231,7 +233,7 @@ class _SubResidual(nn.Module):
         return self.head(z)
 
 
-def test_op_propagator_teaches_dependency_graph_a_new_op():
+def test_op_propagator_teaches_dependency_graph_a_new_op(temporarily_register):
     """`torch.sub` couples its two branches exactly like `+` does, so the
     built-in `propagate_add` handles it once registered -- per graph, or
     globally -- without touching graph.py."""
@@ -252,15 +254,12 @@ def test_op_propagator_teaches_dependency_graph_a_new_op():
     assert model(x).shape == (1, 2, 8, 8)
     assert torch.sub not in OP_PROPAGATORS  # scoped to that one graph, not leaked globally
 
-    register_op_propagator("sub", propagate_add)
-    try:
-        model = _SubResidual(method=True)
-        DependencyGraph(model, x).get_pruning_group("b", keep).prune()
-        assert model(x).shape == (1, 2, 8, 8)
-        with pytest.raises(ValueError, match="already registered"):
-            register_op_propagator("sub", propagate_add)
-    finally:
-        del OP_PROPAGATORS["sub"]
+    temporarily_register(OP_PROPAGATORS, "sub", propagate_add)
+    model = _SubResidual(method=True)
+    DependencyGraph(model, x).get_pruning_group("b", keep).prune()
+    assert model(x).shape == (1, 2, 8, 8)
+    with pytest.raises(ValueError, match="op propagator 'sub' is already registered"):
+        register_op_propagator("sub", propagate_add)
 
 
 def test_every_method_argument_accepts_an_implementation(temporarily_register):

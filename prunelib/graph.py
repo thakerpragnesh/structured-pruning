@@ -119,7 +119,7 @@ from torch.fx.passes.shape_prop import ShapeProp
 from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels
 from .module_rules import MODULE_RULES, ChannelRole, ModuleRule, find_module_rule
-from .registry import resolve_by_type
+from .registry import Registry, resolve_by_type
 from .selection import Selector, select_prune_indices_by_method
 
 SpecialHandler = Callable[[nn.Module, torch.Tensor], nn.Module]
@@ -295,8 +295,8 @@ class DependencyGraph:
     ):
         self.model = model
         self.special_handlers = special_handlers or {}
-        self.module_rules = None if module_rules is None else {**MODULE_RULES, **module_rules}
-        self.op_propagators = None if op_propagators is None else {**OP_PROPAGATORS, **op_propagators}
+        self.module_rules = None if module_rules is None else {**MODULE_RULES.entries(), **module_rules}
+        self.op_propagators = None if op_propagators is None else {**OP_PROPAGATORS.entries(), **op_propagators}
         tracer = tracer or fx.Tracer()
         graph = tracer.trace(model)
         traced = fx.GraphModule(model, graph)
@@ -378,7 +378,7 @@ class DependencyGraph:
         """The propagator registered for `node`'s function (`call_function`)
         or method name (`call_method`), or -- for a `call_module` node -- for
         `module`'s class or its nearest registered base class."""
-        propagators = OP_PROPAGATORS if self.op_propagators is None else self.op_propagators
+        propagators = OP_PROPAGATORS.entries() if self.op_propagators is None else self.op_propagators
         if node.op == "call_module":
             return resolve_by_type(propagators, type(module))
         if node.op in ("call_function", "call_method"):
@@ -577,27 +577,23 @@ def propagate_flatten(walk: Propagation, source: fx.Node, node: fx.Node, idx: to
 
 
 # Keyed the way fx records a node's target: the function itself for
-# `call_function`, the method name for `call_method`, and -- since a
-# `call_module` target is just the submodule's name -- the module class
-# (subclasses included) for modules.
-OP_PROPAGATORS: dict[object, OpPropagator] = {
-    **dict.fromkeys([torch.add, operator.add, operator.iadd, "__add__", "__iadd__", "add", "add_"], propagate_add),
-    **dict.fromkeys([torch.cat, torch.concat], propagate_cat),
-    **dict.fromkeys([torch.flatten, "view", "reshape", "flatten", nn.Flatten], propagate_flatten),
-}
+# `call_function` (`torch.sub`), the method name for `call_method`
+# (`"sub"`), and -- since a `call_module` target is just the submodule's
+# name -- the module class (subclasses included) for modules.
+# `register_op_propagator(target, propagator)` teaches every
+# `DependencyGraph` a new op (re-registering one raises unless
+# `overwrite=True`); pass `op_propagators={...}` to one graph instead to
+# scope it to that graph.
+OP_PROPAGATORS: Registry[OpPropagator] = Registry("op propagator")
+register_op_propagator = OP_PROPAGATORS.register
 
-
-def register_op_propagator(target: object, propagator: OpPropagator, *, overwrite: bool = False) -> OpPropagator:
-    """Teach every `DependencyGraph` to carry a prune through `target` -- a
-    function (`torch.sub`), a tensor method name (`"sub"`), or a module class
-    -- with `propagator(walk, source, node, idx)`, which records into
-    `walk.group` and continues with `walk.forward`. Re-registering a target
-    raises unless `overwrite=True`; pass `op_propagators={...}` to one
-    `DependencyGraph` instead to scope it to that graph."""
-    if target in OP_PROPAGATORS and not overwrite:
-        raise ValueError(f"a propagator for {target!r} is already registered; pass overwrite=True to replace it")
-    OP_PROPAGATORS[target] = propagator
-    return propagator
+for _target in (torch.add, operator.add, operator.iadd, "__add__", "__iadd__", "add", "add_"):
+    register_op_propagator(_target, propagate_add)
+for _target in (torch.cat, torch.concat):
+    register_op_propagator(_target, propagate_cat)
+for _target in (torch.flatten, "view", "reshape", "flatten", nn.Flatten):
+    register_op_propagator(_target, propagate_flatten)
+del _target
 
 
 class LeafTracer(fx.Tracer):

@@ -57,7 +57,7 @@ place — see the scope note above for where things stand now.
 
 ```
 prunelib/
-    registry.py   (82 lines)   Registry (name -> implementation) + resolve_by_type
+    registry.py   (98 lines)   Registry (name or type -> implementation) + resolve_by_type
                                (class -> entry, via the MRO): the shared extension
                                mechanism every pluggable part below uses
     saliency.py   (157 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
@@ -74,9 +74,9 @@ prunelib/
                                slice_batchnorm primitives; Conv/BN/FFN/attention-head
                                structural surgery built on them
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
-    module_rules.py (135 lines) ModuleRule / ChannelRole: how each layer type takes
+    module_rules.py (132 lines) ModuleRule / ChannelRole: how each layer type takes
                                part in DependencyGraph pruning; MODULE_RULES registry
-    graph.py      (675 lines) torch.fx dependency resolution -- generic add/cat/
+    graph.py      (671 lines) torch.fx dependency resolution -- generic add/cat/
                                flatten/depthwise surgery, no seam passed by hand;
                                DependencyGraph (the trace) + Propagation (one
                                walk); OP_PROPAGATORS registry for add/cat/flatten;
@@ -132,7 +132,7 @@ If you're refactoring `prunelib`, read this table first.
 | `mask_vgg_layer` scores and selects only from `surviving_channels` (not-yet-masked channels), never all channels | Without this, an already-masked channel's weight is zero — the lowest possible score under every criterion — so it wins re-selection on every later iteration, and the pruning schedule advances far slower than the requested fraction implies | `vgg.py::mask_vgg_layer` |
 | "Which indices are *not* in this index tensor" is a boolean mask + `nonzero()`, never `set(idx.tolist())` plus a Python `range()` comprehension | Not a historical defect, but a recurring anti-pattern found and fixed 2026-09-22 in three places (`masking.py::surviving_channels`, `vgg.py::prune_vgg_layer`, `saliency.py::keep_indices`) — same result, but drops to a Python-level loop over every channel instead of one vectorized op. If you write `set(...)` + a `range()` comprehension against a channel/index tensor anywhere in this codebase, that's the pattern to replace — with `indices.complement_indices`, which every one of those call sites (and the experiments) now uses | `indices.py` |
 
-| Every pluggable part — saliency scorers, selection rules, distance metrics, quantization methods, prunable layer types, the ops a prune passes through — dispatches through a public registry (`registry.Registry`, or `module_rules.MODULE_RULES` for layer types and `graph.OP_PROPAGATORS` for ops); adding one is a `register_*` call from the caller's own code | Not a historical defect: the open/closed refactor of 2026-10-02. Each was a private dict (`_METHODS`, `_MODEL_METHODS`) or an `if`-chain, so extending meant editing the library — and the same three distance metrics were written out twice (`scanners.py`, `clustering.py`), free to drift apart | `registry.py`, and each module's `*_METHODS`/`*_METRICS`/`MODULE_RULES`/`OP_PROPAGATORS` |
+| Every pluggable part — saliency scorers, selection rules, distance metrics, quantization methods, prunable layer types, the ops a prune passes through — dispatches through a public `registry.Registry` (keyed by name, or — for layer types in `module_rules.MODULE_RULES` and ops in `graph.OP_PROPAGATORS` — by class/fx op target, looked up through the MRO); adding one is a `register_*` call from the caller's own code | Not a historical defect: the open/closed refactor of 2026-10-02. Each was a private dict (`_METHODS`, `_MODEL_METHODS`) or an `if`-chain, so extending meant editing the library — and the same three distance metrics were written out twice (`scanners.py`, `clustering.py`), free to drift apart | `registry.py`, and each module's `*_METHODS`/`*_METRICS`/`MODULE_RULES`/`OP_PROPAGATORS` |
 | Exactly one set of primitives builds a pruned replacement module (`surgery.slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` / `slice_batchnorm`), and it carries over device, dtype and `padding_mode` | `graph.py` and `vgg.py` each had their own copy of `prune_conv_bn`'s index-and-copy logic (and of BatchNorm's running-stat copy); every copy rebuilt modules as CPU float32 with `padding_mode='zeros'`, so pruning a CUDA model left CPU layers in it and a `'reflect'` conv silently changed its border behaviour | `surgery.py` |
 
 If you ever find yourself writing a loop that tracks a running max/min by

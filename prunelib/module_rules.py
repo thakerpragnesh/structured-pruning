@@ -29,12 +29,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Mapping
 
 import torch
 import torch.nn as nn
 
 from .indices import complement_indices
-from .registry import resolve_by_type
+from .registry import Registry, resolve_by_type
 from .surgery import is_depthwise_conv, slice_batchnorm, slice_conv2d, slice_depthwise_conv2d, slice_linear
 
 
@@ -112,24 +113,20 @@ class BatchNormRule(ModuleRule):
         return slice_batchnorm(bn, complement_indices(bn.num_features, _per_channel_prune(prune_out, prune_in, bn)))
 
 
-MODULE_RULES: dict[type, ModuleRule] = {
-    nn.Conv2d: Conv2dRule(),
-    nn.Linear: LinearRule(),
-    nn.BatchNorm1d: BatchNormRule(),
-    nn.BatchNorm2d: BatchNormRule(),
-}
+# Keyed by module class; a rule also covers that class's subclasses.
+# `register_module_rule(nn.Conv1d, MyConv1dRule())` teaches every
+# `DependencyGraph` a new type (re-registering one raises unless
+# `overwrite=True`).
+MODULE_RULES: Registry[ModuleRule] = Registry("module rule")
+register_module_rule = MODULE_RULES.register
+
+register_module_rule(nn.Conv2d, Conv2dRule())
+register_module_rule(nn.Linear, LinearRule())
+register_module_rule(nn.BatchNorm1d, BatchNormRule())
+register_module_rule(nn.BatchNorm2d, BatchNormRule())
 
 
-def register_module_rule(module_type: type, rule: ModuleRule, *, overwrite: bool = False) -> ModuleRule:
-    """Teach every `DependencyGraph` how to prune `module_type` (and its
-    subclasses). Re-registering a type raises unless `overwrite=True`."""
-    if module_type in MODULE_RULES and not overwrite:
-        raise ValueError(f"a rule for {module_type.__name__} is already registered; pass overwrite=True to replace it")
-    MODULE_RULES[module_type] = rule
-    return rule
-
-
-def find_module_rule(module: nn.Module, rules: dict[type, ModuleRule] | None = None) -> ModuleRule | None:
+def find_module_rule(module: nn.Module, rules: Mapping[type, ModuleRule] | None = None) -> ModuleRule | None:
     """The rule for `module`'s type or nearest registered base class, from
     `rules` (default: the global `MODULE_RULES`), or None."""
-    return resolve_by_type(MODULE_RULES if rules is None else rules, type(module))
+    return resolve_by_type(MODULE_RULES.entries() if rules is None else rules, type(module))
