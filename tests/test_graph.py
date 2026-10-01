@@ -129,7 +129,7 @@ def test_two_branches_disagreeing_on_a_shared_layer_raises():
     group = dep.get_pruning_group(model.conv2, torch.tensor([0, 1, 2, 3, 4]))
     with pytest.raises(ValueError, match="disagree"):
         # Same shortcut_conv, but a different (conflicting) index set this time.
-        dep._record(group.output_targets, "shortcut_conv", torch.tensor([0, 1, 2, 3, 5]))
+        group.add_output_target("shortcut_conv", torch.tensor([0, 1, 2, 3, 5]))
 
 
 class ConcatBranches(nn.Module):
@@ -416,3 +416,39 @@ def test_special_handler_prunes_attention_block_via_prune_attention_heads():
     assert model.attn.out.in_features == 6
     out = model(x)
     assert out.shape == (2, 8)  # hidden size at the block's boundary is unchanged by head pruning
+
+
+class TinyAttentionBlockSubclass(TinyAttentionBlock):
+    pass
+
+
+def test_special_handler_also_matches_subclasses_of_the_registered_type():
+    """Liskov: a subclass of a registered block type must be handled like
+    its parent. `special_handlers` used to be keyed on the exact `type()`,
+    while `LeafTracer` already used `isinstance` -- so a subclass traced as a
+    leaf, then fell through to "expected Conv2d or Linear"."""
+    torch.manual_seed(0)
+    model = AttentionWrapper(hidden=8, num_heads=4)
+    model.attn = TinyAttentionBlockSubclass(hidden=8, num_heads=4)
+    x = torch.randn(2, 8)
+
+    dep = DependencyGraph(
+        model, x,
+        tracer=LeafTracer([TinyAttentionBlock]),
+        special_handlers={TinyAttentionBlock: _prune_tiny_attention_block},
+    )
+    dep.get_pruning_group(model.attn, torch.tensor([1, 2])).prune()
+
+    assert model.attn.num_heads == 2
+    assert model(x).shape == (2, 8)
+
+
+def test_depthwise_conv_cannot_be_the_starting_layer():
+    """A depthwise conv only carries the channels its producer emits, so
+    pruning it alone left the producer's output wider than the depthwise
+    conv's new input -- a model that failed on its next forward pass. Start
+    from the producer instead (see the depthwise sandwich test above)."""
+    model = DepthwiseSandwich(channels=6)
+    dep = DependencyGraph(model, torch.randn(1, 3, 8, 8))
+    with pytest.raises(TypeError, match="start from the layer that feeds it"):
+        dep.get_pruning_group(model.dw, torch.tensor([0, 1, 3, 5]))

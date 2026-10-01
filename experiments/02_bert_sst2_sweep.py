@@ -10,7 +10,7 @@ import argparse
 
 import torch
 
-from prunelib import compute_score, count_params, prune_ffn_block, select_prune_indices
+from prunelib import compute_score, count_params, keep_indices, prune_ffn_block
 
 
 def _score_ffn_neurons(fc1_weight: torch.Tensor, method: str = "max_k") -> torch.Tensor:
@@ -43,10 +43,7 @@ def run_smoke(prune_fraction=0.3, seed=0):
 
     scores = _score_ffn_neurons(fc1.weight, method="max_k")
     prune_amount = int(config.intermediate_size * prune_fraction)
-    keep_idx = torch.tensor(
-        [i for i in range(config.intermediate_size)
-         if i not in set(select_prune_indices(scores, prune_amount).tolist())]
-    )
+    keep_idx = keep_indices(scores, prune_amount)
 
     new_fc1, new_fc2 = prune_ffn_block(fc1, fc2, keep_idx)
     layer.intermediate.dense, layer.output.dense = new_fc1, new_fc2

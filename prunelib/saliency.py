@@ -24,10 +24,22 @@ spatial)` so one code path covers both, instead of every caller reshaping a
 Linear weight to a fake `[out, in, 1, 1]` conv tensor to reuse this module (as
 `experiments/02_bert_sst2_sweep.py` used to -- see its `_score_ffn_neurons`
 before this change).
+
+Scorers live in `SALIENCY_METHODS` (a `registry.Registry`), so a new
+criterion is added from the caller's own code -- `@register_saliency_method(
+"taylor")` on a `(weight, **kwargs) -> Tensor[out]` function -- and is then
+accepted by `compute_score`, `selection.select_prune_indices_by_method`,
+`graph.prune_model` and `vgg.py` without editing any of them.
 """
 from __future__ import annotations
 
 import torch
+
+from .indices import complement_indices
+from .registry import Registry
+
+SALIENCY_METHODS: Registry = Registry("method")
+register_saliency_method = SALIENCY_METHODS.register
 
 
 def _channel_view(weight: torch.Tensor) -> torch.Tensor:
@@ -51,6 +63,7 @@ def _channel_view(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
+@register_saliency_method("max_k")
 def max_k_saliency(weight: torch.Tensor, k: int = 3) -> torch.Tensor:
     """Max-k saliency score per output channel/neuron.
 
@@ -90,16 +103,19 @@ def max_k_saliency(weight: torch.Tensor, k: int = 3) -> torch.Tensor:
     return channel_scores
 
 
+@register_saliency_method("l1")
 def l1_saliency(weight: torch.Tensor) -> torch.Tensor:
     """L1-norm saliency: sum of absolute weights per output channel/neuron."""
     return _channel_view(weight.detach()).abs().sum(dim=(1, 2))
 
 
+@register_saliency_method("l2")
 def l2_saliency(weight: torch.Tensor) -> torch.Tensor:
     """L2-norm saliency: Euclidean norm of weights per output channel/neuron."""
     return _channel_view(weight.detach()).pow(2).sum(dim=(1, 2)).sqrt()
 
 
+@register_saliency_method("random")
 def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
     """Random baseline score, one draw per output channel/neuron. Seed via `generator`."""
     out_ch = _channel_view(weight).shape[0]
@@ -108,24 +124,15 @@ def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = No
     return torch.rand(out_ch)
 
 
-_METHODS = {
-    "max_k": max_k_saliency,
-    "l1": l1_saliency,
-    "l2": l2_saliency,
-    "random": random_saliency,
-}
-
-
 def compute_score(weight: torch.Tensor, method: str = "max_k", **kwargs) -> torch.Tensor:
     """Single entry point used by every experiment and by `select_prune_indices`.
 
     Because scoring always goes through here, there is no code path where a
     caller can compute one score and select against another (which is exactly
-    how D1 happened in the original codebase).
+    how D1 happened in the original codebase). `method` is any name in
+    `SALIENCY_METHODS`; `kwargs` are forwarded to that scorer.
     """
-    if method not in _METHODS:
-        raise ValueError(f"unknown method {method!r}, expected one of {list(_METHODS)}")
-    return _METHODS[method](weight, **kwargs)
+    return SALIENCY_METHODS.get(method)(weight, **kwargs)
 
 
 def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
@@ -144,7 +151,4 @@ def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tenso
 
 def keep_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
     """Complement of `select_prune_indices`: the channels to keep, ascending order."""
-    prune_idx = select_prune_indices(scores, prune_amount)
-    keep_mask = torch.ones(scores.numel(), dtype=torch.bool)
-    keep_mask[prune_idx] = False
-    return keep_mask.nonzero(as_tuple=True)[0]
+    return complement_indices(scores.numel(), select_prune_indices(scores, prune_amount))

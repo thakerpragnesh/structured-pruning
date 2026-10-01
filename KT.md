@@ -57,31 +57,45 @@ place — see the scope note above for where things stand now.
 
 ```
 prunelib/
-    saliency.py   (150 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
-                               Conv2d or Linear weights
-    surgery.py    (216 lines)  Conv/BN/FFN/attention-head structural surgery
-                               (in-place substitution)
+    registry.py   (82 lines)   Registry (name -> implementation) + resolve_by_type
+                               (class -> entry, via the MRO): the shared extension
+                               mechanism every pluggable part below uses
+    saliency.py   (154 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
+                               Conv2d or Linear weights; SALIENCY_METHODS registry
+    selection.py  (64 lines)   select_prune_indices_by_method: weight + budget ->
+                               prune indices, by any scorer or registered selector
+    clustering.py (185 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
+                               prune the lowest-L1 channels within each cluster;
+                               registers itself as the "kmeans" selection rule
+    distance.py   (66 lines)   DistanceMetric (pairwise distance + matching K-Means
+                               centroid); DISTANCE_METRICS registry
+    indices.py    (35 lines)   complement_indices, expand_blocks
+    surgery.py    (280 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
+                               slice_batchnorm primitives; Conv/BN/FFN/attention-head
+                               structural surgery built on them
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
-    graph.py      (661 lines) torch.fx dependency resolution -- generic add/cat/
+    module_rules.py (135 lines) ModuleRule / ChannelRole: how each layer type takes
+                               part in DependencyGraph pruning; MODULE_RULES registry
+    graph.py      (599 lines) torch.fx dependency resolution -- generic add/cat/
                                flatten/depthwise surgery, no seam passed by hand;
                                plus prune_model() (one-call generic pruning),
                                PruningGroup.mask()/.commit_and_compress() (two-phase
                                workflow for a whole dependency group), and
                                special_handlers/LeafTracer (attention-block hook)
-    quantization.py (182 lines) Post-training Float16 / linear INT8 / Fixed-Point32
+    quantization.py (195 lines) Post-training Float16 / linear INT8 / Fixed-Point32
                                quantization (thesis Ch. 6.6) -- separate compression
-                               stage from pruning, applied after it
+                               stage from pruning, applied after it;
+                               QUANTIZATION_METHODS registry
     vgg.py        VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
-                               (every conv layer, including the last -> classifier[0])
-    clustering.py (208 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
-                               prune the lowest-L1 channels within each cluster
-    scanners.py   (70 lines)   Distance metrics + co-activation scanning
+                               (every conv layer, including the last -> classifier[0];
+                               only build_vgg16 needs torchvision)
+    scanners.py   (67 lines)   Pairwise distance matrix + co-activation scanning
     evaluate.py   (59 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
-    00_demo.py                 (76 lines)  full pipeline, seconds, no dependencies beyond torch
-    01_vgg_cifar10_sweep.py   (174 lines)  VGG16/CIFAR-10 — see section 5, this one has three run modes
-    02_bert_sst2_sweep.py      (78 lines)  BERT FFN pruning
-    03_head_redundancy.py     (110 lines)  attention head distance scan + K-Means head pruning
+    00_demo.py                 (75 lines)  full pipeline, seconds, no dependencies beyond torch
+    01_vgg_cifar10_sweep.py   (183 lines)  VGG16/CIFAR-10 — see section 5, this one has three run modes
+    02_bert_sst2_sweep.py      (75 lines)  BERT FFN pruning
+    03_head_redundancy.py     (108 lines)  attention head distance scan + K-Means head pruning
     04_coactivation.py         (44 lines)  synthetic co-activation demo
     05_ordering.py             (69 lines)  does the CNN ordering result transfer?
     06_generic_pruning.py     (130 lines)  DependencyGraph on a real ResNet-18
@@ -93,10 +107,10 @@ archive/
         pipeline.py         kept here as a tested mask-then-compress example,
                              not a live alternative. Moved under archive/
                              2026-09-21. See LEGACY_PIPELINE_MIGRATION.md.
-tests/          92 tests across 10 files, one per historical defect or behavior
+tests/          107 tests across 11 files, one per historical defect or behavior
 ```
 
-Total: ~3,800 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
+Total: ~5,100 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
 
 ## 3. Design decisions, and the defect each one prevents
 
@@ -114,7 +128,10 @@ If you're refactoring `prunelib`, read this table first.
 | Pruning a VGG layer replaces modules in-place inside `model.features` rather than rebuilding a whole model from a `feature_list` and copying weights in | This *is* D6/D7's root cause, one level up — the old code's entire "reconstruct then copy" pattern is gone, not just patched | `experiments/01_vgg_cifar10_sweep.py::prune_vgg_layer`, `vgg.py::compress_masked_vgg` |
 | Masking uses `torch.nn.utils.prune.custom_from_mask` — one call, full mask computed up front — instead of subclassing `BasePruningMethod` with a `compute_mask` that reconstructs the mask from global state on every call | The systemic bug across *every* driver script in old `pruning_framwork_v4`: a `layer_number` global was supposed to tell `compute_mask` which layer it was on, and the line updating it was commented out in all six scripts, so it silently stayed 0 forever (see `GITHUB_AUDIT.md` section 11) | `masking.py::mask_channels` |
 | `mask_vgg_layer` scores and selects only from `surviving_channels` (not-yet-masked channels), never all channels | Without this, an already-masked channel's weight is zero — the lowest possible score under every criterion — so it wins re-selection on every later iteration, and the pruning schedule advances far slower than the requested fraction implies | `vgg.py::mask_vgg_layer` |
-| "Which indices are *not* in this index tensor" is a boolean mask + `nonzero()`, never `set(idx.tolist())` plus a Python `range()` comprehension | Not a historical defect, but a recurring anti-pattern found and fixed 2026-09-22 in three places (`masking.py::surviving_channels`, `vgg.py::prune_vgg_layer`, `saliency.py::keep_indices`) — same result, but drops to a Python-level loop over every channel instead of one vectorized op. If you write `set(...)` + a `range()` comprehension against a channel/index tensor anywhere in this codebase, that's the pattern to replace | `masking.py`, `saliency.py`, `vgg.py` |
+| "Which indices are *not* in this index tensor" is a boolean mask + `nonzero()`, never `set(idx.tolist())` plus a Python `range()` comprehension | Not a historical defect, but a recurring anti-pattern found and fixed 2026-09-22 in three places (`masking.py::surviving_channels`, `vgg.py::prune_vgg_layer`, `saliency.py::keep_indices`) — same result, but drops to a Python-level loop over every channel instead of one vectorized op. If you write `set(...)` + a `range()` comprehension against a channel/index tensor anywhere in this codebase, that's the pattern to replace — with `indices.complement_indices`, which every one of those call sites (and the experiments) now uses | `indices.py` |
+
+| Every pluggable part — saliency scorers, selection rules, distance metrics, quantization methods, prunable layer types — dispatches through a public registry (`registry.Registry`, or `module_rules.MODULE_RULES` for layer types); adding one is a `register_*` call from the caller's own code | Not a historical defect: the open/closed refactor of 2026-10-02. Each was a private dict (`_METHODS`, `_MODEL_METHODS`) or an `if`-chain, so extending meant editing the library — and the same three distance metrics were written out twice (`scanners.py`, `clustering.py`), free to drift apart | `registry.py`, and each module's `*_METHODS`/`*_METRICS`/`MODULE_RULES` |
+| Exactly one set of primitives builds a pruned replacement module (`surgery.slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` / `slice_batchnorm`), and it carries over device, dtype and `padding_mode` | `graph.py` and `vgg.py` each had their own copy of `prune_conv_bn`'s index-and-copy logic (and of BatchNorm's running-stat copy); every copy rebuilt modules as CPU float32 with `padding_mode='zeros'`, so pruning a CUDA model left CPU layers in it and a `'reflect'` conv silently changed its border behaviour | `surgery.py` |
 
 If you ever find yourself writing a loop that tracks a running max/min by
 hand, or a loop with a manually-incremented destination index into a
@@ -132,7 +149,10 @@ routed through `compute_score(weight, method=...)`. `select_prune_indices`
 and `keep_indices` operate on the *score* tensor, not the weight — this
 separation is what makes D1 structurally impossible to reintroduce, since
 there's no code path where a caller has both a weight tensor and a stale
-score tensor in scope at the same time.
+score tensor in scope at the same time. The scorers are entries in
+`SALIENCY_METHODS` (registered with `@register_saliency_method("max_k")`
+etc.), so a new one added from outside the package is immediately valid
+everywhere `method=` is accepted — see "Extension points" below.
 
 `max_k_saliency` is the one to understand well: it flattens each kernel to
 1D, takes the top-`k` magnitudes with `torch.topk`, sums them (`kernel_scores`,
@@ -144,12 +164,24 @@ historical defects.
 
 ### `prunelib/surgery.py`
 
-Two functions: `prune_conv_bn` (Conv2d + optional BatchNorm2d + optional next
-Conv2d) and `prune_ffn_block` (Linear → activation → Linear). Both build
-*new* modules of the correct smaller size and copy the kept rows/columns in
-— they never mutate the originals. Both validate the seam (that the tensor
+Four primitives — `slice_conv2d(conv, keep_out=, keep_in=)`,
+`slice_depthwise_conv2d(conv, keep)`, `slice_linear(linear, keep_out=,
+keep_in=)`, `slice_batchnorm(bn, keep)` — and three seam-aware functions
+built on them: `prune_conv_bn` (Conv2d + optional BatchNorm2d + optional
+next Conv2d), `prune_ffn_block` (Linear → activation → Linear), and
+`prune_attention_heads`. Everything builds *new* modules of the correct
+smaller size and copies the kept rows/columns in — never mutating the
+originals. The seam-aware functions validate the seam (that the tensor
 shapes on either side of the cut actually match) before doing anything, and
 raise `ValueError` with a specific message if not.
+
+The primitives are the only code in `prunelib` that constructs a pruned
+module — `graph.py` (through `module_rules.py`) and `vgg.py` call them too —
+so "a replacement is a drop-in substitute" is enforced in one place: it
+keeps the original's kernel/stride/padding/dilation, `padding_mode`, device
+and dtype. `slice_conv2d` raises for a grouped conv rather than building
+`groups=1` (which, for a depthwise conv, used to silently broadcast each
+single-channel filter across every input channel).
 
 One deliberate design choice worth knowing: `prune_conv_bn` copies
 BatchNorm's running mean/var across to the new, smaller BN layer. The
@@ -204,6 +236,23 @@ module's own docstring for the full list of what's deliberately out of
 scope (no automatic attention-block discovery; only one `cat` branch pruned
 at a time; a few other named limitations).
 
+Which layer types it understands lives in `module_rules.py`, not in
+`graph.py`: each type's `ModuleRule` answers `role(module)` — a
+`ChannelRole.MIXING` layer (ungrouped Conv2d, Linear) is where a prune
+*stops* (only its input shrinks) and where channels are *produced* (a
+starting layer, or the far end of a skip connection); a
+`ChannelRole.PER_CHANNEL` layer (BatchNorm, depthwise conv) shrinks and
+passes the prune through — and `rebuild(module, prune_out, prune_in)`.
+The forward walk, the backward skip-connection walk and `PruningGroup.prune()`
+all depend only on those two answers. Register a rule for another type
+(`register_module_rule`, or `module_rules=` on one `DependencyGraph`) and all
+three paths handle it; `tests/test_extension_points.py` does this for
+Conv1d. `PruningGroup.add_output_target`/`add_input_target` own the
+"two branches disagree about one layer" check. The starting layer must be
+`MIXING`: starting from a depthwise conv used to be accepted and leave its
+producer's output wider than its new input (a model that failed on the next
+forward pass); it now raises `TypeError`.
+
 One real deviation from the rest of this library, called out in the
 docstring: `PruningGroup.prune()` mutates the model in place instead of
 returning new modules for the caller to wire up. That's deliberate — the
@@ -243,6 +292,10 @@ designed for, it falls out of the forward-walk naturally.
   Conv2d/Linear/BatchNorm logic) decides how to rebuild it — see
   `test_graph.py::test_special_handler_prunes_attention_block_via_prune_attention_heads`
   for a worked example wiring a handler to `surgery.prune_attention_heads`.
+  Subclasses of a registered type are matched too (MRO lookup, the same
+  `isinstance` semantics `LeafTracer` already used — it used to be an
+  exact-`type()` match, so a subclass traced as a leaf and then fell
+  through to "expected Conv2d or Linear").
   `LeafTracer` exists because a custom block class isn't a leaf under
   `fx.Tracer`'s default rule, so without it `DependencyGraph` would trace
   straight through the block and never see it as one node to hand to the
@@ -297,7 +350,10 @@ Every conv layer can be pruned, including the last one (added
 input columns `[c*49, (c+1)*49)` (`_shrink_classifier_input`, the VGG-
 specific version of `graph.py`'s flatten handling). Both
 `prune_vgg_layer` and `mask_vgg_layer` take any `method=` that
-`clustering.select_prune_indices_by_method` accepts, including `"kmeans"`.
+`selection.select_prune_indices_by_method` accepts, including `"kmeans"`
+or a selector callable. Only `build_vgg16` needs torchvision (imported
+inside it), so the surgery functions work on any torchvision-shaped VGG
+without the optional dependency installed.
 
 ### `archive/legacy_pipeline/`
 
@@ -322,9 +378,10 @@ defect-by-defect mapping from the original scripts.
 
 
 
-`pairwise_distance_matrix(vectors, metric)` implements Manhattan/Euclidean/
-Cosine — the three metrics compared in Paper 2. It computes distances only;
-the clustering and selection live in `clustering.py` (below).
+`pairwise_distance_matrix(vectors, metric)` computes Manhattan/Euclidean/
+Cosine — the three metrics compared in Paper 2 — via `distance.py` (below),
+the same metric definitions `clustering.kmeans` uses. It computes distances
+only; the clustering and selection live in `clustering.py` (below).
 
 ### `prunelib/clustering.py`
 
@@ -345,13 +402,15 @@ cluster. A smaller `n_clusters` still protects one representative per
 cluster and prunes the lowest-L1 channels among the rest. It raises rather
 than empty a cluster.
 
-`select_prune_indices_by_method(weight, n, method, **kwargs)` is the single
-dispatcher `vgg.py` and `graph.prune_model` call. `"kmeans"` goes to the
-function above; every other method goes through `compute_score` →
+`kmeans_prune_indices` registers itself as the `"kmeans"` rule in
+`selection.SELECTION_METHODS`. `select_prune_indices_by_method(weight, n,
+method, **kwargs)` — the single dispatcher `vgg.py` and `graph.prune_model`
+call — now lives in `selection.py` (still importable from here) and never
+imports this module: registered selectors (like `"kmeans"`) are called
+directly, and every saliency method goes through `compute_score` →
 `select_prune_indices` exactly as before, so the D1 guarantee (one score,
-one selection) still holds for the saliency methods. A cluster-based rule
-isn't a per-channel score, which is why it sits beside `compute_score`
-rather than inside it.
+one selection) still holds. A cluster-based rule isn't a per-channel score,
+which is why it's a selector rather than a scorer.
 
 `CoActivationScanner` computes pairwise Jaccard similarity on boolean firing
 masks, with a `firing_rate_ceiling` (default 0.9) that excludes near-
@@ -363,6 +422,36 @@ against real model activations yet (see section 6) — the logic is tested
 against synthetic masks in `tests/test_scanners.py` and demonstrated in
 `experiments/04_coactivation.py`, but nobody has confirmed the 0.9 default
 is the right threshold on an actual fine-tuned model.
+
+### Extension points: `registry.py`, `selection.py`, `distance.py`, `module_rules.py`, `indices.py`
+
+Added 2026-10-02 (the open/closed refactor; every pruning path was verified
+bit-identical against the previous implementation — same pruned weights,
+same `DependencyGraph` groups on a real ResNet-18, same VGG mask/compress
+result). `registry.Registry` is the one mechanism: a named table with
+`register` (also a decorator; refuses to shadow an existing name unless
+`overwrite=True`), `get` (the usual "unknown method 'x', expected one of
+[...]" error), and `resolve` (a name is looked up, anything else is taken
+to already be an implementation — which is why `method=` can be a callable
+and `metric=` a `DistanceMetric`). The registries:
+
+- `saliency.SALIENCY_METHODS` — `(weight, **kw) -> Tensor[out]` scorers.
+- `selection.SELECTION_METHODS` — `(weight, prune_amount, **kw) -> prune_idx`
+  selectors for rules that aren't a per-channel score (`"kmeans"`).
+- `distance.DISTANCE_METRICS` — `DistanceMetric(pairwise, centroid)`; the
+  centroid is the K-Means update that minimizes that distance, kept in the
+  same object so the two can't be registered inconsistently. `centroid=None`
+  is fine for scanning; `kmeans` rejects it.
+- `quantization.QUANTIZATION_METHODS` — same-shape round-trips
+  `quantize_model_` can apply. INT8 is deliberately absent: it returns an
+  `Int8Tensor`, a different contract.
+- `module_rules.MODULE_RULES` — keyed by class, resolved through the MRO
+  (`registry.resolve_by_type`), so subclasses inherit their parent's rule.
+
+`indices.py` holds the two index helpers that used to be re-derived inline
+in four or five places each: `complement_indices(n, idx)` ("which of `0..n-1`
+aren't in `idx`") and `expand_blocks(idx, block_size)` (channel → its block
+of flattened columns, head → its block of Q/K/V rows).
 
 ### `prunelib/evaluate.py`
 
@@ -422,7 +511,7 @@ defect-named test even if you refactor the code it guards, unless you're
 certain the refactor makes the bug class structurally impossible (as, e.g.,
 switching to `torch.topk` made D2 impossible to reintroduce even accidentally).
 
-Run everything: `PYTHONPATH=. pytest tests/ -v` (92 tests, ~30-35s total on
+Run everything: `PYTHONPATH=. pytest tests/ -v` (107 tests, ~35-40s total on
 CPU; the pure-`prunelib` tests alone (including `test_graph.py`,
 `test_quantization.py`, and `test_evaluate.py`, none of which need
 `torchvision`/`transformers`) are still ~2-3s, the rest is the handful
@@ -528,14 +617,20 @@ correct public implementation. Current state, honestly:
 
 ## 7. Extending this codebase — where new work goes
 
-- **New scoring method** (e.g. a second-order/Hessian-based saliency): add
-  a function to `saliency.py` matching the existing signature
-  (`weight: [out,in,kh,kw] -> Tensor[out]`), register it in `_METHODS`, add
+- **New scoring method** (e.g. a second-order/Hessian-based saliency): write
+  a function matching the existing signature (`weight: [out,in,kh,kw] ->
+  Tensor[out]`) and decorate it with `@register_saliency_method("name")` —
+  in `saliency.py` if it belongs in the library, or in your own code if it
+  doesn't; either way `compute_score`, `select_prune_indices_by_method`,
+  `prune_model` and `vgg.py` accept it with no further edit. Add
   a test in `tests/test_saliency.py` following the existing pattern
   (independent brute-force comparison where feasible, like
   `test_d2_matches_bruteforce_topk`).
 - **New surgery type** (`prune_attention_heads` is the worked example now):
-  add to `surgery.py`, validate the seam and raise before mutating anything
+  add to `surgery.py`, build it from the `slice_*` primitives (don't
+  construct modules and copy weights by hand — that's how three diverging
+  copies of the same logic happened), validate the seam and raise before
+  mutating anything
   (follow `prune_ffn_block`'s pattern exactly), add a test that checks
   *values* survive correctly post-surgery, not just shapes (see
   `test_d6_conv_values_are_correct_not_just_shape` for why shape-only tests
@@ -558,6 +653,12 @@ correct public implementation. Current state, honestly:
   handler mechanism itself. `PruningGroup.mask()` / `.commit_and_compress()`
   (also added 2026-09-23) already wire `DependencyGraph`-based pruning into
   the two-phase mask-then-compress workflow — that's no longer open either.
+  To make `DependencyGraph` prune *through* a new layer type (Conv1d,
+  LayerNorm, GroupNorm, ...), don't edit `graph.py`: write a
+  `module_rules.ModuleRule` (`role` + `rebuild`) and register it with
+  `register_module_rule`, or pass `module_rules={Type: rule}` to one graph.
+  `tests/test_extension_points.py::test_module_rule_teaches_dependency_graph_a_new_layer_type`
+  is the worked example.
 - **New quantization method** (e.g. logarithmic or k-means-based
   quantization, which the thesis flags as better fits for skewed weight
   distributions than linear INT8 — see section 10.2): add a function to
@@ -568,14 +669,19 @@ correct public implementation. Current state, honestly:
   feasible, like `test_int8_quantize_matches_the_documented_formula`; a
   clipping/wrapping-at-the-boundary test if the format has a bounded range,
   like `test_fixed_point32_clips_out_of_range_values_instead_of_wrapping`).
-  If it round-trips to a same-shape, same-dtype-castable tensor, also wire
-  it into `quantize_model_`'s `_MODEL_METHODS`; if it needs a struct like
-  INT8 does, document why it's excluded from `quantize_model_`, the way
-  `quantize_model_`'s own docstring does for INT8.
+  If it round-trips to a same-shape, same-dtype-castable tensor, also
+  decorate it with `@register_quantization_method("name")` so
+  `quantize_model_` can apply it; if it needs a struct like INT8 does, don't
+  register it (it would break `quantize_model_`'s uniform copy-back loop) —
+  document why it's excluded instead, the way `quantize_model_`'s own
+  docstring does for INT8.
 - **A new cluster-based selection rule** (e.g. a different
   within-cluster tiebreak than L1, or agglomerative clustering): add it to
-  `clustering.py` and route it through `select_prune_indices_by_method`,
-  so every caller gets it without growing its own branch.
+  `clustering.py` with `@register_selection_method("name")` — signature
+  `(weight, prune_amount, **kwargs) -> prune_idx` — so every caller gets it
+  without growing its own branch (and without `selection.py` importing it).
+  A new distance metric for it goes through `register_distance_metric`,
+  with the centroid rule that minimizes it.
 - **A new CNN pruning criterion (SVD, second-order, anything matching the
   papers other than K-Means) belongs in `pruning_framwork_v4`, not here.** That
   repo is canonical for CNN methods and already has more coverage than
@@ -602,7 +708,7 @@ to add or fix a CNN pruning criterion, you probably want
 git clone https://github.com/thakerpragnesh/structured-pruning.git
 cd structured-pruning
 pip install -e ".[dev,vision-experiments,transformer-experiments]"
-pytest tests/ -v                        # 92 tests
+pytest tests/ -v                        # 107 tests
 python experiments/00_demo.py           # full pipeline, seconds
 python experiments/01_vgg_cifar10_sweep.py --smoke
 python experiments/06_generic_pruning.py --smoke

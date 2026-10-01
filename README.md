@@ -26,7 +26,7 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (92 tests,
+compress once at the end — cleanly and with a real test suite (107 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
@@ -189,6 +189,43 @@ dep = DependencyGraph(
 dep.get_pruning_group(model.attn, keep_heads).prune()
 ```
 
+### Extending `prunelib` without editing it
+
+Every pluggable part — saliency scorers, selection rules, distance metrics,
+quantization methods, and the layer types `DependencyGraph` can prune — is
+a public registry. Register from your own code, and every entry point that
+dispatches on it picks the new entry up:
+
+```python
+from prunelib import (
+    ChannelRole, DistanceMetric, ModuleRule, register_distance_metric,
+    register_module_rule, register_quantization_method, register_saliency_method,
+)
+
+@register_saliency_method("taylor")            # now valid as method="taylor" in compute_score,
+def taylor_saliency(weight, **kwargs): ...     # select_prune_indices_by_method, prune_model, vgg.py
+
+register_distance_metric("chebyshev", DistanceMetric(  # scanning and K-Means both accept it
+    pairwise=lambda x, y: torch.cdist(x, y, p=float("inf")),
+    centroid=lambda m: (m.max(0).values + m.min(0).values) / 2,
+))
+
+register_quantization_method("log2", my_log2_round_trip)   # quantize_model_(model, method="log2")
+
+class Conv1dRule(ModuleRule):                  # teach DependencyGraph a new layer type
+    def role(self, conv): return ChannelRole.MIXING
+    def rebuild(self, conv, prune_out, prune_in): ...
+register_module_rule(nn.Conv1d, Conv1dRule())  # or DependencyGraph(..., module_rules={...}) for one graph
+```
+
+`prune_model`, `prune_vgg_layer` and `mask_vgg_layer` also take a selector
+callable directly as `method=` — `(weight, prune_amount) -> prune_idx` — for
+a one-off rule not worth registering. Every pruned module is rebuilt by
+`surgery.py`'s `slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` /
+`slice_batchnorm`, which keep the original's device, dtype and
+`padding_mode`; `tests/test_extension_points.py` has a worked example of
+each extension point.
+
 ## Results
 
 CNN results below are the published, peer-reviewed figures (see
@@ -213,6 +250,7 @@ and how much of the network is pruned, and will not be identical across runs.
 | `graph.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), `prune_model`, two-phase `PruningGroup`, `special_handlers` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
 | `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
+| `registry.py` / `selection.py` / `distance.py` / `module_rules.py` — public extension points (scorers, selection rules, metrics, quantization methods, prunable layer types) | Unit-tested, including a custom Conv1d rule driving `DependencyGraph` end to end; refactor verified bit-identical against the previous implementation on every pruning path |
 | `clustering.py` — K-Means (Manhattan/Euclidean/Cosine) selection, prune lowest-L1 within each cluster | Unit-tested, including a brute-force check of the selection rule and end-to-end through `prune_model` and both VGG paths; paper's accuracy numbers not yet reproduced here |
 | `experiments/01` VGG-CIFAR10 sweep | `--tiny-check` runs the real `torchvision.models.vgg16` class through real `prune_vgg_layer`/`prune_conv_bn` calls end to end (verified, ~3-4 min on CPU); full run (real CIFAR-10 + ImageNet weights) not yet executed |
 | `experiments/02` BERT FFN sweep | Pipeline verified in `--smoke` against real `transformers` model classes; full run not yet executed |
@@ -285,16 +323,22 @@ fine-tuned model in this codebase, only verified mechanically so far.
 
 ```
 prunelib/
+    registry.py   name -> implementation registries, the shared extension mechanism
     saliency.py   Max-k (correct), L1, L2, random -- Conv2d or Linear weights
-    surgery.py    conv/BN/FFN/attention-head structural surgery
+    selection.py  weight + budget -> indices to prune, by any registered rule
+    clustering.py K-Means channel selection: prune lowest-L1 within each cluster
+    distance.py   Manhattan/Euclidean/Cosine metrics (+ matching K-Means centroids)
+    indices.py    index-set helpers: complement, expand channel -> block of columns
+    surgery.py    slice_* primitives; conv/BN/FFN/attention-head structural surgery
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
+    module_rules.py  per-layer-type rules DependencyGraph prunes through (Conv2d,
+                  Linear, BatchNorm built in; register more)
     graph.py      torch.fx dependency resolution -- generic add/cat/flatten/depthwise
                   surgery; prune_model, PruningGroup.mask()/.commit_and_compress(),
                   special_handlers/LeafTracer (attention-block hook)
     quantization.py  Float16 / linear INT8 / Fixed-Point32 post-training quantization
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
-    clustering.py K-Means channel selection: prune lowest-L1 within each cluster
-    scanners.py   distance metrics + co-activation scanning
+    scanners.py   pairwise distance matrix + co-activation scanning
     evaluate.py   parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                  runs in seconds
@@ -310,7 +354,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          92 tests, each naming the defect or behavior it guards against
+tests/          107 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

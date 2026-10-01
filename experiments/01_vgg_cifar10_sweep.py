@@ -20,7 +20,15 @@ import torch
 import torch.nn as nn
 import torchvision
 
-from prunelib import build_vgg16, count_params, measure_latency, prune_conv_bn, prune_vgg_layer, select_prune_indices_by_method
+from prunelib import (
+    build_vgg16,
+    complement_indices,
+    count_params,
+    measure_latency,
+    prune_conv_bn,
+    prune_vgg_layer,
+    select_prune_indices_by_method,
+)
 from prunelib.vgg import vgg_conv_bn_positions
 
 
@@ -51,8 +59,8 @@ def run_smoke(prune_step=0.05, n_iterations=5, seed=0):
         for it in range(n_iterations):
             n_ch = m.conv1.out_channels
             prune_amount = max(1, int(round(32 * prune_step)))
-            prune_idx = set(select_prune_indices_by_method(m.conv1.weight, prune_amount, method=method).tolist())
-            keep = torch.tensor([i for i in range(n_ch) if i not in prune_idx])
+            prune_idx = select_prune_indices_by_method(m.conv1.weight, prune_amount, method=method)
+            keep = complement_indices(n_ch, prune_idx)
             new_conv1, new_bn1, new_conv2 = prune_conv_bn(m.conv1, keep, bn=m.bn1, next_conv=m.conv2)
             m = TinyVGGBlock(ch=len(keep))
             m.conv1, m.bn1, m.conv2 = new_conv1, new_bn1, new_conv2

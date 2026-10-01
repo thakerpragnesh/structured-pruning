@@ -14,14 +14,17 @@ largest L1 norm contributes the most, so it's the one worth keeping.
 Unlike `saliency.py`'s scorers, this is not a per-channel score: whether a
 channel is pruned depends on which other channels it clusters with, so it
 can't be expressed as `compute_score(...) -> select_prune_indices(...)`.
-`select_prune_indices_by_method` below is the one dispatcher that hides that
-difference from callers (`vgg.py`, `graph.prune_model`), so they accept
-`method="kmeans"` alongside `"max_k"`/`"l1"`/`"l2"`/`"random"` without each
-growing its own branch.
+`kmeans_prune_indices` is registered as the `"kmeans"` rule in
+`selection.SELECTION_METHODS`, so `selection.select_prune_indices_by_method`
+-- the one dispatcher `vgg.py` and `graph.prune_model` call -- accepts
+`method="kmeans"` alongside `"max_k"`/`"l1"`/`"l2"`/`"random"` without
+knowing this module exists. (`select_prune_indices_by_method` used to live
+here; it's still importable from here for existing callers.)
 
 K-Means is implemented here in plain torch (no scikit-learn dependency).
 Each metric uses the centroid update that actually minimizes it, not the
-Euclidean mean for all three:
+Euclidean mean for all three (each `distance.DistanceMetric` carries its own,
+so a metric registered there brings its centroid rule with it):
 
 - `"euclidean"`: arithmetic mean (standard Lloyd's K-Means).
 - `"manhattan"`: coordinate-wise median (K-Medians) -- the mean minimizes
@@ -33,34 +36,14 @@ from __future__ import annotations
 
 import torch
 
-from .saliency import compute_score, select_prune_indices
-
-_METRICS = ("manhattan", "euclidean", "cosine")
-
-
-def _distance(x: torch.Tensor, centroids: torch.Tensor, metric: str) -> torch.Tensor:
-    """[N, D] x [K, D] -> [N, K] distance from every point to every centroid."""
-    if metric == "manhattan":
-        return torch.cdist(x, centroids, p=1)
-    if metric == "euclidean":
-        return torch.cdist(x, centroids, p=2)
-    if metric == "cosine":
-        xn = torch.nn.functional.normalize(x, dim=1, eps=1e-12)
-        cn = torch.nn.functional.normalize(centroids, dim=1, eps=1e-12)
-        return 1.0 - xn @ cn.T
-    raise ValueError(f"unknown metric {metric!r}, expected one of {list(_METRICS)}")
+from .distance import DISTANCE_METRICS, DistanceMetric
+from .saliency import select_prune_indices
+from .selection import register_selection_method, select_prune_indices_by_method  # noqa: F401  (re-exported, see above)
 
 
-def _update_centroid(members: torch.Tensor, metric: str) -> torch.Tensor:
-    if metric == "manhattan":
-        return members.median(dim=0).values
-    centroid = members.mean(dim=0)
-    if metric == "cosine":
-        centroid = torch.nn.functional.normalize(centroid, dim=0, eps=1e-12)
-    return centroid
-
-
-def _kmeans_plus_plus_init(x: torch.Tensor, n_clusters: int, metric: str, generator: torch.Generator) -> torch.Tensor:
+def _kmeans_plus_plus_init(
+    x: torch.Tensor, n_clusters: int, metric: DistanceMetric, generator: torch.Generator
+) -> torch.Tensor:
     """K-Means++ seeding under `metric`: each new centroid is sampled with
     probability proportional to its squared distance from the nearest
     centroid chosen so far, which spreads the initial centroids out and
@@ -69,7 +52,7 @@ def _kmeans_plus_plus_init(x: torch.Tensor, n_clusters: int, metric: str, genera
     n = x.shape[0]
     first = torch.randint(n, (1,), generator=generator).item()
     chosen = [first]
-    nearest = _distance(x, x[first:first + 1], metric).squeeze(1)
+    nearest = metric.pairwise(x, x[first:first + 1]).squeeze(1)
     for _ in range(1, n_clusters):
         weights = nearest.clamp_min(0).pow(2)
         if weights.sum() <= 0:
@@ -81,14 +64,14 @@ def _kmeans_plus_plus_init(x: torch.Tensor, n_clusters: int, metric: str, genera
         else:
             nxt = torch.multinomial(weights, 1, generator=generator).item()
         chosen.append(nxt)
-        nearest = torch.minimum(nearest, _distance(x, x[nxt:nxt + 1], metric).squeeze(1))
+        nearest = torch.minimum(nearest, metric.pairwise(x, x[nxt:nxt + 1]).squeeze(1))
     return x[chosen].clone()
 
 
 def kmeans(
     vectors: torch.Tensor,
     n_clusters: int,
-    metric: str = "manhattan",
+    metric: str | DistanceMetric = "manhattan",
     max_iter: int = 100,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -100,9 +83,14 @@ def kmeans(
     currently-assigned centroid (the standard fix, and what makes
     `kmeans_prune_indices`' "each cluster keeps one representative" rule
     produce exactly the requested number of survivors).
+
+    `metric` is a name in `distance.DISTANCE_METRICS` or a
+    `distance.DistanceMetric`; it must define a `centroid` rule.
     """
-    if metric not in _METRICS:
-        raise ValueError(f"unknown metric {metric!r}, expected one of {list(_METRICS)}")
+    metric_name = metric
+    metric = DISTANCE_METRICS.resolve(metric)
+    if metric.centroid is None:
+        raise ValueError(f"metric {metric_name!r} has no centroid rule, so it can't be used for K-Means")
     if vectors.dim() != 2:
         raise ValueError(f"expected a 2D [N, D] tensor, got shape {tuple(vectors.shape)}")
     n = vectors.shape[0]
@@ -115,7 +103,7 @@ def kmeans(
     labels = torch.full((n,), -1, dtype=torch.long)
 
     for _ in range(max_iter):
-        dist = _distance(x, centroids, metric)
+        dist = metric.pairwise(x, centroids)
         new_labels = dist.argmin(dim=1)
 
         # Repair empty clusters before the update step, so no centroid is
@@ -132,16 +120,17 @@ def kmeans(
         if torch.equal(new_labels, labels):
             break
         labels = new_labels
-        centroids = torch.stack([_update_centroid(x[labels == c], metric) for c in range(n_clusters)])
+        centroids = torch.stack([metric.centroid(x[labels == c]) for c in range(n_clusters)])
 
     return labels, centroids
 
 
+@register_selection_method("kmeans")
 def kmeans_prune_indices(
     weight: torch.Tensor,
     prune_amount: int,
     n_clusters: int | None = None,
-    metric: str = "manhattan",
+    metric: str | DistanceMetric = "manhattan",
     seed: int = 0,
     max_iter: int = 100,
 ) -> torch.Tensor:
@@ -193,16 +182,4 @@ def kmeans_prune_indices(
 
     candidate_scores = torch.where(protected, torch.full_like(l1, float("inf")), l1)
     return select_prune_indices(candidate_scores, prune_amount)
-
-
-def select_prune_indices_by_method(weight: torch.Tensor, prune_amount: int, method: str = "max_k", **kwargs) -> torch.Tensor:
-    """One entry point for every selection rule this package has: the
-    per-channel saliency scorers (`"max_k"`, `"l1"`, `"l2"`, `"random"` --
-    score via `compute_score`, then take the lowest `prune_amount`) and
-    cluster-based selection (`"kmeans"` -- see `kmeans_prune_indices`;
-    `kwargs` are forwarded to it, e.g. `metric=`, `n_clusters=`, `seed=`).
-    """
-    if method == "kmeans":
-        return kmeans_prune_indices(weight, prune_amount, **kwargs)
-    return select_prune_indices(compute_score(weight, method=method, **kwargs), prune_amount)
 

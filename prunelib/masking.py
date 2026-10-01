@@ -52,6 +52,12 @@ def build_channel_mask(weight: torch.Tensor, prune_idx: torch.Tensor) -> torch.T
     return mask
 
 
+def _zero_channel_mask(weight: torch.Tensor, atol: float) -> torch.Tensor:
+    """[out] bool: True where that output channel is entirely (within
+    `atol`) zero."""
+    return weight.reshape(weight.shape[0], -1).abs().sum(dim=1) <= atol
+
+
 def mask_channels(module: nn.Module, prune_idx: torch.Tensor, name: str = "weight") -> None:
     """Phase 1. Zero the given output channels of `module`'s `name` parameter
     via PyTorch's pruning reparametrization -- non-destructive, reversible,
@@ -66,15 +72,10 @@ def mask_channels(module: nn.Module, prune_idx: torch.Tensor, name: str = "weigh
     and wouldn't match what happens once the channel is physically removed
     during compression.
     """
-    weight = getattr(module, name)
-    mask = build_channel_mask(weight, prune_idx)
-    prune.custom_from_mask(module, name=name, mask=mask)
+    prune.custom_from_mask(module, name=name, mask=build_channel_mask(getattr(module, name), prune_idx))
 
     if name == "weight" and getattr(module, "bias", None) is not None:
-        bias_mask = torch.ones_like(module.bias)
-        if prune_idx.numel() > 0:
-            bias_mask[prune_idx.to(torch.long)] = 0
-        prune.custom_from_mask(module, name="bias", mask=bias_mask)
+        prune.custom_from_mask(module, name="bias", mask=build_channel_mask(module.bias, prune_idx))
 
 
 def commit_mask(module: nn.Module, name: str = "weight") -> None:
@@ -91,17 +92,13 @@ def zeroed_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Indices of output channels that are entirely zero. Meaningful once a
     mask has been committed (see `commit_mask`) -- everything *not* in this
     list is an "unmasked" survivor."""
-    flat = weight.reshape(weight.shape[0], -1)
-    is_zero = flat.abs().sum(dim=1) <= atol
-    return is_zero.nonzero(as_tuple=True)[0]
+    return _zero_channel_mask(weight, atol).nonzero(as_tuple=True)[0]
 
 
 def surviving_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Complement of `zeroed_channels`: the "unmasked" channels to copy
     across during compression."""
-    flat = weight.reshape(weight.shape[0], -1)
-    is_zero = flat.abs().sum(dim=1) <= atol
-    return (~is_zero).nonzero(as_tuple=True)[0]
+    return (~_zero_channel_mask(weight, atol)).nonzero(as_tuple=True)[0]
 
 
 def compress_masked_conv_bn(

@@ -14,7 +14,7 @@ import argparse
 
 import torch
 
-from prunelib import kmeans_prune_indices, pairwise_distance_matrix, prune_attention_heads
+from prunelib import complement_indices, kmeans_prune_indices, pairwise_distance_matrix, prune_attention_heads
 
 
 def _head_vectors(query_weight: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -42,9 +42,7 @@ def prune_redundant_heads(attention, n_prune: int, metric: str = "manhattan", se
     self_attn = attention.self
     num_heads = self_attn.num_attention_heads
     pruned = kmeans_prune_indices(_qkv_head_vectors(self_attn, num_heads), n_prune, metric=metric, seed=seed)
-    keep_mask = torch.ones(num_heads, dtype=torch.bool)
-    keep_mask[pruned] = False
-    keep = keep_mask.nonzero(as_tuple=True)[0]
+    keep = complement_indices(num_heads, pruned)
 
     q, k, v, o = prune_attention_heads(
         self_attn.query, self_attn.key, self_attn.value, attention.output.dense, keep_heads=keep, num_heads=num_heads,

@@ -223,3 +223,40 @@ def test_prune_attention_heads_against_a_real_hf_bert_model():
     input_ids = torch.randint(0, config.vocab_size, (2, 6))
     out = model(input_ids)  # must not raise -- proves the seam is real inside the real module
     assert out.last_hidden_state.shape == (2, 6, config.hidden_size)
+
+
+def test_rebuilt_modules_are_drop_in_substitutes():
+    """A pruned replacement must match the original in everything except
+    channel count. The surgery code used to build every replacement as a
+    CPU float32 module with padding_mode='zeros' -- a float64 or CUDA model
+    came back mixed-precision / mixed-device, and a 'reflect'-padded conv
+    silently changed its border behavior."""
+    torch.manual_seed(0)
+    conv = nn.Conv2d(3, 6, 3, padding=1, padding_mode="reflect").double()
+    bn = nn.BatchNorm2d(6).double()
+    next_conv = nn.Conv2d(6, 4, 3, padding=1, padding_mode="reflect").double()
+    keep = torch.tensor([0, 2, 5])
+
+    new_conv, new_bn, new_next = prune_conv_bn(conv, keep, bn=bn, next_conv=next_conv)
+    for new in (new_conv, new_bn, new_next):
+        assert new.weight.dtype == torch.float64
+    assert new_conv.padding_mode == new_next.padding_mode == "reflect"
+
+    x = torch.randn(1, 3, 5, 5, dtype=torch.float64)
+    with torch.no_grad():
+        assert torch.allclose(new_conv(x), conv(x)[:, keep])  # border values match too
+
+    fc1, fc2 = nn.Linear(4, 6, device="meta"), nn.Linear(6, 2, device="meta")
+    new_fc1, new_fc2 = prune_ffn_block(fc1, fc2, keep)
+    assert new_fc1.weight.device.type == new_fc2.weight.device.type == "meta"
+
+
+def test_prune_conv_bn_rejects_grouped_convs():
+    """prune_conv_bn always built a groups=1 replacement. For a depthwise
+    conv, copy_ then silently broadcast each [1, kh, kw] filter across every
+    input channel -- a wrong model with no error."""
+    depthwise = nn.Conv2d(6, 6, 3, groups=6)
+    with pytest.raises(ValueError, match="slice_depthwise_conv2d"):
+        prune_conv_bn(depthwise, torch.tensor([0, 1]))
+    with pytest.raises(ValueError, match="groups=2"):
+        prune_conv_bn(nn.Conv2d(4, 4, 3), torch.tensor([0, 1]), next_conv=nn.Conv2d(4, 4, 3, groups=2))

@@ -4,17 +4,23 @@ VGG-specific structural surgery, built on the generic `prune_conv_bn`.
 Pulled out of experiments/01_vgg_cifar10_sweep.py so the corrected legacy
 pipeline (archive/legacy_pipeline/pipeline.py) and the experiment script
 share one implementation instead of two copies drifting apart.
+
+Only `build_vgg16` needs torchvision, and it imports it itself: the surgery
+functions here are plain torch over any torchvision-*shaped* VGG (a
+`.features` Sequential of Conv2d/BatchNorm2d, a `.classifier` whose first
+layer is a Linear), so they work without the optional
+`vision-experiments` dependency installed.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-import torchvision
 
-from .clustering import select_prune_indices_by_method
+from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels, surviving_channels
-from .surgery import prune_conv_bn
+from .selection import select_prune_indices_by_method
+from .surgery import prune_conv_bn, slice_linear
 
 
 def vgg_conv_bn_positions(features: nn.Sequential) -> list[tuple[int, int | None]]:
@@ -44,46 +50,47 @@ def _shrink_classifier_input(linear: nn.Linear, keep_idx: torch.Tensor, n_channe
             f"multiple of the last conv layer's {n_channels} channels"
         )
     spatial = linear.in_features // n_channels
-    keep_idx = keep_idx.to(torch.long)
-    cols = (keep_idx.unsqueeze(1) * spatial + torch.arange(spatial)).reshape(-1)
+    return slice_linear(linear, keep_in=expand_blocks(keep_idx, spatial))
 
-    new = nn.Linear(cols.numel(), linear.out_features, bias=linear.bias is not None)
-    with torch.no_grad():
-        new.weight.copy_(linear.weight.index_select(1, cols))
-        if linear.bias is not None:
-            new.bias.copy_(linear.bias)
-    return new
+
+def _layer_indices(model: nn.Module, layer_position: int) -> tuple[int, int | None, int | None]:
+    """`(conv_idx, bn_idx, next_conv_idx)` in `model.features` for the
+    `layer_position`-th conv layer; `bn_idx` is None if it has no
+    BatchNorm, `next_conv_idx` is None for the last conv layer (whose
+    consumer is `classifier[0]`)."""
+    pairs = vgg_conv_bn_positions(model.features)
+    if not 0 <= layer_position < len(pairs):
+        raise ValueError(f"layer_position {layer_position} out of range: model has {len(pairs)} conv layers")
+    conv_idx, bn_idx = pairs[layer_position]
+    next_conv_idx = pairs[layer_position + 1][0] if layer_position + 1 < len(pairs) else None
+    return conv_idx, bn_idx, next_conv_idx
 
 
 def _apply_vgg_surgery(model: nn.Module, layer_position: int, keep_idx: torch.Tensor) -> None:
     """Shrink conv layer `layer_position` to `keep_idx` in place, along with
     its BatchNorm (if any) and whatever consumes its output: the next conv,
     or `classifier[0]` for the last conv layer."""
-    pairs = vgg_conv_bn_positions(model.features)
-    conv_idx, bn_idx = pairs[layer_position]
+    conv_idx, bn_idx, next_conv_idx = _layer_indices(model, layer_position)
     conv = model.features[conv_idx]
     bn = model.features[bn_idx] if bn_idx is not None else None
-    is_last = layer_position == len(pairs) - 1
-    next_conv = None if is_last else model.features[pairs[layer_position + 1][0]]
+    next_conv = model.features[next_conv_idx] if next_conv_idx is not None else None
 
     new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep_idx, bn=bn, next_conv=next_conv)
     model.features[conv_idx] = new_conv
     if bn_idx is not None:
         model.features[bn_idx] = new_bn
-    if is_last:
+    if next_conv_idx is None:
         model.classifier[0] = _shrink_classifier_input(model.classifier[0], keep_idx, conv.out_channels)
     else:
-        model.features[pairs[layer_position + 1][0]] = new_next_conv
-
-
-def _check_layer_position(pairs: list, layer_position: int) -> None:
-    if not 0 <= layer_position < len(pairs):
-        raise ValueError(f"layer_position {layer_position} out of range: model has {len(pairs)} conv layers")
+        model.features[next_conv_idx] = new_next_conv
 
 
 def build_vgg16(num_classes: int = 10, pretrained: bool = True) -> nn.Module:
     """Modern torchvision weights API (`weights=`), not the deprecated
-    `pretrained=True/False` boolean removed in recent torchvision versions."""
+    `pretrained=True/False` boolean removed in recent torchvision versions.
+    Needs torchvision (`pip install structured-pruning[vision-experiments]`)."""
+    import torchvision
+
     weights = torchvision.models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None
     model = torchvision.models.vgg16(weights=weights)
     model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
@@ -106,8 +113,9 @@ def mask_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float,
     iteration actually implies. This is a correctness requirement of the
     mask-then-compress design, not an optimization.
 
-    `method` is any rule `clustering.select_prune_indices_by_method` accepts
-    (`"max_k"`, `"l1"`, `"l2"`, `"random"`, or `"kmeans"`); `method_kwargs`
+    `method` is any rule `selection.select_prune_indices_by_method` accepts
+    (`"max_k"`, `"l1"`, `"l2"`, `"random"`, `"kmeans"`, anything registered
+    later, or a selector callable); `method_kwargs`
     are forwarded to it (e.g. `metric="manhattan"` for `"kmeans"`). For
     `"kmeans"`, clustering runs over the surviving channels only, for the
     same reason scoring does.
@@ -118,10 +126,7 @@ def mask_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float,
     Returns the number of newly-masked channels (0 if this layer has no
     survivors left to prune).
     """
-    pairs = vgg_conv_bn_positions(model.features)
-    _check_layer_position(pairs, layer_position)
-    conv_idx, _ = pairs[layer_position]
-    conv = model.features[conv_idx]
+    conv = model.features[_layer_indices(model, layer_position)[0]]
     n_out_original = conv.weight.shape[0]
 
     survivors = surviving_channels(conv.weight)
@@ -187,16 +192,12 @@ def prune_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float
 
     Returns the number of channels kept.
     """
-    pairs = vgg_conv_bn_positions(model.features)
-    _check_layer_position(pairs, layer_position)
-    conv = model.features[pairs[layer_position][0]]
+    conv = model.features[_layer_indices(model, layer_position)[0]]
 
     n_out = conv.out_channels
     prune_amount = min(max(1, int(round(n_out * prune_fraction))), n_out - 1)
     prune_idx = select_prune_indices_by_method(conv.weight, prune_amount, method=method, **method_kwargs)
-    keep_mask = torch.ones(n_out, dtype=torch.bool)
-    keep_mask[prune_idx] = False
-    keep = keep_mask.nonzero(as_tuple=True)[0]
+    keep = complement_indices(n_out, prune_idx)
 
     _apply_vgg_surgery(model, layer_position, keep)
     return len(keep)

@@ -173,3 +173,35 @@ def test_kmeans_method_works_through_both_vgg_pruning_paths():
     assert first == second == 16  # second call clusters survivors only, so both calls count
     compress_masked_vgg(model)
     assert model(torch.randn(1, 3, 32, 32)).shape == (1, 5)
+
+
+def test_vgg_surgery_does_not_need_torchvision():
+    """Only build_vgg16 needs torchvision (an optional dependency); the VGG
+    surgery functions are plain torch over any torchvision-shaped VGG, so
+    they must import and run without it. Run in a subprocess so blocking
+    the import can't leak into other tests."""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent("""
+        import sys
+        sys.modules["torchvision"] = None  # any `import torchvision` now raises ImportError
+        import torch, torch.nn as nn
+        import prunelib
+
+        model = nn.Module()
+        model.features = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8), nn.ReLU(),
+                                       nn.Conv2d(8, 6, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d((2, 2)))
+        model.classifier = nn.Sequential(nn.Linear(6 * 4, 3))
+        assert prunelib.prune_vgg_layer(model, 0, 0.25) == 6
+        assert prunelib.prune_vgg_layer(model, 1, 0.5) == 3
+        assert model.classifier[0].in_features == 3 * 4
+        try:
+            prunelib.build_vgg16(pretrained=False)
+        except ImportError:
+            print("ok")
+    """)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"

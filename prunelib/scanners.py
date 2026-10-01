@@ -7,23 +7,20 @@ from __future__ import annotations
 
 import torch
 
+from .distance import DistanceMetric, pairwise_distance
 
-def pairwise_distance_matrix(vectors: torch.Tensor, metric: str = "manhattan") -> torch.Tensor:
+
+def pairwise_distance_matrix(vectors: torch.Tensor, metric: str | DistanceMetric = "manhattan") -> torch.Tensor:
     """Pairwise distance between rows of `vectors`, shape [N, D] -> [N, N].
 
-    metric: "manhattan" (L1), "euclidean" (L2), or "cosine" (1 - cosine similarity).
-    Manhattan was found to outperform the other two for K-Means-based channel
-    selection in the paper above (35.15% param / 49.11% FLOPs reduction on
-    VGG16 vs. Euclidean's 31.01%/43.96% and Cosine's 21.93%/32.03%).
+    metric: "manhattan" (L1), "euclidean" (L2), "cosine" (1 - cosine
+    similarity), or anything else in `distance.DISTANCE_METRICS` / a
+    `distance.DistanceMetric`. Manhattan was found to outperform the other
+    two for K-Means-based channel selection in the paper above (35.15% param
+    / 49.11% FLOPs reduction on VGG16 vs. Euclidean's 31.01%/43.96% and
+    Cosine's 21.93%/32.03%).
     """
-    if metric == "manhattan":
-        return torch.cdist(vectors, vectors, p=1)
-    if metric == "euclidean":
-        return torch.cdist(vectors, vectors, p=2)
-    if metric == "cosine":
-        normed = torch.nn.functional.normalize(vectors, dim=1, eps=1e-12)
-        return 1.0 - normed @ normed.T
-    raise ValueError(f"unknown metric {metric!r}, expected 'manhattan', 'euclidean', or 'cosine'")
+    return pairwise_distance(vectors, vectors, metric)
 
 
 class CoActivationScanner:

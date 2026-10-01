@@ -46,9 +46,22 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-_QUANTIZABLE_MODULE_TYPES = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.BatchNorm1d)
+from .registry import Registry
+
+QUANTIZABLE_MODULE_TYPES = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.BatchNorm1d)
+
+# Same-shape round-trip methods `quantize_model_` can apply: `(tensor,
+# **kwargs) -> tensor` of the same shape, castable back to the input's dtype.
+# INT8 is deliberately *not* one of them -- `quantize_int8_linear` returns an
+# `Int8Tensor` struct, a different contract, so registering it here would
+# break `quantize_model_`'s uniform copy-back loop. Register new same-shape
+# methods (e.g. logarithmic quantization, KT.md section 10.2) with
+# `register_quantization_method`.
+QUANTIZATION_METHODS: Registry = Registry("method")
+register_quantization_method = QUANTIZATION_METHODS.register
 
 
+@register_quantization_method("float16")
 def quantize_float16(tensor: torch.Tensor) -> torch.Tensor:
     """Direct fp32 (or any float dtype) -> fp16 cast."""
     return tensor.to(torch.float16)
@@ -116,6 +129,7 @@ def dequantize_int8_linear(quantized: Int8Tensor) -> torch.Tensor:
     return (quantized.values.to(torch.float32) - quantized.zero_point) * quantized.scale
 
 
+@register_quantization_method("fixed_point32")
 def quantize_fixed_point32(tensor: torch.Tensor, integer_bits: int = 3, fractional_bits: int = 28) -> torch.Tensor:
     """Round-trip `tensor` through a signed fixed-point format (1 sign bit +
     `integer_bits` + `fractional_bits`, thesis defaults 3/28 -- still 32
@@ -138,18 +152,19 @@ def quantize_fixed_point32(tensor: torch.Tensor, integer_bits: int = 3, fraction
     return clamped / scale
 
 
-_MODEL_METHODS = {
-    "float16": quantize_float16,
-    "fixed_point32": quantize_fixed_point32,
-}
-
-
 @torch.no_grad()
-def quantize_model_(model: nn.Module, method: str = "float16", **kwargs) -> nn.Module:
-    """Apply `method`'s quantization error to every Linear/Conv2d/BatchNorm
-    weight (and bias, if present) in `model`, **in place**, then cast the
-    result back to that parameter's original dtype. "float16" or
-    "fixed_point32" only -- INT8 isn't included here because
+def quantize_model_(
+    model: nn.Module,
+    method: str = "float16",
+    module_types: tuple[type, ...] = QUANTIZABLE_MODULE_TYPES,
+    **kwargs,
+) -> nn.Module:
+    """Apply `method`'s quantization error to every weight (and bias, if
+    present) of every `module_types` module in `model` (default: Linear/
+    Conv2d/BatchNorm), **in place**, then cast the result back to that
+    parameter's original dtype. `method` is a name in `QUANTIZATION_METHODS`
+    ("float16", "fixed_point32", or one registered later); `kwargs` are
+    forwarded to it. INT8 isn't included here because
     `quantize_int8_linear` returns a separate `Int8Tensor` struct, not a
     same-shape, same-dtype replacement this function's uniform copy-back
     loop can use; call `quantize_int8_linear`/`dequantize_int8_linear`
@@ -168,12 +183,10 @@ def quantize_model_(model: nn.Module, method: str = "float16", **kwargs) -> nn.M
     are unchanged; only numeric precision is). This follows the same
     explicit, name-flagged exception `masking.commit_mask` already set.
     """
-    if method not in _MODEL_METHODS:
-        raise ValueError(f"unknown method {method!r}, expected one of {list(_MODEL_METHODS)}")
-    fn = _MODEL_METHODS[method]
+    fn = QUANTIZATION_METHODS.get(method)
 
     for module in model.modules():
-        if not isinstance(module, _QUANTIZABLE_MODULE_TYPES):
+        if not isinstance(module, module_types):
             continue
         if getattr(module, "weight", None) is not None:
             module.weight.copy_(fn(module.weight, **kwargs).to(module.weight.dtype))
