@@ -42,6 +42,7 @@ already set for an explicitly in-place operation in this library.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -155,7 +156,7 @@ def quantize_fixed_point32(tensor: torch.Tensor, integer_bits: int = 3, fraction
 @torch.no_grad()
 def quantize_model_(
     model: nn.Module,
-    method: str = "float16",
+    method: str | Callable[..., torch.Tensor] = "float16",
     module_types: tuple[type, ...] = QUANTIZABLE_MODULE_TYPES,
     **kwargs,
 ) -> nn.Module:
@@ -163,8 +164,9 @@ def quantize_model_(
     present) of every `module_types` module in `model` (default: Linear/
     Conv2d/BatchNorm), **in place**, then cast the result back to that
     parameter's original dtype. `method` is a name in `QUANTIZATION_METHODS`
-    ("float16", "fixed_point32", or one registered later); `kwargs` are
-    forwarded to it. INT8 isn't included here because
+    ("float16", "fixed_point32", or one registered later) or a same-shape
+    `(tensor, **kwargs) -> tensor` function itself; `kwargs` are forwarded
+    to it. INT8 isn't included here because
     `quantize_int8_linear` returns a separate `Int8Tensor` struct, not a
     same-shape, same-dtype replacement this function's uniform copy-back
     loop can use; call `quantize_int8_linear`/`dequantize_int8_linear`
@@ -183,7 +185,7 @@ def quantize_model_(
     are unchanged; only numeric precision is). This follows the same
     explicit, name-flagged exception `masking.commit_mask` already set.
     """
-    fn = QUANTIZATION_METHODS.get(method)
+    fn = QUANTIZATION_METHODS.resolve(method)
 
     for module in model.modules():
         if not isinstance(module, module_types):

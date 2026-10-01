@@ -1,7 +1,7 @@
 """
 Open/closed: every pluggable part of `prunelib` -- saliency scorers,
 selection rules, distance metrics, quantization methods, prunable layer
-types -- is extended from the caller's own code, and the extension then
+types, the ops a prune passes through -- is extended from the caller's own code, and the extension then
 works through every entry point that dispatches on it, with no edit to the
 library. Before `registry.py`, each of these was a private dict or an
 if-chain inside the library (KT.md section 7 said "register it in
@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from prunelib import (
     MODULE_RULES,
+    OP_PROPAGATORS,
     ChannelRole,
     DependencyGraph,
     DistanceMetric,
@@ -22,8 +23,10 @@ from prunelib import (
     kmeans,
     l1_saliency,
     pairwise_distance_matrix,
+    propagate_add,
     prune_model,
     quantize_model_,
+    register_op_propagator,
     register_saliency_method,
     select_prune_indices_by_method,
 )
@@ -208,3 +211,72 @@ def test_module_rule_teaches_dependency_graph_a_new_layer_type():
     assert torch.equal(model[0].weight, weight[keep])
     assert model(x).shape == (2, 4, 10)
     assert nn.Conv1d not in MODULE_RULES  # scoped to that one graph, not leaked globally
+
+
+class _SubResidual(nn.Module):
+    """A residual block merged with subtraction, which DependencyGraph has no
+    built-in propagator for. `method=True` writes it as `.sub()` (an fx
+    `call_method` node) instead of `torch.sub` (a `call_function` node)."""
+
+    def __init__(self, method: bool = False):
+        super().__init__()
+        self.method = method
+        self.a = nn.Conv2d(3, 6, 3, padding=1)
+        self.b = nn.Conv2d(6, 6, 3, padding=1)
+        self.head = nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        y = self.a(x)
+        z = self.b(y).sub(y) if self.method else torch.sub(self.b(y), y)
+        return self.head(z)
+
+
+def test_op_propagator_teaches_dependency_graph_a_new_op():
+    """`torch.sub` couples its two branches exactly like `+` does, so the
+    built-in `propagate_add` handles it once registered -- per graph, or
+    globally -- without touching graph.py."""
+    x = torch.randn(1, 3, 8, 8)
+    keep = torch.tensor([0, 1, 3, 5])
+
+    torch.manual_seed(0)
+    with pytest.raises(NotImplementedError, match="sub"):
+        DependencyGraph(_SubResidual(), x).get_pruning_group("b", keep)  # unknown op -> refused, not guessed
+
+    torch.manual_seed(0)
+    model = _SubResidual()
+    a_weight, b_weight = model.a.weight.detach().clone(), model.b.weight.detach().clone()
+    group = DependencyGraph(model, x, op_propagators={torch.sub: propagate_add}).get_pruning_group("b", keep)
+    assert set(group.output_targets) == {"a", "b"} and set(group.input_targets) == {"b", "head"}
+    group.prune()
+    assert torch.equal(model.a.weight, a_weight[keep]) and torch.equal(model.b.weight, b_weight[keep][:, keep])
+    assert model(x).shape == (1, 2, 8, 8)
+    assert torch.sub not in OP_PROPAGATORS  # scoped to that one graph, not leaked globally
+
+    register_op_propagator("sub", propagate_add)
+    try:
+        model = _SubResidual(method=True)
+        DependencyGraph(model, x).get_pruning_group("b", keep).prune()
+        assert model(x).shape == (1, 2, 8, 8)
+        with pytest.raises(ValueError, match="already registered"):
+            register_op_propagator("sub", propagate_add)
+    finally:
+        del OP_PROPAGATORS["sub"]
+
+
+def test_every_method_argument_accepts_an_implementation(temporarily_register):
+    """`Registry.resolve`'s contract: wherever `prunelib` takes `method=` by
+    name, it takes the implementation itself too -- scoring and
+    quantization included, not just selection."""
+    w = torch.randn(5, 3, 3, 3)
+    assert torch.equal(compute_score(w, method=l1_saliency), compute_score(w, method="l1"))
+
+    def tenths(t):
+        return torch.round(t * 10) / 10
+
+    torch.manual_seed(0)
+    by_name, by_fn = nn.Linear(4, 3), nn.Linear(4, 3)
+    by_fn.load_state_dict(by_name.state_dict())
+    temporarily_register(QUANTIZATION_METHODS, "tenths", tenths)
+    quantize_model_(by_name, method="tenths")
+    quantize_model_(by_fn, method=tenths)
+    assert torch.equal(by_name.weight, by_fn.weight) and torch.equal(by_name.bias, by_fn.bias)

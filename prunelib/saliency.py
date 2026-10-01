@@ -33,6 +33,8 @@ accepted by `compute_score`, `selection.select_prune_indices_by_method`,
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 from .indices import complement_indices
@@ -124,15 +126,16 @@ def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = No
     return torch.rand(out_ch)
 
 
-def compute_score(weight: torch.Tensor, method: str = "max_k", **kwargs) -> torch.Tensor:
+def compute_score(weight: torch.Tensor, method: str | Callable[..., torch.Tensor] = "max_k", **kwargs) -> torch.Tensor:
     """Single entry point used by every experiment and by `select_prune_indices`.
 
     Because scoring always goes through here, there is no code path where a
     caller can compute one score and select against another (which is exactly
     how D1 happened in the original codebase). `method` is any name in
-    `SALIENCY_METHODS`; `kwargs` are forwarded to that scorer.
+    `SALIENCY_METHODS`, or a scorer itself (`(weight, **kwargs) ->
+    Tensor[out]`); `kwargs` are forwarded to that scorer.
     """
-    return SALIENCY_METHODS.get(method)(weight, **kwargs)
+    return SALIENCY_METHODS.resolve(method)(weight, **kwargs)
 
 
 def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:

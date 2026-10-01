@@ -34,7 +34,18 @@ from .masking import (
 from .selection import SELECTION_METHODS, register_selection_method, select_prune_indices_by_method
 from .clustering import kmeans, kmeans_prune_indices  # also registers the "kmeans" selection rule
 from .module_rules import MODULE_RULES, ChannelRole, ModuleRule, find_module_rule, register_module_rule
-from .graph import DependencyGraph, LeafTracer, PruningGroup, prune_model
+from .graph import (
+    OP_PROPAGATORS,
+    DependencyGraph,
+    LeafTracer,
+    Propagation,
+    PruningGroup,
+    propagate_add,
+    propagate_cat,
+    propagate_flatten,
+    prune_model,
+    register_op_propagator,
+)
 from .quantization import (
     QUANTIZATION_METHODS,
     Int8Tensor,
@@ -98,6 +109,10 @@ __all__ = [
     "ModuleRule",
     "ChannelRole",
     "find_module_rule",
+    "Propagation",
+    "propagate_add",
+    "propagate_cat",
+    "propagate_flatten",
     # quantization
     "Int8Tensor",
     "quantize_float16",
@@ -112,7 +127,7 @@ __all__ = [
     "mask_vgg_layer",
     "prune_vgg_layer",
     "vgg_conv_bn_positions",
-    # extension points: add a method/metric/layer type without editing prunelib
+    # extension points: add a method/metric/layer type/op without editing prunelib
     "SALIENCY_METHODS",
     "register_saliency_method",
     "SELECTION_METHODS",
@@ -121,6 +136,8 @@ __all__ = [
     "register_distance_metric",
     "MODULE_RULES",
     "register_module_rule",
+    "OP_PROPAGATORS",
+    "register_op_propagator",
     "QUANTIZATION_METHODS",
     "register_quantization_method",
 ]

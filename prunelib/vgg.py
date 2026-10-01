@@ -19,7 +19,7 @@ import torch.nn.utils.prune as prune
 
 from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels, surviving_channels
-from .selection import select_prune_indices_by_method
+from .selection import Selector, select_prune_indices_by_method
 from .surgery import prune_conv_bn, slice_linear
 
 
@@ -41,7 +41,7 @@ def _shrink_classifier_input(linear: nn.Linear, keep_idx: torch.Tensor, n_channe
     `C * 49` features, channel-major, so channel `c` owns input columns
     `[c * spatial, (c + 1) * spatial)` of `classifier[0]`. Pruning channel
     `c` therefore means dropping that whole block of columns -- the same
-    expansion `graph.DependencyGraph._handle_flatten` does for an arbitrary
+    expansion `graph.propagate_flatten` does for an arbitrary
     model, specialised here to VGG's fixed layout.
     """
     if linear.in_features % n_channels:
@@ -97,7 +97,9 @@ def build_vgg16(num_classes: int = 10, pretrained: bool = True) -> nn.Module:
     return model
 
 
-def mask_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float, method: str = "max_k", **method_kwargs) -> int:
+def mask_vgg_layer(
+    model: nn.Module, layer_position: int, prune_fraction: float, method: str | Selector = "max_k", **method_kwargs
+) -> int:
     """Phase 1 for one VGG conv layer, safe to call once per iteration across
     a multi-iteration schedule: extend this layer's channel mask by roughly
     `prune_fraction` of its *original* channel count, chosen from channels
@@ -180,7 +182,9 @@ def compress_masked_vgg(model: nn.Module) -> int:
     return total_removed
 
 
-def prune_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float, method: str = "max_k", **method_kwargs) -> int:
+def prune_vgg_layer(
+    model: nn.Module, layer_position: int, prune_fraction: float, method: str | Selector = "max_k", **method_kwargs
+) -> int:
     """Prune the `layer_position`-th conv layer of `model.features` (0-indexed
     among conv layers). Surgery happens in place: `prune_conv_bn` returns
     already-correctly-sized modules, substituted back into the Sequential.

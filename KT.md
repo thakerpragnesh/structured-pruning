@@ -60,7 +60,7 @@ prunelib/
     registry.py   (82 lines)   Registry (name -> implementation) + resolve_by_type
                                (class -> entry, via the MRO): the shared extension
                                mechanism every pluggable part below uses
-    saliency.py   (154 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
+    saliency.py   (157 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
                                Conv2d or Linear weights; SALIENCY_METHODS registry
     selection.py  (64 lines)   select_prune_indices_by_method: weight + budget ->
                                prune indices, by any scorer or registered selector
@@ -76,13 +76,15 @@ prunelib/
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     module_rules.py (135 lines) ModuleRule / ChannelRole: how each layer type takes
                                part in DependencyGraph pruning; MODULE_RULES registry
-    graph.py      (599 lines) torch.fx dependency resolution -- generic add/cat/
+    graph.py      (675 lines) torch.fx dependency resolution -- generic add/cat/
                                flatten/depthwise surgery, no seam passed by hand;
+                               DependencyGraph (the trace) + Propagation (one
+                               walk); OP_PROPAGATORS registry for add/cat/flatten;
                                plus prune_model() (one-call generic pruning),
                                PruningGroup.mask()/.commit_and_compress() (two-phase
                                workflow for a whole dependency group), and
                                special_handlers/LeafTracer (attention-block hook)
-    quantization.py (195 lines) Post-training Float16 / linear INT8 / Fixed-Point32
+    quantization.py (197 lines) Post-training Float16 / linear INT8 / Fixed-Point32
                                quantization (thesis Ch. 6.6) -- separate compression
                                stage from pruning, applied after it;
                                QUANTIZATION_METHODS registry
@@ -107,7 +109,7 @@ archive/
         pipeline.py         kept here as a tested mask-then-compress example,
                              not a live alternative. Moved under archive/
                              2026-09-21. See LEGACY_PIPELINE_MIGRATION.md.
-tests/          107 tests across 11 files, one per historical defect or behavior
+tests/          109 tests across 11 files, one per historical defect or behavior
 ```
 
 Total: ~5,100 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
@@ -130,7 +132,7 @@ If you're refactoring `prunelib`, read this table first.
 | `mask_vgg_layer` scores and selects only from `surviving_channels` (not-yet-masked channels), never all channels | Without this, an already-masked channel's weight is zero — the lowest possible score under every criterion — so it wins re-selection on every later iteration, and the pruning schedule advances far slower than the requested fraction implies | `vgg.py::mask_vgg_layer` |
 | "Which indices are *not* in this index tensor" is a boolean mask + `nonzero()`, never `set(idx.tolist())` plus a Python `range()` comprehension | Not a historical defect, but a recurring anti-pattern found and fixed 2026-09-22 in three places (`masking.py::surviving_channels`, `vgg.py::prune_vgg_layer`, `saliency.py::keep_indices`) — same result, but drops to a Python-level loop over every channel instead of one vectorized op. If you write `set(...)` + a `range()` comprehension against a channel/index tensor anywhere in this codebase, that's the pattern to replace — with `indices.complement_indices`, which every one of those call sites (and the experiments) now uses | `indices.py` |
 
-| Every pluggable part — saliency scorers, selection rules, distance metrics, quantization methods, prunable layer types — dispatches through a public registry (`registry.Registry`, or `module_rules.MODULE_RULES` for layer types); adding one is a `register_*` call from the caller's own code | Not a historical defect: the open/closed refactor of 2026-10-02. Each was a private dict (`_METHODS`, `_MODEL_METHODS`) or an `if`-chain, so extending meant editing the library — and the same three distance metrics were written out twice (`scanners.py`, `clustering.py`), free to drift apart | `registry.py`, and each module's `*_METHODS`/`*_METRICS`/`MODULE_RULES` |
+| Every pluggable part — saliency scorers, selection rules, distance metrics, quantization methods, prunable layer types, the ops a prune passes through — dispatches through a public registry (`registry.Registry`, or `module_rules.MODULE_RULES` for layer types and `graph.OP_PROPAGATORS` for ops); adding one is a `register_*` call from the caller's own code | Not a historical defect: the open/closed refactor of 2026-10-02. Each was a private dict (`_METHODS`, `_MODEL_METHODS`) or an `if`-chain, so extending meant editing the library — and the same three distance metrics were written out twice (`scanners.py`, `clustering.py`), free to drift apart | `registry.py`, and each module's `*_METHODS`/`*_METRICS`/`MODULE_RULES`/`OP_PROPAGATORS` |
 | Exactly one set of primitives builds a pruned replacement module (`surgery.slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` / `slice_batchnorm`), and it carries over device, dtype and `padding_mode` | `graph.py` and `vgg.py` each had their own copy of `prune_conv_bn`'s index-and-copy logic (and of BatchNorm's running-stat copy); every copy rebuilt modules as CPU float32 with `padding_mode='zeros'`, so pruning a CUDA model left CPU layers in it and a `'reflect'` conv silently changed its border behaviour | `surgery.py` |
 
 If you ever find yourself writing a loop that tracks a running max/min by
@@ -247,7 +249,15 @@ The forward walk, the backward skip-connection walk and `PruningGroup.prune()`
 all depend only on those two answers. Register a rule for another type
 (`register_module_rule`, or `module_rules=` on one `DependencyGraph`) and all
 three paths handle it; `tests/test_extension_points.py` does this for
-Conv1d. `PruningGroup.add_output_target`/`add_input_target` own the
+Conv1d. Which *ops* it understands — add, cat, flatten (function, tensor
+method, or `nn.Flatten`) — is the same idea one level over: each is an op
+propagator in `graph.OP_PROPAGATORS` (`propagate_add`, `propagate_cat`,
+`propagate_flatten`), a function `(walk, source, node, idx)` that sees the
+walk only through `Propagation` (`shape`, `group`, `forward`,
+`find_producer`). `DependencyGraph` holds what's fixed once traced;
+`Propagation` holds one `get_pruning_group` call's state (the group being
+filled, the nodes visited), which is why neither is threaded through every
+method any more. `PruningGroup.add_output_target`/`add_input_target` own the
 "two branches disagree about one layer" check. The starting layer must be
 `MIXING`: starting from a depthwise conv used to be accepted and leave its
 producer's output wider than its new input (a model that failed on the next
@@ -511,7 +521,7 @@ defect-named test even if you refactor the code it guards, unless you're
 certain the refactor makes the bug class structurally impossible (as, e.g.,
 switching to `torch.topk` made D2 impossible to reintroduce even accidentally).
 
-Run everything: `PYTHONPATH=. pytest tests/ -v` (107 tests, ~35-40s total on
+Run everything: `PYTHONPATH=. pytest tests/ -v` (109 tests, ~35-40s total on
 CPU; the pure-`prunelib` tests alone (including `test_graph.py`,
 `test_quantization.py`, and `test_evaluate.py`, none of which need
 `torchvision`/`transformers`) are still ~2-3s, the rest is the handful
@@ -658,6 +668,13 @@ correct public implementation. Current state, honestly:
   `module_rules.ModuleRule` (`role` + `rebuild`) and register it with
   `register_module_rule`, or pass `module_rules={Type: rule}` to one graph.
   `tests/test_extension_points.py::test_module_rule_teaches_dependency_graph_a_new_layer_type`
+  is the worked example. To make it propagate through a new *op* (only
+  add/cat/flatten are built in — a residual merged with `torch.sub`, say),
+  don't edit `graph.py` either: `register_op_propagator(torch.sub,
+  propagate_add)` (and `"sub"` for the tensor method), or
+  `op_propagators={...}` on one graph; a genuinely new op gets its own
+  `(walk, source, node, idx)` function.
+  `test_extension_points.py::test_op_propagator_teaches_dependency_graph_a_new_op`
   is the worked example.
 - **New quantization method** (e.g. logarithmic or k-means-based
   quantization, which the thesis flags as better fits for skewed weight
@@ -708,7 +725,7 @@ to add or fix a CNN pruning criterion, you probably want
 git clone https://github.com/thakerpragnesh/structured-pruning.git
 cd structured-pruning
 pip install -e ".[dev,vision-experiments,transformer-experiments]"
-pytest tests/ -v                        # 107 tests
+pytest tests/ -v                        # 109 tests
 python experiments/00_demo.py           # full pipeline, seconds
 python experiments/01_vgg_cifar10_sweep.py --smoke
 python experiments/06_generic_pruning.py --smoke

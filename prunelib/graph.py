@@ -38,8 +38,10 @@ Known limitations, not fixed here:
 - Models with data-dependent control flow (dynamic `if`s on tensor values,
   some HuggingFace Transformer forward passes) may fail `torch.fx`'s default
   tracer entirely; pass a model-specific `tracer=` if you have one.
-- Only `torch.add`/`operator.add`/`operator.iadd` are recognized as
-  elementwise merges (not `torch.sub`, not a custom merge function).
+- Only `torch.add`/`operator.add`/`operator.iadd` (and the tensor `add`
+  methods) are recognized as elementwise merges out of the box -- not
+  `torch.sub`, not a custom merge function. Adding one is a
+  `register_op_propagator(torch.sub, propagate_add)` call, not an edit here.
 - `torch.cat` is only understood along the channel dimension, and only one
   of its branches is expected to be pruned at a time -- pruning two
   concatenated branches in the same `get_pruning_group` call can silently
@@ -60,14 +62,18 @@ Known limitations, not fixed here:
   genuine mismatch will still surface as a shape error the next time the
   model runs a forward pass, just not necessarily at graph-construction time.
 
-Which layer types are understood is not hard-coded here: every
-Conv2d/Linear/BatchNorm decision above goes through a `module_rules.
-ModuleRule` (its `ChannelRole` -- does a prune stop at this module or pass
-through it -- and how to rebuild it smaller). Pass `module_rules={nn.Conv1d:
-MyConv1dRule()}` to one `DependencyGraph`, or `module_rules.
-register_module_rule` it globally, to support another type without editing
-this file. Rebuilding itself is `surgery.py`'s `slice_*` primitives, the
-same code `prune_conv_bn`/`prune_ffn_block` use.
+Neither the layer types nor the operations understood are hard-coded
+here. Every Conv2d/Linear/BatchNorm decision above goes through a
+`module_rules.ModuleRule` (its `ChannelRole` -- does a prune stop at this
+module or pass through it -- and how to rebuild it smaller); pass
+`module_rules={nn.Conv1d: MyConv1dRule()}` to one `DependencyGraph`, or
+`module_rules.register_module_rule` it globally. Every add/cat/flatten
+decision goes through an op propagator in `OP_PROPAGATORS`
+(`propagate_add`, `propagate_cat`, `propagate_flatten`), which sees one
+walk only through the small `Propagation` interface; pass
+`op_propagators={...}` to one graph, or `register_op_propagator` globally.
+Rebuilding itself is `surgery.py`'s `slice_*` primitives, the same code
+`prune_conv_bn`/`prune_ffn_block` use.
 
 Three additions on top of the above, all opt-in and none changing existing
 behavior:
@@ -117,11 +123,7 @@ from .registry import resolve_by_type
 from .selection import Selector, select_prune_indices_by_method
 
 SpecialHandler = Callable[[nn.Module, torch.Tensor], nn.Module]
-
-_ADD_FUNCTIONS = {torch.add, operator.add, operator.iadd}
-_CAT_FUNCTIONS = {torch.cat, torch.concat}
-_ADD_METHODS = {"__add__", "__iadd__", "add", "add_"}
-_RESHAPE_METHODS = {"view", "reshape", "flatten"}
+OpPropagator = Callable[["Propagation", fx.Node, fx.Node, torch.Tensor], None]  # (walk, source, node, idx), see register_op_propagator
 
 
 def _set_submodule(root: nn.Module, qualified_name: str, new_module: nn.Module) -> None:
@@ -169,9 +171,10 @@ class PruningGroup:
     see `.prune()`'s handling of it below and the module docstring above.
 
     Add targets through `add_output_target`/`add_input_target`, which
-    detect two paths disagreeing about the same module; `module_rules`
-    (default: the global `module_rules.MODULE_RULES`) decides how each
-    targeted module is rebuilt."""
+    detect two paths disagreeing about the same module, and
+    `add_special_target`; `module_rules` (default: the global
+    `module_rules.MODULE_RULES`) decides how each targeted module is
+    rebuilt."""
 
     def __init__(self, model: nn.Module, module_rules: dict[type, ModuleRule] | None = None):
         self.model = model
@@ -190,6 +193,11 @@ class PruningGroup:
         """Remove input channels `idx` of module `name` (see
         `add_output_target`)."""
         return _record_target(self.input_targets, name, idx)
+
+    def add_special_target(self, name: str, handler: SpecialHandler, keep_idx: torch.Tensor) -> None:
+        """Rebuild module `name` as `handler(module, keep_idx)` on `.prune()`,
+        instead of through its module rule."""
+        self.special_targets[name] = (handler, keep_idx)
 
     def prune(self) -> nn.Module:
         """Rebuild every targeted module with the recorded indices removed,
@@ -267,7 +275,13 @@ class DependencyGraph:
 
     `module_rules`, if given, adds to (or overrides) the global
     `module_rules.MODULE_RULES` for this graph only -- see that module for
-    how to teach `DependencyGraph` a new layer type.
+    how to teach `DependencyGraph` a new layer type. `op_propagators` does
+    the same for `OP_PROPAGATORS`, the operations a prune is carried
+    *through* (add, cat, flatten, ...) -- see `register_op_propagator`.
+
+    The graph only holds what's fixed once traced; each `get_pruning_group`
+    call walks it with a fresh `Propagation`, which holds that one walk's
+    state.
     """
 
     def __init__(
@@ -277,10 +291,12 @@ class DependencyGraph:
         tracer: fx.Tracer | None = None,
         special_handlers: dict[type, SpecialHandler] | None = None,
         module_rules: dict[type, ModuleRule] | None = None,
+        op_propagators: dict[object, OpPropagator] | None = None,
     ):
         self.model = model
         self.special_handlers = special_handlers or {}
         self.module_rules = None if module_rules is None else {**MODULE_RULES, **module_rules}
+        self.op_propagators = None if op_propagators is None else {**OP_PROPAGATORS, **op_propagators}
         tracer = tracer or fx.Tracer()
         graph = tracer.trace(model)
         traced = fx.GraphModule(model, graph)
@@ -315,7 +331,7 @@ class DependencyGraph:
 
         handler = resolve_by_type(self.special_handlers, type(module))
         if handler is not None:
-            group.special_targets[target] = (handler, keep_idx)
+            group.add_special_target(target, handler, keep_idx)
             return group
 
         node = self._node_by_target.get(target)
@@ -330,10 +346,10 @@ class DependencyGraph:
 
         prune_idx = complement_indices(module.weight.shape[0], keep_idx)
         group.add_output_target(target, prune_idx)
-        self._propagate_forward(node, prune_idx, group, visited=set())
+        Propagation(self, group).forward(node, prune_idx)
         return group
 
-    # -- internals -----------------------------------------------------
+    # -- internals, shared with `Propagation` --------------------------
 
     def _resolve_name(self, layer: nn.Module | str) -> str:
         if isinstance(layer, str):
@@ -357,6 +373,17 @@ class DependencyGraph:
             return rule.role(module)
         except NotImplementedError as exc:
             raise NotImplementedError(f"{name!r}: {exc}") from None
+
+    def _op_propagator(self, node: fx.Node, module: nn.Module | None = None) -> OpPropagator | None:
+        """The propagator registered for `node`'s function (`call_function`)
+        or method name (`call_method`), or -- for a `call_module` node -- for
+        `module`'s class or its nearest registered base class."""
+        propagators = OP_PROPAGATORS if self.op_propagators is None else self.op_propagators
+        if node.op == "call_module":
+            return resolve_by_type(propagators, type(module))
+        if node.op in ("call_function", "call_method"):
+            return propagators.get(node.target)
+        return None
 
     def _shape(self, node: fx.Node) -> torch.Size:
         meta = node.meta.get("tensor_meta")
@@ -385,51 +412,36 @@ class DependencyGraph:
                 return False
         return True
 
-    def _propagate_forward(self, node: fx.Node, idx: torch.Tensor, group: PruningGroup, visited: set[str]) -> None:
-        if node.name in visited:
+
+class Propagation:
+    """One prune decision's walk through a `DependencyGraph`: the
+    `PruningGroup` it fills in, and the nodes it has already passed through.
+    `get_pruning_group` starts a fresh one per call.
+
+    This is also everything an op propagator (`register_op_propagator`) is
+    given to work with: `shape(node)` to read a recorded shape, `group` to
+    record targets into, and `forward` / `find_producer` to continue the
+    walk."""
+
+    def __init__(self, graph: DependencyGraph, group: PruningGroup):
+        self.graph = graph
+        self.group = group
+        self._visited: set[str] = set()
+
+    def shape(self, node: fx.Node) -> torch.Size:
+        """`node`'s output shape, as recorded when the graph was traced."""
+        return self.graph._shape(node)
+
+    def forward(self, node: fx.Node, idx: torch.Tensor) -> None:
+        """Carry a prune of channels `idx` of `node`'s output into every node
+        that consumes it. A node already walked through is skipped."""
+        if node.name in self._visited:
             return
-        visited.add(node.name)
+        self._visited.add(node.name)
         for user in list(node.users):
-            self._visit(node, user, idx, group, visited)
+            self._visit(node, user, idx)
 
-    def _visit(self, source: fx.Node, node: fx.Node, idx: torch.Tensor, group: PruningGroup, visited: set[str]) -> None:
-        if node.op == "output":
-            return
-        if node.op == "call_module":
-            self._visit_module(source, node, idx, group, visited)
-            return
-        if node.op == "call_function":
-            handler = self._FUNCTION_HANDLERS.get(node.target)
-        elif node.op == "call_method":
-            handler = self._METHOD_HANDLERS.get(node.target)
-        else:
-            handler = None
-        if handler is None:
-            raise NotImplementedError(
-                f"{node.op} {node.target!r} ({node.name}) is downstream of a pruned layer and "
-                f"DependencyGraph doesn't know how to propagate through it"
-            )
-        handler(self, source, node, idx, group, visited)
-
-    def _visit_module(self, source: fx.Node, node: fx.Node, idx: torch.Tensor, group: PruningGroup, visited: set[str]) -> None:
-        module = self._module(node.target)
-        role = self._role(node.target, module)
-        if role is ChannelRole.MIXING:
-            group.add_input_target(node.target, idx)
-        elif role is ChannelRole.PER_CHANNEL:
-            group.add_output_target(node.target, idx)
-            self._propagate_forward(node, idx, group, visited)
-        elif isinstance(module, nn.Flatten):
-            self._handle_flatten(source, node, idx, group, visited)
-        elif self._is_channel_preserving(node):
-            self._propagate_forward(node, idx, group, visited)
-        else:
-            raise NotImplementedError(
-                f"{node.target!r} ({type(module).__name__}) is downstream of a pruned layer and "
-                f"DependencyGraph doesn't know how to propagate through it"
-            )
-
-    def _find_producer(self, node: fx.Node, idx: torch.Tensor, group: PruningGroup) -> fx.Node:
+    def find_producer(self, node: fx.Node, idx: torch.Tensor) -> fx.Node:
         """Walk backward from `node` (the "other" operand of an elementwise
         add) through channel-preserving ops and PER_CHANNEL modules
         (BatchNorm, depthwise conv -- recording those into `group` as it
@@ -438,6 +450,7 @@ class DependencyGraph:
         -- e.g. for `out += identity`, this is what finds the block's own
         input-producing conv when `identity` is a bare reference to it, or
         the shortcut/downsample conv when there is one."""
+        graph = self.graph
         seen: set[str] = set()
         stack = [node]
         while stack:
@@ -447,15 +460,15 @@ class DependencyGraph:
             seen.add(n.name)
 
             if n.op == "call_module":
-                module = self._module(n.target)
-                role = self._role(n.target, module)
+                module = graph._module(n.target)
+                role = graph._role(n.target, module)
                 if role is ChannelRole.MIXING:
                     return n
                 if role is ChannelRole.PER_CHANNEL:
-                    group.add_output_target(n.target, idx)
+                    self.group.add_output_target(n.target, idx)
                     stack.extend(n.all_input_nodes)
                     continue
-                if self._is_channel_preserving(n):
+                if graph._is_channel_preserving(n):
                     stack.extend(n.all_input_nodes)
                     continue
                 raise NotImplementedError(
@@ -472,56 +485,119 @@ class DependencyGraph:
                 raise NotImplementedError(f"can't trace the skip connection back through node {n.name} (op={n.op})")
         raise NotImplementedError("no Conv2d/Linear producer found upstream of the skip connection")
 
-    def _handle_add(self, source: fx.Node, node: fx.Node, idx: torch.Tensor, group: PruningGroup, visited: set[str]) -> None:
-        others = [n for n in node.all_input_nodes if n is not source]
-        if len(others) != 1:
+    def _visit(self, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
+        if node.op == "output":
+            return
+        if node.op == "call_module":
+            self._visit_module(source, node, idx)
+            return
+        propagator = self.graph._op_propagator(node)
+        if propagator is None:
             raise NotImplementedError(
-                f"{node.name}: add with {len(others)} other tensor operand(s) (expected exactly 1) is not supported"
+                f"{node.op} {node.target!r} ({node.name}) is downstream of a pruned layer and "
+                f"DependencyGraph doesn't know how to propagate through it"
             )
-        producer = self._find_producer(others[0], idx, group)
-        group.add_output_target(producer.target, idx)
-        self._propagate_forward(producer, idx, group, visited)
-        self._propagate_forward(node, idx, group, visited)
+        propagator(self, source, node, idx)
 
-    def _handle_cat(self, source: fx.Node, node: fx.Node, idx: torch.Tensor, group: PruningGroup, visited: set[str]) -> None:
-        cat_inputs = list(node.args[0])
-        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
-        try:
-            position = cat_inputs.index(source)
-        except ValueError:
-            raise NotImplementedError(f"{node.name}: pruned tensor not found among cat's inputs") from None
-
-        ndim = len(self._shape(source))
-        norm_dim = dim if dim >= 0 else dim + ndim
-        if norm_dim != 1:
-            raise NotImplementedError(f"{node.name}: cat along dim={dim} isn't the channel dimension, not supported")
-
-        offset = sum(int(self._shape(cat_inputs[i])[norm_dim]) for i in range(position))
-        self._propagate_forward(node, idx + offset, group, visited)
-
-    def _handle_flatten(self, source: fx.Node, node: fx.Node, idx: torch.Tensor, group: PruningGroup, visited: set[str]) -> None:
-        shape = self._shape(source)
-        if len(shape) != 4:
+    def _visit_module(self, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
+        module = self.graph._module(node.target)
+        role = self.graph._role(node.target, module)
+        if role is ChannelRole.MIXING:
+            self.group.add_input_target(node.target, idx)
+            return
+        if role is ChannelRole.PER_CHANNEL:
+            self.group.add_output_target(node.target, idx)
+            self.forward(node, idx)
+            return
+        propagator = self.graph._op_propagator(node, module)
+        if propagator is not None:
+            propagator(self, source, node, idx)
+        elif self.graph._is_channel_preserving(node):
+            self.forward(node, idx)
+        else:
             raise NotImplementedError(
-                f"{node.name}: flatten/view/reshape of a {len(shape)}D tensor isn't recognized as the "
-                f"conv-output-into-classifier-head pattern DependencyGraph handles (only a 4D NCHW "
-                f"conv output being flattened ahead of a Linear is supported)"
+                f"{node.target!r} ({type(module).__name__}) is downstream of a pruned layer and "
+                f"DependencyGraph doesn't know how to propagate through it"
             )
-        spatial = int(shape[2]) * int(shape[3])
-        self._propagate_forward(node, expand_blocks(idx, spatial), group, visited)
 
-    # Which `call_function` / `call_method` targets propagate a prune, and
-    # how. Defined after the handlers they name, so the class body can refer
-    # to them directly.
-    _FUNCTION_HANDLERS = {
-        **dict.fromkeys(_ADD_FUNCTIONS, _handle_add),
-        **dict.fromkeys(_CAT_FUNCTIONS, _handle_cat),
-        torch.flatten: _handle_flatten,
-    }
-    _METHOD_HANDLERS = {
-        **dict.fromkeys(_ADD_METHODS, _handle_add),
-        **dict.fromkeys(_RESHAPE_METHODS, _handle_flatten),
-    }
+
+# -- op propagators: how a prune passes through an op that owns no weights --
+
+
+def propagate_add(walk: Propagation, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
+    """An elementwise merge of two branches (a residual connection's `out +
+    identity`): channel `c` of the result is channel `c` of both operands,
+    so the *other* operand's producer must lose the same channels, and the
+    prune continues from both it and the merge. Any elementwise op on two
+    same-shape branches couples them this way, e.g.
+    `register_op_propagator(torch.sub, propagate_add)`."""
+    others = [n for n in node.all_input_nodes if n is not source]
+    if len(others) != 1:
+        raise NotImplementedError(
+            f"{node.name}: elementwise merge with {len(others)} other tensor operand(s) "
+            f"(expected exactly 1) is not supported"
+        )
+    producer = walk.find_producer(others[0], idx)
+    walk.group.add_output_target(producer.target, idx)
+    walk.forward(producer, idx)
+    walk.forward(node, idx)
+
+
+def propagate_cat(walk: Propagation, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
+    """Channel concatenation: `source`'s channels land in the result shifted
+    by the widths of the inputs before it."""
+    cat_inputs = list(node.args[0])
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    try:
+        position = cat_inputs.index(source)
+    except ValueError:
+        raise NotImplementedError(f"{node.name}: pruned tensor not found among cat's inputs") from None
+
+    ndim = len(walk.shape(source))
+    norm_dim = dim if dim >= 0 else dim + ndim
+    if norm_dim != 1:
+        raise NotImplementedError(f"{node.name}: cat along dim={dim} isn't the channel dimension, not supported")
+
+    offset = sum(int(walk.shape(cat_inputs[i])[norm_dim]) for i in range(position))
+    walk.forward(node, idx + offset)
+
+
+def propagate_flatten(walk: Propagation, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
+    """A conv output flattened ahead of a Linear: channel `c` becomes the
+    `H * W` consecutive features it owns."""
+    shape = walk.shape(source)
+    if len(shape) != 4:
+        raise NotImplementedError(
+            f"{node.name}: flatten/view/reshape of a {len(shape)}D tensor isn't recognized as the "
+            f"conv-output-into-classifier-head pattern DependencyGraph handles (only a 4D NCHW "
+            f"conv output being flattened ahead of a Linear is supported)"
+        )
+    spatial = int(shape[2]) * int(shape[3])
+    walk.forward(node, expand_blocks(idx, spatial))
+
+
+# Keyed the way fx records a node's target: the function itself for
+# `call_function`, the method name for `call_method`, and -- since a
+# `call_module` target is just the submodule's name -- the module class
+# (subclasses included) for modules.
+OP_PROPAGATORS: dict[object, OpPropagator] = {
+    **dict.fromkeys([torch.add, operator.add, operator.iadd, "__add__", "__iadd__", "add", "add_"], propagate_add),
+    **dict.fromkeys([torch.cat, torch.concat], propagate_cat),
+    **dict.fromkeys([torch.flatten, "view", "reshape", "flatten", nn.Flatten], propagate_flatten),
+}
+
+
+def register_op_propagator(target: object, propagator: OpPropagator, *, overwrite: bool = False) -> OpPropagator:
+    """Teach every `DependencyGraph` to carry a prune through `target` -- a
+    function (`torch.sub`), a tensor method name (`"sub"`), or a module class
+    -- with `propagator(walk, source, node, idx)`, which records into
+    `walk.group` and continues with `walk.forward`. Re-registering a target
+    raises unless `overwrite=True`; pass `op_propagators={...}` to one
+    `DependencyGraph` instead to scope it to that graph."""
+    if target in OP_PROPAGATORS and not overwrite:
+        raise ValueError(f"a propagator for {target!r} is already registered; pass overwrite=True to replace it")
+    OP_PROPAGATORS[target] = propagator
+    return propagator
 
 
 class LeafTracer(fx.Tracer):
