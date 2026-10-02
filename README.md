@@ -44,8 +44,8 @@ formerly `legacy_pipeline/` at the repo root — see `LEGACY_PIPELINE_MIGRATION.
 was a corrected rebuild of `pruning_framwork_v4`'s original driver scripts,
 done in parallel with this package. Since then, those same scripts got fixed
 directly in `pruning_framwork_v4` itself — and more completely, since that
-fix added K-means/SVD/hybrid sequencing that `legacy_pipeline` (built on this
-repo's Max-k/L1/L2/random-only `prunelib`) never had. It moved under
+fix added K-means/SVD/hybrid sequencing that `legacy_pipeline` (whose config
+only offers Max-k/L1/L2/random) never had. It moved under
 `archive/` rather than staying at the top level to make that explicit: this
 repo is `prunelib` plus the Transformer experiments first, with
 `legacy_pipeline` kept only for its test suite and as a record of the
@@ -85,10 +85,10 @@ runs all of them this way on every commit (see `.github/workflows/tests.yml`).
 ## API
 
 ```python
-from prunelib import compute_score, select_prune_indices, prune_conv_bn, prune_ffn_block
+from prunelib import compute_score, keep_indices, prune_conv_bn, prune_ffn_block
 
 scores = compute_score(conv.weight, method="max_k", k=3)   # or "l1", "l2", "random"
-keep_idx = ...  # complement of select_prune_indices(scores, n_to_prune)
+keep_idx = keep_indices(scores, n_to_prune)                 # complement of select_prune_indices(scores, n_to_prune)
 new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep_idx, bn=bn, next_conv=next_conv)
 ```
 

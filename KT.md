@@ -73,7 +73,7 @@ prunelib/
     surgery.py    (280 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
                                slice_batchnorm primitives; Conv/BN/FFN/attention-head
                                structural surgery built on them
-    masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
+    masking.py    (127 lines)  two-phase mask-then-compress workflow (torch.nn.utils.prune)
     module_rules.py (132 lines) ModuleRule / ChannelRole: how each layer type takes
                                part in DependencyGraph pruning; MODULE_RULES registry
     graph.py      (671 lines) torch.fx dependency resolution -- generic add/cat/
@@ -88,14 +88,14 @@ prunelib/
                                quantization (thesis Ch. 6.6) -- separate compression
                                stage from pruning, applied after it;
                                QUANTIZATION_METHODS registry
-    vgg.py        VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
+    vgg.py        (207 lines)  VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
                                (every conv layer, including the last -> classifier[0];
                                only build_vgg16 needs torchvision)
     scanners.py   (67 lines)   Pairwise distance matrix + co-activation scanning
     evaluate.py   (59 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                 (75 lines)  full pipeline, seconds, no dependencies beyond torch
-    01_vgg_cifar10_sweep.py   (183 lines)  VGG16/CIFAR-10 — see section 5, this one has three run modes
+    01_vgg_cifar10_sweep.py   (183 lines)  VGG16/CIFAR-10 — three run modes, see section 4 (experiments/)
     02_bert_sst2_sweep.py      (75 lines)  BERT FFN pruning
     03_head_redundancy.py     (108 lines)  attention head distance scan + K-Means head pruning
     04_coactivation.py         (44 lines)  synthetic co-activation demo
@@ -112,7 +112,7 @@ archive/
 tests/          109 tests across 11 files, one per historical defect or behavior
 ```
 
-Total: ~5,100 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
+Total: ~5,250 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
 
 ## 3. Design decisions, and the defect each one prevents
 
@@ -125,13 +125,12 @@ If you're refactoring `prunelib`, read this table first.
 | Per-kernel top-k summed across input channels in one vectorized op (`.sum(dim=2)` then `.sum(dim=1)`), not an accumulator reset "once per output channel" but mutated inside an inner loop | D3: score accumulated from monotonically-growing partial maxima across input channels — not the intended quantity at all | `saliency.py::max_k_saliency` |
 | Kernel height and width read from their own tensor dimensions (`kh, kw = weight.shape[2], weight.shape[3]`), never reusing one dimension for both | D4: original iterated `range(size[2])` for *both* height and width, dropping columns on non-square kernels | `saliency.py::max_k_saliency` |
 | `prune_ffn_block` and `prune_conv_bn` raise `ValueError` immediately if shapes don't match, before touching any tensor | D5: a shape bug surfaced as a confusing `IndexError` deep inside an unrelated loop instead of at the actual mistake | `surgery.py`, both functions' first lines |
-| Surgery is pure advanced indexing (`weight.index_select(0, keep_idx)`); no manual per-channel copy loop with a hand-maintained destination counter | D6: the old copy loop's destination index never incremented, so every surviving channel wrote to index 0 | `surgery.py::prune_conv_bn` |
+| Surgery is pure advanced indexing (`weight.index_select(0, keep_idx)`); no manual per-channel copy loop with a hand-maintained destination counter | D6: the old copy loop's destination index never incremented, so every surviving channel wrote to index 0 | `surgery.py::_take`, behind every `slice_*` primitive |
 | Same as D6 — no manual loop, so there's no "off-by-one before first use" to have | D7: `fin_new = fin_org` then `fin_new += 1` before the variable was ever read | `surgery.py` (structurally can't recur) |
-| Pruning a VGG layer replaces modules in-place inside `model.features` rather than rebuilding a whole model from a `feature_list` and copying weights in | This *is* D6/D7's root cause, one level up — the old code's entire "reconstruct then copy" pattern is gone, not just patched | `experiments/01_vgg_cifar10_sweep.py::prune_vgg_layer`, `vgg.py::compress_masked_vgg` |
+| Pruning a VGG layer replaces modules in-place inside `model.features` rather than rebuilding a whole model from a `feature_list` and copying weights in | This *is* D6/D7's root cause, one level up — the old code's entire "reconstruct then copy" pattern is gone, not just patched | `vgg.py::prune_vgg_layer` / `_apply_vgg_surgery`, `vgg.py::compress_masked_vgg` |
 | Masking uses `torch.nn.utils.prune.custom_from_mask` — one call, full mask computed up front — instead of subclassing `BasePruningMethod` with a `compute_mask` that reconstructs the mask from global state on every call | The systemic bug across *every* driver script in old `pruning_framwork_v4`: a `layer_number` global was supposed to tell `compute_mask` which layer it was on, and the line updating it was commented out in all six scripts, so it silently stayed 0 forever (see `GITHUB_AUDIT.md` section 11) | `masking.py::mask_channels` |
 | `mask_vgg_layer` scores and selects only from `surviving_channels` (not-yet-masked channels), never all channels | Without this, an already-masked channel's weight is zero — the lowest possible score under every criterion — so it wins re-selection on every later iteration, and the pruning schedule advances far slower than the requested fraction implies | `vgg.py::mask_vgg_layer` |
 | "Which indices are *not* in this index tensor" is a boolean mask + `nonzero()`, never `set(idx.tolist())` plus a Python `range()` comprehension | Not a historical defect, but a recurring anti-pattern found and fixed 2026-09-22 in three places (`masking.py::surviving_channels`, `vgg.py::prune_vgg_layer`, `saliency.py::keep_indices`) — same result, but drops to a Python-level loop over every channel instead of one vectorized op. If you write `set(...)` + a `range()` comprehension against a channel/index tensor anywhere in this codebase, that's the pattern to replace — with `indices.complement_indices`, which every one of those call sites (and the experiments) now uses | `indices.py` |
-
 | Every pluggable part — saliency scorers, selection rules, distance metrics, quantization methods, prunable layer types, the ops a prune passes through — dispatches through a public `registry.Registry` (keyed by name, or — for layer types in `module_rules.MODULE_RULES` and ops in `graph.OP_PROPAGATORS` — by class/fx op target, looked up through the MRO); adding one is a `register_*` call from the caller's own code | Not a historical defect: the open/closed refactor of 2026-10-02. Each was a private dict (`_METHODS`, `_MODEL_METHODS`) or an `if`-chain, so extending meant editing the library — and the same three distance metrics were written out twice (`scanners.py`, `clustering.py`), free to drift apart | `registry.py`, and each module's `*_METHODS`/`*_METRICS`/`MODULE_RULES`/`OP_PROPAGATORS` |
 | Exactly one set of primitives builds a pruned replacement module (`surgery.slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` / `slice_batchnorm`), and it carries over device, dtype and `padding_mode` | `graph.py` and `vgg.py` each had their own copy of `prune_conv_bn`'s index-and-copy logic (and of BatchNorm's running-stat copy); every copy rebuilt modules as CPU float32 with `padding_mode='zeros'`, so pruning a CUDA model left CPU layers in it and a `'reflect'` conv silently changed its border behaviour | `surgery.py` |
 
@@ -146,8 +145,10 @@ instead.
 ### `prunelib/saliency.py`
 
 Four scoring functions (`max_k_saliency`, `l1_saliency`, `l2_saliency`,
-`random_saliency`), all with signature `(weight: [out,in,kh,kw]) -> [out]`,
-routed through `compute_score(weight, method=...)`. `select_prune_indices`
+`random_saliency`), all with signature `(weight) -> [out]` for a Conv2d
+weight `[out,in,kh,kw]` or a Linear weight `[out,in]` (`_channel_view`
+reshapes both to `(out, in, spatial)`), routed through
+`compute_score(weight, method=...)`. `select_prune_indices`
 and `keep_indices` operate on the *score* tensor, not the weight — this
 separation is what makes D1 structurally impossible to reintroduce, since
 there's no code path where a caller has both a weight tensor and a stale
@@ -286,7 +287,7 @@ designed for, it falls out of the forward-walk naturally.
   it as its pruning step; `test_graph.py::test_prune_model_scores_and_prunes_in_one_call`
   is the unit test.
 - `PruningGroup.mask()` / `.commit_and_compress()` — the two-phase
-  mask-then-compress workflow from `masking.py` (see section 4's entry for
+  mask-then-compress workflow from `masking.py` (see its entry above for
   it), extended to a whole dependency group: `.mask()` zeroes every
   output-target module via `masking.mask_channels` instead of immediately
   rebuilding, so you can fine-tune with the group's channels masked before
@@ -375,8 +376,9 @@ place — see README.md's opening line. A corrected rebuild of
 this package, before those scripts got fixed directly in that repo. **Now
 superseded**: `pruning_framwork_v4`'s own fix has more complete method
 coverage (K-means, SVD, hybrid sequencing) than `legacy_pipeline` does, since
-`legacy_pipeline` is built on this package's `prunelib` (Max-k/L1/L2/random
-only). Don't extend `legacy_pipeline` to add parity with
+`legacy_pipeline`'s config only offers this package's Max-k/L1/L2/random
+criteria (`prunelib` has since gained `"kmeans"`, but `legacy_pipeline` is
+frozen and doesn't expose it). Don't extend `legacy_pipeline` to add parity with
 `pruning_framwork_v4` — that work belongs in `pruning_framwork_v4` itself.
 What's still worth reading here:
 `pipeline.py::run_pruning` is a complete, tested example of the
@@ -386,12 +388,24 @@ compress once at the end), and `tests/test_legacy_pipeline.py` is the
 regression test for that. See `LEGACY_PIPELINE_MIGRATION.md` for the full
 defect-by-defect mapping from the original scripts.
 
-
+### `prunelib/scanners.py`
 
 `pairwise_distance_matrix(vectors, metric)` computes Manhattan/Euclidean/
 Cosine — the three metrics compared in Paper 2 — via `distance.py` (below),
-the same metric definitions `clustering.kmeans` uses. It computes distances
+the same metric definitions `clustering.kmeans` uses, so a metric registered
+with `register_distance_metric` works here too. It computes distances
 only; the clustering and selection live in `clustering.py` (below).
+
+`CoActivationScanner` computes pairwise Jaccard similarity on boolean firing
+masks, with a `firing_rate_ceiling` (default 0.9) that excludes near-
+universal-firing units before computing similarity. This exists because a
+unit that fires on 95%+ of tokens will show spuriously high overlap with
+*any* other frequently-firing unit — that's an artifact of both units being
+non-selective, not evidence of redundancy. This hasn't been validated
+against real model activations yet (see section 6) — the logic is tested
+against synthetic masks in `tests/test_scanners.py` and demonstrated in
+`experiments/04_coactivation.py`, but nobody has confirmed the 0.9 default
+is the right threshold on an actual fine-tuned model.
 
 ### `prunelib/clustering.py`
 
@@ -422,17 +436,6 @@ directly, and every saliency method goes through `compute_score` →
 one selection) still holds. A cluster-based rule isn't a per-channel score,
 which is why it's a selector rather than a scorer.
 
-`CoActivationScanner` computes pairwise Jaccard similarity on boolean firing
-masks, with a `firing_rate_ceiling` (default 0.9) that excludes near-
-universal-firing units before computing similarity. This exists because a
-unit that fires on 95%+ of tokens will show spuriously high overlap with
-*any* other frequently-firing unit — that's an artifact of both units being
-non-selective, not evidence of redundancy. This hasn't been validated
-against real model activations yet (see section 6) — the logic is tested
-against synthetic masks in `tests/test_scanners.py` and demonstrated in
-`experiments/04_coactivation.py`, but nobody has confirmed the 0.9 default
-is the right threshold on an actual fine-tuned model.
-
 ### Extension points: `registry.py`, `selection.py`, `distance.py`, `module_rules.py`, `indices.py`
 
 Added 2026-10-02 (the open/closed refactor; every pruning path was verified
@@ -457,6 +460,15 @@ and `metric=` a `DistanceMetric`). The registries:
   `Int8Tensor`, a different contract.
 - `module_rules.MODULE_RULES` — keyed by class, resolved through the MRO
   (`registry.resolve_by_type`), so subclasses inherit their parent's rule.
+- `graph.OP_PROPAGATORS` — keyed the way `torch.fx` records a node's target:
+  the function for `call_function` (`torch.add`, `torch.cat`,
+  `torch.flatten`), the method name for `call_method` (`"add"`, `"view"`),
+  and the module class for `call_module` (`nn.Flatten`, MRO-resolved like
+  `MODULE_RULES`). Each entry is a `(walk, source, node, idx)` propagator.
+
+`DependencyGraph(..., module_rules={...}, op_propagators={...})` merges
+per-graph overrides over the global tables (`{**REGISTRY.entries(),
+**overrides}`) without registering anything globally.
 
 `indices.py` holds the two index helpers that used to be re-derived inline
 in four or five places each: `complement_indices(n, idx)` ("which of `0..n-1`
@@ -473,8 +485,9 @@ precisions, not a substitute for measuring a saved checkpoint, which also
 carries INT8 scale/zero-point metadata). Nothing subtle here, but
 note: `measure_latency`'s numbers are hardware- and batch-size-dependent.
 Don't hardcode a specific multiplier anywhere that isn't clearly labeled
-with the machine/conditions it came from — see the README's note about the
-1.8x vs 2.13x latency discrepancy for why this matters in practice.
+with the machine/conditions it came from — the README once quoted 1.8x
+where a later `00_demo.py` run measured 2.13x, which is why its Results
+section now says to measure on your own machine before citing one.
 
 ### `experiments/`
 
@@ -526,6 +539,10 @@ CPU; the pure-`prunelib` tests alone (including `test_graph.py`,
 `test_quantization.py`, and `test_evaluate.py`, none of which need
 `torchvision`/`transformers`) are still ~2-3s, the rest is the handful
 of tests that build a real `torchvision.vgg16` or a real HF BERT model).
+Those VGG16 tests also need a few GB of free RAM: on a 6.6 GB laptop with
+other work open, `test_legacy_pipeline.py` was OOM-killed (2026-10-02)
+while the other ten files passed run on their own. If `pytest` dies with
+exit code 137, run the files separately before suspecting the code.
 
 The two slowest tests train/evaluate a real (random-init) VGG16 against
 `archive/legacy_pipeline`'s FakeData path — `PruningConfig.fakedata_train_size`
@@ -627,9 +644,11 @@ correct public implementation. Current state, honestly:
 
 ## 7. Extending this codebase — where new work goes
 
-- **New scoring method** (e.g. a second-order/Hessian-based saliency): write
-  a function matching the existing signature (`weight: [out,in,kh,kw] ->
-  Tensor[out]`) and decorate it with `@register_saliency_method("name")` —
+- **New scoring method** (e.g. a Taylor or activation-based saliency for
+  Transformer FFN neurons — a new *CNN* criterion goes to
+  `pruning_framwork_v4`, see below): write a function matching the existing
+  signature (`weight` — Conv2d `[out,in,kh,kw]` or Linear `[out,in]` —
+  `-> Tensor[out]`) and decorate it with `@register_saliency_method("name")` —
   in `saliency.py` if it belongs in the library, or in your own code if it
   doesn't; either way `compute_score`, `select_prune_indices_by_method`,
   `prune_model` and `vgg.py` accept it with no further edit. Add
@@ -705,10 +724,10 @@ correct public implementation. Current state, honestly:
   this package's `prunelib`. Adding one here would create a second,
   divergent implementation of the same idea — see the scope note at the
   top of section 1.
-- **Transformer-extension work** (wiring `experiments/03`'s detected
-  redundant-head pairs into actual `prune_attention_heads` calls — now
-  straightforward via a `special_handlers` handler, see above — deciding a
-  real criterion rather than raw query-weight distance, validating
+- **Transformer-extension work** (`experiments/03` already prunes heads via
+  K-Means on Q/K/V weights and `prune_attention_heads`, since 2026-09-30;
+  what's open is testing whether weight-space clustering is the right head
+  criterion on a fine-tuned checkpoint, and validating
   `CoActivationScanner`'s threshold against real activations) is this repo's
   actual remaining job — see the gaps list in section 6 for what's still
   open there. Also check `transformer_pruning` first, since it's the newer,
@@ -733,7 +752,9 @@ python experiments/07_quantization.py   # pruning + all three quantization metho
 ```
 
 Read section 3 of this document before touching `prunelib/saliency.py`,
-`prunelib/surgery.py`, `prunelib/masking.py`, or `prunelib/graph.py`. Read section 6 before
+`prunelib/surgery.py`, `prunelib/masking.py`, or `prunelib/graph.py`, and
+section 4's "Extension points" entry before adding a method, metric, layer
+type or op (it's usually a `register_*` call, not an edit). Read section 6 before
 writing anything that implies full VGG16/CIFAR-10 results or BERT
 fine-tuning results are already produced by this codebase — the mask-then-
 compress *mechanism* is tested and correct; specific accuracy numbers from
@@ -767,13 +788,32 @@ real training runs haven't been produced here yet.
   resize the model once, at the end, via `compress_masked_conv_bn`. As
   opposed to one-shot surgery (`prune_conv_bn` called directly), which
   resizes immediately on every pruning decision.
+- **Scorer vs. selector** — a scorer (`SALIENCY_METHODS`) gives every
+  channel its own number and the lowest are pruned; a selector
+  (`SELECTION_METHODS`) returns the indices to prune directly, for rules
+  where a channel's fate depends on the others (K-Means). Both are valid
+  `method=` values.
+- **Registry** — a `registry.Registry`: a public name (or type) →
+  implementation table that a `register_*` call extends from outside
+  `prunelib`, so adding a method never means editing the library.
+- **Channel role** — a `ModuleRule`'s answer for one layer type: `MIXING`
+  (ungrouped Conv2d, Linear) produces its own channels, so a prune stops at
+  its input; `PER_CHANNEL` (BatchNorm, depthwise conv) shrinks and passes
+  the prune through.
+- **Op propagator** — the function `DependencyGraph` calls to carry a
+  prune through an op that owns no weights (add, cat, flatten); registered
+  in `graph.OP_PROPAGATORS`.
+- **Pruning group** — every module one prune decision forces to resize,
+  as `DependencyGraph.get_pruning_group` returns it (`PruningGroup`), ready
+  for `.prune()` or `.mask()` / `.commit_and_compress()`.
 
 ## 10. Thesis material not reflected in this codebase
 
 Pragnesh Thaker's Ph.D. thesis, *Pruning and Quantization Techniques for Deep
 Neural Network Acceleration* (NITK Surathkal, July 2025), is the primary
 source behind this repo — `prunelib`'s Max-k saliency, K-Means/distance-metric
-scanning, and hybrid pruning all trace back to it, and the numbers in
+selection and scanning, and `experiments/05`'s ordering question (the
+thesis's hybrid pruning) all trace back to it, and the numbers in
 `README.md` and `PUBLICATIONS.md` are drawn from it. This section covers what
 the thesis describes that **isn't** implemented or documented anywhere in
 this codebase: methods `prunelib` doesn't have (SVD pruning, kernel-level
@@ -828,9 +868,10 @@ removed per fully-connected layer per iteration, for 5 iterations, within a
 1% accuracy-drop budget. `prunelib.surgery.prune_ffn_block` could physically
 implement the resulting surgery (it already shrinks a Linear → activation →
 Linear pair), but nothing in `prunelib` computes this specific
-incoming+outgoing neuron saliency score, and `vgg.py` only ever touches
-`model.features` (the conv stack) — `model.classifier` (VGG's 3 dense
-layers) is never pruned by this codebase.
+incoming+outgoing neuron saliency score, and `vgg.py` never prunes
+`model.classifier`'s neurons (VGG's 3 dense layers) — it only resizes
+`classifier[0]`'s *input* columns to follow a pruned last conv layer
+(2026-09-30), which removes no neuron from the classifier itself.
 
 **Custom regularization (CSD — Custom Standard Deviation)** (thesis Ch. 6.1,
 Eq. 6.1–6.4; this is `PUBLICATIONS.md` paper #2) — a training-time

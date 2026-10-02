@@ -2,10 +2,11 @@
 Evaluation helpers: parameter counts, *measured* wall-clock latency, and
 estimated size at a given bit-width.
 
-Measured latency is what the README's "1.8x latency reduction" figure comes
-from — structural surgery removes real rows/columns from real tensors, so a
-smaller model is actually faster on the same hardware, not just "fewer FLOPs
-on paper" the way masked pruning is.
+Measured latency is what the README's quickstart latency figure
+(`experiments/00_demo.py`) comes from — structural surgery removes real
+rows/columns from real tensors, so a smaller model is actually faster on
+the same hardware, not just "fewer FLOPs on paper" the way masked pruning
+is.
 """
 from __future__ import annotations
 
