@@ -8,7 +8,6 @@ real parameter count and measured latency before and after.
     python experiments/00_demo.py
 """
 import argparse
-import time
 
 import torch
 import torch.nn as nn

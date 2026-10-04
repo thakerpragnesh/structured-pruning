@@ -2,8 +2,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from prunelib import compute_score, kmeans, kmeans_prune_indices, prune_model, select_prune_indices
-from prunelib.clustering import select_prune_indices_by_method
+from prunelib import (
+    compute_score,
+    kmeans,
+    kmeans_prune_indices,
+    prune_model,
+    select_prune_indices,
+    select_prune_indices_by_method,
+)
 
 
 def _grouped_channels(group_sizes, dim=16, noise=0.01, seed=0):

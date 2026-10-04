@@ -64,13 +64,13 @@ prunelib/
                                Conv2d or Linear weights; SALIENCY_METHODS registry
     selection.py  (64 lines)   select_prune_indices_by_method: weight + budget ->
                                prune indices, by any scorer or registered selector
-    clustering.py (185 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
+    clustering.py (184 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
                                prune the lowest-L1 channels within each cluster;
                                registers itself as the "kmeans" selection rule
     distance.py   (66 lines)   DistanceMetric (pairwise distance + matching K-Means
                                centroid); DISTANCE_METRICS registry
     indices.py    (35 lines)   complement_indices, expand_blocks
-    surgery.py    (280 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
+    surgery.py    (274 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
                                slice_batchnorm primitives; Conv/BN/FFN/attention-head
                                structural surgery built on them
     masking.py    (127 lines)  two-phase mask-then-compress workflow (torch.nn.utils.prune)
@@ -88,18 +88,18 @@ prunelib/
                                quantization (thesis Ch. 6.6) -- separate compression
                                stage from pruning, applied after it;
                                QUANTIZATION_METHODS registry
-    vgg.py        (207 lines)  VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
+    vgg.py        (203 lines)  VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
                                (every conv layer, including the last -> classifier[0];
                                only build_vgg16 needs torchvision)
     scanners.py   (67 lines)   Pairwise distance matrix + co-activation scanning
     evaluate.py   (59 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
-    00_demo.py                 (75 lines)  full pipeline, seconds, no dependencies beyond torch
+    00_demo.py                 (74 lines)  full pipeline, seconds, no dependencies beyond torch
     01_vgg_cifar10_sweep.py   (183 lines)  VGG16/CIFAR-10 — three run modes, see section 4 (experiments/)
     02_bert_sst2_sweep.py      (75 lines)  BERT FFN pruning
     03_head_redundancy.py     (108 lines)  attention head distance scan + K-Means head pruning
     04_coactivation.py         (44 lines)  synthetic co-activation demo
-    05_ordering.py             (69 lines)  does the CNN ordering result transfer?
+    05_ordering.py             (65 lines)  does the CNN ordering result transfer?
     06_generic_pruning.py     (130 lines)  DependencyGraph on a real ResNet-18
     07_quantization.py         (89 lines)  prune_model() + all three quantization methods, one pipeline
 archive/
@@ -429,7 +429,7 @@ than empty a cluster.
 `kmeans_prune_indices` registers itself as the `"kmeans"` rule in
 `selection.SELECTION_METHODS`. `select_prune_indices_by_method(weight, n,
 method, **kwargs)` — the single dispatcher `vgg.py` and `graph.prune_model`
-call — now lives in `selection.py` (still importable from here) and never
+call — now lives in `selection.py` and never
 imports this module: registered selectors (like `"kmeans"`) are called
 directly, and every saliency method goes through `compute_score` →
 `select_prune_indices` exactly as before, so the D1 guarantee (one score,

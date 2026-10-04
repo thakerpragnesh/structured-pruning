@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from prunelib import count_params, estimate_size_bytes, prune_model
-from prunelib.quantization import quantize_fixed_point32, quantize_int8_linear, quantize_model_
+from prunelib.quantization import quantize_int8_linear, quantize_model_
 
 
 class ConvNet(nn.Module):

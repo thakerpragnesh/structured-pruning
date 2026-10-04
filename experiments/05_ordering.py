@@ -39,12 +39,8 @@ def main():
     keep_a = keep_indices(scores_before, prune_amount)
     _, _, pruned_conv2_a = prune_conv_bn(conv1, keep_a, bn=bn1, next_conv=conv2)
 
-    # Order B: prune conv2's kernels first (simulated by zeroing a slice of
-    # conv2's *input* side -- the kernel-level analogue), THEN re-score conv1.
-    conv2_kernel_pruned = conv2.weight.clone()
-    kernel_prune_amount = int(conv2_kernel_pruned.shape[1] * args.budget)
-    conv2_kernel_pruned[:, :kernel_prune_amount] = 0.0
-
+    # Order B: prune conv2's kernels first (zeroing a slice of conv2's
+    # *input* side -- the kernel-level analogue), THEN re-score conv1.
     # After kernel pruning has zeroed part of conv2's input side, conv1's
     # output channels feeding those zeroed slots are effectively invisible
     # to the network -- but conv1's OWN weights (what compute_score sees)

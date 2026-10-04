@@ -18,8 +18,7 @@ can't be expressed as `compute_score(...) -> select_prune_indices(...)`.
 `selection.SELECTION_METHODS`, so `selection.select_prune_indices_by_method`
 -- the one dispatcher `vgg.py` and `graph.prune_model` call -- accepts
 `method="kmeans"` alongside `"max_k"`/`"l1"`/`"l2"`/`"random"` without
-knowing this module exists. (`select_prune_indices_by_method` used to live
-here; it's still importable from here for existing callers.)
+knowing this module exists.
 
 K-Means is implemented here in plain torch (no scikit-learn dependency).
 Each metric uses the centroid update that actually minimizes it, not the
@@ -38,7 +37,7 @@ import torch
 
 from .distance import DISTANCE_METRICS, DistanceMetric
 from .saliency import select_prune_indices
-from .selection import register_selection_method, select_prune_indices_by_method  # noqa: F401  (re-exported, see above)
+from .selection import register_selection_method
 
 
 def _kmeans_plus_plus_init(

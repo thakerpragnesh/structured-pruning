@@ -251,9 +251,6 @@ def prune_attention_heads(
     new_key = slice_linear(key, keep_out=keep_rows)
     new_value = slice_linear(value, keep_out=keep_rows)
     new_output = slice_linear(output, keep_in=keep_rows)
-
-    if new_output.in_features != new_query.out_features:  # pragma: no cover - should be unreachable
-        raise RuntimeError("post-surgery seam mismatch — this indicates a bug in prune_attention_heads")
     return new_query, new_key, new_value, new_output
 
 
@@ -274,7 +271,4 @@ def prune_ffn_block(fc1: nn.Linear, fc2: nn.Linear, keep_idx: torch.Tensor) -> t
         )
     new_fc1 = slice_linear(fc1, keep_out=keep_idx)
     new_fc2 = slice_linear(fc2, keep_in=keep_idx)
-
-    if new_fc1.out_features != new_fc2.in_features:  # pragma: no cover - should be unreachable
-        raise RuntimeError("post-surgery seam mismatch — this indicates a bug in prune_ffn_block")
     return new_fc1, new_fc2

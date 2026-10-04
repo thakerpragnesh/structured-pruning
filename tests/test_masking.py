@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 
 from prunelib.masking import (
-    build_channel_mask,
     commit_mask,
     compress_masked_conv_bn,
     mask_channels,

@@ -39,7 +39,7 @@ from prunelib.vgg import vgg_conv_bn_positions
 
 from .config import PruningConfig
 from .data import build_dataloaders
-from .model import freeze_all_but_classifier, get_device, load_model, unfreeze_all  # noqa: F401  (freeze kept for callers who want head-only fine-tuning)
+from .model import get_device, load_model, unfreeze_all
 from .train import evaluate, fit_one_cycle
 
 

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.utils.prune as prune
 
 from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels, surviving_channels
@@ -172,9 +171,6 @@ def compress_masked_vgg(model: nn.Module) -> int:
         conv = model.features[conv_idx]
 
         commit_mask(conv)
-        if prune.is_pruned(conv):  # pragma: no cover -- would indicate a bug in commit_mask
-            raise RuntimeError(f"conv at features[{conv_idx}] is still masked after commit_mask")
-
         keep_idx = surviving_channels(conv.weight)
         total_removed += conv.out_channels - keep_idx.numel()
         _apply_vgg_surgery(model, pos, keep_idx)

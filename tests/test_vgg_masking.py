@@ -44,7 +44,6 @@ def test_mask_vgg_layer_excludes_already_masked_channels_on_repeat_calls():
     assert second == expected_per_call  # not ~0, which is what the un-fixed version would give
     assert third == expected_per_call
 
-    total_masked = len(vgg_conv_bn_positions(model.features))  # placeholder, real check below
     zeroed = n_out - surviving_channels(model.features[conv_idx].weight).numel()
     assert zeroed == first + second + third  # every call's contribution is additive, none wasted on re-selection
 
