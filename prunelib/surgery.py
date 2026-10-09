@@ -31,29 +31,74 @@ classifier resize call them too, where each used to carry its own copy of
 the same index-and-copy logic (and of BatchNorm's running-statistics copy).
 
 A replacement must be a drop-in substitute for the module it replaces, so
-the primitives carry over everything about the original except its channel
-counts: kernel/stride/padding/dilation, `padding_mode`, and the device and
-dtype of its parameters. (Before they were consolidated, every rebuilt
-module was created on the CPU in float32 with `padding_mode='zeros'`
-regardless of the original -- pruning a CUDA model left CPU layers inside
-it, and a `'reflect'`-padded conv silently became zero-padded.)
+each primitive builds it as a *copy* of the original with resized tensors
+(`_resized_copy`): same class, kernel/stride/padding/dilation,
+`padding_mode`, device, dtype, train/eval mode and `requires_grad`. Two
+earlier versions each lost part of that. Before the primitives were
+consolidated, every rebuilt module was created on the CPU in float32 with
+`padding_mode='zeros'` -- pruning a CUDA model left CPU layers inside it,
+and a `'reflect'`-padded conv silently became zero-padded. After that, they
+were still constructed as a fresh `nn.Conv2d` / `nn.Linear`: a subclass
+(a weight-standardized conv, say) silently became the plain base class and
+computed something else, a frozen layer came back trainable, and a layer
+of a model in eval mode came back in training mode.
 """
 from __future__ import annotations
 
-import itertools
+import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.utils.prune as torch_prune
 
 from .indices import expand_blocks
 
 
-def _factory_kwargs(module: nn.Module) -> dict:
-    """`device=`/`dtype=` matching `module`'s own floating-point tensors, so
-    a replacement is constructed where the original lives."""
-    tensors = itertools.chain(module.parameters(recurse=False), module.buffers(recurse=False))
-    ref = next((t for t in tensors if t.is_floating_point()), None)
-    return {} if ref is None else {"device": ref.device, "dtype": ref.dtype}
+def _resized_copy(module: nn.Module, tensors: dict[str, torch.Tensor | None], **attrs) -> nn.Module:
+    """A copy of `module` -- same class, configuration, train/eval mode and
+    `requires_grad` -- whose parameters/buffers named in `tensors` are the
+    given (resized) tensors, and whose attributes in `attrs` (its channel
+    counts) are updated. The original is left untouched.
+
+    A masked module (`masking.mask_channels`, i.e. `torch.nn.utils.prune`'s
+    reparametrization) comes back unmasked, its masked values baked in: the
+    caller sliced `module.weight`, which already has the mask applied. A
+    tensor that is computed from others -- weight norm, spectral norm, a
+    `torch.nn.utils.parametrize` parametrization -- raises rather than be
+    resized here and silently recomputed at its old size."""
+    pruning_hooks = {k: h for k, h in module._forward_pre_hooks.items() if isinstance(h, torch_prune.BasePruningMethod)}
+    masked = {h._tensor_name for h in pruning_hooks.values()}
+    # A masked tensor the caller didn't resize keeps its (masked) value.
+    tensors = {**tensors, **{name: getattr(module, name) for name in sorted(masked) if name not in tensors}}
+    for name in tensors:
+        if name not in module._parameters and name not in module._buffers and name not in masked:
+            raise NotImplementedError(
+                f"{type(module).__name__}.{name} is computed from other tensors (weight norm, spectral norm or a "
+                f"parametrization), not stored, so it can't be resized here -- remove that reparametrization first"
+            )
+
+    # Copy everything but the tensors being replaced and the masking state
+    # being dropped: mapping them to None in the memo skips copying them.
+    skipped = [getattr(module, name) for name in tensors]
+    skipped += [module._parameters[f"{name}_orig"] for name in masked] + [module._buffers[f"{name}_mask"] for name in masked]
+    memo = {id(obj): None for obj in [*skipped, *pruning_hooks.values()] if obj is not None}
+    new = copy.deepcopy(module, memo)
+    for name in masked:
+        del new._parameters[f"{name}_orig"], new._buffers[f"{name}_mask"]
+        new.__dict__.pop(name, None)
+    for key in pruning_hooks:
+        del new._forward_pre_hooks[key]
+
+    for name, value in tensors.items():
+        value = None if value is None else value.detach().clone()
+        if name in module._buffers:
+            new._buffers[name] = value
+        else:
+            original = module._parameters.get(f"{name}_orig", module._parameters.get(name))
+            setattr(new, name, None if value is None else nn.Parameter(value, requires_grad=original.requires_grad))
+    for name, value in attrs.items():
+        setattr(new, name, value)
+    return new
 
 
 def _take(weight: torch.Tensor, bias: torch.Tensor | None, keep_out, keep_in):
@@ -67,21 +112,6 @@ def _take(weight: torch.Tensor, bias: torch.Tensor | None, keep_out, keep_in):
     if keep_in is not None:
         weight = weight.index_select(1, keep_in.to(torch.long))
     return weight, bias
-
-
-def _copy_into(new: nn.Module, weight: torch.Tensor, bias: torch.Tensor | None) -> None:
-    new.weight.copy_(weight)
-    if bias is not None:
-        new.bias.copy_(bias)
-
-
-def _conv_like(conv: nn.Conv2d, in_channels: int, out_channels: int, groups: int) -> nn.Conv2d:
-    """A Conv2d configured exactly like `conv` except for its channel counts."""
-    return nn.Conv2d(
-        in_channels, out_channels, kernel_size=conv.kernel_size, stride=conv.stride, padding=conv.padding,
-        dilation=conv.dilation, groups=groups, bias=conv.bias is not None, padding_mode=conv.padding_mode,
-        **_factory_kwargs(conv),
-    )
 
 
 def is_depthwise_conv(module: nn.Module) -> bool:
@@ -113,9 +143,7 @@ def slice_conv2d(
             + ("; use slice_depthwise_conv2d for a depthwise conv" if is_depthwise_conv(conv) else "")
         )
     weight, bias = _take(conv.weight, conv.bias, keep_out, keep_in)
-    new = _conv_like(conv, weight.shape[1], weight.shape[0], groups=1)
-    _copy_into(new, weight, bias)
-    return new
+    return _resized_copy(conv, {"weight": weight, "bias": bias}, in_channels=weight.shape[1], out_channels=weight.shape[0])
 
 
 @torch.no_grad()
@@ -127,9 +155,7 @@ def slice_depthwise_conv2d(conv: nn.Conv2d, keep: torch.Tensor) -> nn.Conv2d:
         raise ValueError(f"expected a depthwise conv (groups == in == out > 1), got {conv}")
     weight, bias = _take(conv.weight, conv.bias, keep, None)
     n = weight.shape[0]
-    new = _conv_like(conv, n, n, groups=n)
-    _copy_into(new, weight, bias)
-    return new
+    return _resized_copy(conv, {"weight": weight, "bias": bias}, in_channels=n, out_channels=n, groups=n)
 
 
 @torch.no_grad()
@@ -140,9 +166,7 @@ def slice_linear(
     bias) and input features `keep_in` (columns of weight) of `linear`
     (`None` keeps all of that dimension)."""
     weight, bias = _take(linear.weight, linear.bias, keep_out, keep_in)
-    new = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None, **_factory_kwargs(linear))
-    _copy_into(new, weight, bias)
-    return new
+    return _resized_copy(linear, {"weight": weight, "bias": bias}, in_features=weight.shape[1], out_features=weight.shape[0])
 
 
 @torch.no_grad()
@@ -155,18 +179,12 @@ def slice_batchnorm(bn: nn.modules.batchnorm._BatchNorm, keep: torch.Tensor) -> 
     keeps the pruned model numerically sane before any fine-tuning happens.
     """
     keep = keep.to(torch.long)
-    new_bn = type(bn)(
-        keep.numel(), eps=bn.eps, momentum=bn.momentum, affine=bn.affine,
-        track_running_stats=bn.track_running_stats, **_factory_kwargs(bn),
-    )
+    tensors = {}
     if bn.affine:
-        new_bn.weight.copy_(bn.weight.index_select(0, keep))
-        new_bn.bias.copy_(bn.bias.index_select(0, keep))
+        tensors.update(weight=bn.weight.index_select(0, keep), bias=bn.bias.index_select(0, keep))
     if bn.track_running_stats:
-        new_bn.running_mean.copy_(bn.running_mean.index_select(0, keep))
-        new_bn.running_var.copy_(bn.running_var.index_select(0, keep))
-        new_bn.num_batches_tracked.copy_(bn.num_batches_tracked)
-    return new_bn
+        tensors.update(running_mean=bn.running_mean.index_select(0, keep), running_var=bn.running_var.index_select(0, keep))
+    return _resized_copy(bn, tensors, num_features=keep.numel())  # num_batches_tracked is copied as-is
 
 
 def prune_conv_bn(

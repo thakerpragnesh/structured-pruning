@@ -22,10 +22,12 @@ def count_params(module: nn.Module) -> int:
 
 def count_encoder_params(module: nn.Module, encoder_attr: str = "encoder") -> int:
     """Parameter count restricted to a named sub-module (e.g. a Transformer's
-    `.encoder`), for reporting that excludes embeddings/heads which pruning
-    doesn't touch."""
-    sub = getattr(module, encoder_attr, module)
-    return count_params(sub)
+    `.encoder`, or `"bert.encoder"` inside a task model that wraps one), for
+    reporting that excludes embeddings/heads which pruning doesn't touch.
+    Raises `AttributeError` if `module` has no such submodule. It used to
+    count the whole model instead, so a typo or a wrapper class reported
+    embeddings and heads as encoder parameters without a word."""
+    return count_params(module.get_submodule(encoder_attr))
 
 
 @torch.no_grad()

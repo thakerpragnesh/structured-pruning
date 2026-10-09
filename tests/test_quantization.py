@@ -125,3 +125,22 @@ def test_quantize_model_unknown_method_raises():
     model = nn.Linear(4, 3)
     with pytest.raises(ValueError, match="unknown method"):
         quantize_model_(model, method="int8")
+
+
+def test_quantize_model_reaches_every_parameter_a_listed_type_owns():
+    """Open/closed: it looked up `weight` and `bias` by name, so a listed type
+    that names its parameters otherwise was silently left as it was
+    (`MultiheadAttention`'s `in_proj_weight`), and `nn.LSTM` -- whose `bias`
+    is a flag, not a tensor -- crashed. It now quantizes every
+    floating-point parameter the module owns directly."""
+    torch.manual_seed(0)
+    model = nn.ModuleDict({"attn": nn.MultiheadAttention(8, 2), "rnn": nn.LSTM(4, 4)})
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+
+    quantize_model_(model, method="fixed_point32", module_types=(nn.MultiheadAttention, nn.LSTM), integer_bits=1, fractional_bits=2)
+
+    for name, p in model.named_parameters():
+        if name.startswith("attn.out_proj"):  # a Linear child: quantized only when Linear is listed
+            assert torch.equal(p, before[name]), name
+        else:
+            assert torch.equal(p, quantize_fixed_point32(before[name], integer_bits=1, fractional_bits=2)), name

@@ -18,6 +18,7 @@ import torch.nn as nn
 from .graph import DependencyGraph
 from .group import PruningGroup
 from .indices import complement_indices
+from .module_rules import find_module_rule
 from .selection import Selector, prune_count, select_prune_indices_by_method
 
 
@@ -65,13 +66,15 @@ def prune_model(
         raise ValueError(f"prune_fraction must be in [0, 1), got {prune_fraction}")
 
     module = model.get_submodule(layer) if isinstance(layer, str) else layer
-    if not hasattr(module, "weight"):
-        raise TypeError(f"{layer!r} ({type(module).__name__}) has no .weight to score")
+    rule = find_module_rule(module, None if dependency_graph is None else dependency_graph.module_rules)
+    if rule is None:
+        raise TypeError(f"{layer!r} ({type(module).__name__}) has no module rule, so no weight to score")
 
     dep = dependency_graph or DependencyGraph(model, example_input)
-    n_out = module.weight.shape[0]
+    weight = rule.output_weight(module)  # [out_channels, ...], whatever the layer's own layout
+    n_out = weight.shape[0]
     n_to_prune = prune_count(n_out, prune_fraction, min_prune=0)
-    prune_idx = select_prune_indices_by_method(module.weight, n_to_prune, method=method, **method_kwargs)
+    prune_idx = select_prune_indices_by_method(weight, n_to_prune, method=method, **method_kwargs)
 
     group = dep.get_pruning_group(layer, complement_indices(n_out, prune_idx))
     group.prune()

@@ -34,7 +34,6 @@ from typing import Callable, Mapping
 import torch
 import torch.nn as nn
 
-from .masking import commit_mask
 from .module_rules import ModuleRule, find_module_rule
 
 SpecialHandler = Callable[[nn.Module, torch.Tensor], nn.Module]
@@ -74,8 +73,10 @@ class PruningGroup:
     """The result of `DependencyGraph.get_pruning_group`: every module whose
     weights must be resized for one prune decision to be structurally valid,
     keyed by qualified name. `output_targets[name]` are indices to remove
-    from that module's *output* dimension (dim 0 of its weight);
-    `input_targets[name]` from its *input* dimension (dim 1). A module can
+    from that module's *output* channels; `input_targets[name]` from its
+    *input* channels. Which weight dimension each one is belongs to the
+    module's rule (`ModuleRule.output_weight`, `rebuild`): dim 0 and dim 1
+    for every built-in type, not for a `ConvTranspose2d`. A module can
     appear in both (a plain conv-BN-conv chain has the middle conv shrink on
     input from the previous layer and needs no output change here; a
     depthwise conv appears only in `output_targets`, by convention, since
@@ -176,9 +177,10 @@ class PruningGroup:
                 raise NotImplementedError(f"{name!r}: {exc}") from None
 
     def commit_and_compress(self) -> nn.Module:
-        """Phase 2: bake every mask `.mask()` applied into real zeros
-        (`masking.commit_mask`) on each `output_targets` module, then run
-        the same rebuild `.prune()` does. Equivalent to calling `.prune()`
+        """Phase 2: bake every mask `.mask()` applied into real zeros on
+        each `output_targets` module, through its module rule's
+        `commit_mask` (the counterpart of the `mask` that applied it), then
+        run the same rebuild `.prune()` does. Equivalent to calling `.prune()`
         directly on an unmasked group -- see
         `tests/test_masking.py::test_compress_masked_conv_bn_matches_direct_surgery`
         for the single-layer version of this same equivalence proof -- except
@@ -187,5 +189,6 @@ class PruningGroup:
         masked, so this is also safe to call on a group `.mask()` was never
         called on (identical to plain `.prune()` in that case)."""
         for name in self.output_targets:
-            commit_mask(self.model.get_submodule(name))
+            module = self.model.get_submodule(name)
+            self._rule(name, module).commit_mask(module)
         return self.prune()

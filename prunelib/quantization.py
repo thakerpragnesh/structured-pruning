@@ -160,13 +160,20 @@ def quantize_model_(
     module_types: tuple[type, ...] = QUANTIZABLE_MODULE_TYPES,
     **kwargs,
 ) -> nn.Module:
-    """Apply `method`'s quantization error to every weight (and bias, if
-    present) of every `module_types` module in `model` (default: Linear/
-    Conv2d/BatchNorm), **in place**, then cast the result back to that
-    parameter's original dtype. `method` is a name in `QUANTIZATION_METHODS`
-    ("float16", "fixed_point32", or one registered later) or a same-shape
-    `(tensor, **kwargs) -> tensor` function itself; `kwargs` are forwarded
-    to it. INT8 isn't included here because
+    """Apply `method`'s quantization error to every floating-point parameter
+    each `module_types` module in `model` owns directly (default types:
+    Linear/Conv2d/BatchNorm, i.e. their weight and bias), **in place**, then
+    cast the result back to that parameter's original dtype. A child
+    module's parameters are quantized when the child's own type is listed
+    (`nn.MultiheadAttention` owns `in_proj_weight`; its `out_proj` is a
+    `Linear`). It used to look up `weight` and `bias` by name, so a listed
+    type that names its parameters otherwise was silently left untouched
+    (`MultiheadAttention`), or crashed when `bias` was a flag (`nn.LSTM`).
+
+    `method` is a name in `QUANTIZATION_METHODS` ("float16",
+    "fixed_point32", or one registered later) or a same-shape `(tensor,
+    **kwargs) -> tensor` function itself; `kwargs` are forwarded to it.
+    INT8 isn't included here because
     `quantize_int8_linear` returns a separate `Int8Tensor` struct, not a
     same-shape, same-dtype replacement this function's uniform copy-back
     loop can use; call `quantize_int8_linear`/`dequantize_int8_linear`
@@ -190,8 +197,7 @@ def quantize_model_(
     for module in model.modules():
         if not isinstance(module, module_types):
             continue
-        if getattr(module, "weight", None) is not None:
-            module.weight.copy_(fn(module.weight, **kwargs).to(module.weight.dtype))
-        if getattr(module, "bias", None) is not None:
-            module.bias.copy_(fn(module.bias, **kwargs).to(module.bias.dtype))
+        for param in module.parameters(recurse=False):
+            if param.is_floating_point():
+                param.copy_(fn(param, **kwargs).to(param.dtype))
     return model

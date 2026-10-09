@@ -25,7 +25,8 @@ from prunelib import (
     kmeans,
     l1_saliency,
     pairwise_distance_matrix,
-    propagate_add,
+    propagate_channelwise,
+    propagate_elementwise,
     prune_model,
     quantize_model_,
     register_op_propagator,
@@ -219,6 +220,21 @@ def test_module_rule_teaches_dependency_graph_a_new_layer_type():
     assert nn.Conv1d not in MODULE_RULES  # scoped to that one graph, not leaked globally
 
 
+def test_prune_model_scores_a_layer_type_a_module_rule_taught():
+    """Open/closed: the Conv1d rule above taught the graph to prune Conv1d,
+    but `prune_model` still couldn't, because the scorers accepted only 2D
+    and 4D weights. The rule is now all it takes."""
+    x = torch.randn(2, 3, 10)
+    model = _conv1d_net()
+    weight = model[0].weight.detach().clone()
+    weakest = torch.topk(l1_saliency(weight), 3, largest=False).indices.sort().values
+
+    dep = DependencyGraph(model, x, module_rules={nn.Conv1d: _Conv1dRule()})
+    prune_model(model, x, model[0], prune_fraction=3 / 8, method="l1", dependency_graph=dep)
+    assert torch.equal(model[0].weight, weight[complement_indices(8, weakest)])
+    assert model[1].num_features == 5 and model(x).shape == (2, 4, 10)
+
+
 def test_per_graph_overrides_are_layered_over_the_live_global_registry(temporarily_register):
     """A graph built with *any* `module_rules=` override used to snapshot the
     global table, so a rule registered globally afterwards reached graphs
@@ -237,7 +253,7 @@ def test_module_rule_methods_are_positional_only():
     base's `role(self, module)` -- raised TypeError on every one of them.
     The base methods are positional-only now, so the contract is a
     positional call, which every rule (built-in or `_Conv1dRule`) accepts."""
-    for name in ("role", "rebuild", "mask"):
+    for name in ("role", "rebuild", "output_weight", "mask", "commit_mask"):
         params = list(inspect.signature(getattr(ModuleRule, name)).parameters.values())[1:]
         assert all(p.kind is inspect.Parameter.POSITIONAL_ONLY for p in params), name
         for rule in [*MODULE_RULES.entries().values(), _Conv1dRule()]:
@@ -245,30 +261,88 @@ def test_module_rule_methods_are_positional_only():
 
 
 class _RecordingConv2dRule(Conv2dRule):
-    """The built-in Conv2d rule, plus a record of every `mask` call."""
+    """The built-in Conv2d rule, plus a record of every `mask` /
+    `commit_mask` call."""
 
     def __init__(self):
-        self.masked = []
+        self.masked, self.committed = [], []
 
     def mask(self, conv, prune_out):
         self.masked.append(prune_out.tolist())
         super().mask(conv, prune_out)
 
+    def commit_mask(self, conv):
+        self.committed.append(conv.out_channels)
+        super().commit_mask(conv)
 
-def test_pruning_group_masks_through_the_module_rule():
+
+def test_pruning_group_masks_and_commits_through_the_module_rule():
     """Dependency inversion: `PruningGroup.mask()` called
     `masking.mask_channels` on every layer itself, so a rule could say how to
     rebuild its type but not how to mask it -- a layer whose output channels
     aren't dim 0 of its weight would have been zeroed on the wrong axis. It
-    now asks the rule."""
+    now asks the rule, and `.commit_and_compress()` asks the same rule to
+    undo it (`commit_mask`), so a rule that masks some other way can."""
     rule = _RecordingConv2dRule()
     torch.manual_seed(0)
     model = nn.Sequential(nn.Conv2d(3, 6, 3, padding=1), nn.ReLU(), nn.Conv2d(6, 2, 1))
     dep = DependencyGraph(model, torch.randn(1, 3, 6, 6), module_rules={nn.Conv2d: rule})
-    dep.get_pruning_group("0", torch.tensor([0, 2, 5])).mask()
+    group = dep.get_pruning_group("0", torch.tensor([0, 2, 5]))
+    group.mask()
 
     assert rule.masked == [[1, 3, 4]]  # the output target only; "2" shrinks on input, at compress time
     assert (model[0].weight[[1, 3, 4]] == 0).all() and (model[0].weight[[0, 2, 5]] != 0).any()
+
+    group.commit_and_compress()
+    assert rule.committed == [6] and model[0].out_channels == 3
+
+
+class _ConvTranspose2dRule(ModuleRule):
+    """What a caller writes for ConvTranspose2d, whose weight is
+    `[in, out, kh, kw]`: output channels on dim 1, not dim 0."""
+
+    def role(self, conv):
+        return ChannelRole.MIXING
+
+    def output_weight(self, conv):
+        return conv.weight.transpose(0, 1)
+
+    def rebuild(self, conv, prune_out, prune_in):
+        keep_out = complement_indices(conv.out_channels, prune_out)
+        keep_in = complement_indices(conv.in_channels, prune_in)
+        new = nn.ConvTranspose2d(keep_in.numel(), keep_out.numel(), conv.kernel_size, conv.stride)
+        with torch.no_grad():
+            new.weight.copy_(conv.weight[keep_in][:, keep_out])
+            new.bias.copy_(conv.bias[keep_out])
+        return new
+
+
+def _upsampling_net():
+    torch.manual_seed(0)
+    return nn.Sequential(nn.ConvTranspose2d(4, 6, 2, stride=2), nn.ReLU(), nn.Conv2d(6, 2, 1)).eval()
+
+
+def test_module_rule_says_where_a_layers_output_channels_are():
+    """Open/closed: the graph counted a starting layer's channels from
+    `weight.shape[0]`, and `prune_model` scored those rows, so no rule could
+    describe ConvTranspose2d. Keeping 3 of its 6 output channels pruned one
+    (the count came out as its 4 *input* channels), with no error.
+    `ModuleRule.output_weight` says where a type keeps them."""
+    x = torch.randn(1, 4, 4, 4)
+    rules = {nn.ConvTranspose2d: _ConvTranspose2dRule()}
+
+    model = _upsampling_net()
+    group = DependencyGraph(model, x, module_rules=rules).get_pruning_group("0", torch.tensor([0, 1, 2]))
+    assert group.output_targets["0"].tolist() == [3, 4, 5] and group.input_targets["2"].tolist() == [3, 4, 5]
+    group.prune()
+    assert model[0].out_channels == 3 and model(x).shape == (1, 2, 8, 8)
+
+    model = _upsampling_net()
+    weight = model[0].weight.detach().clone()
+    weakest = torch.topk(l1_saliency(weight.transpose(0, 1)), 2, largest=False).indices.sort().values
+    dep = DependencyGraph(model, x, module_rules=rules)
+    prune_model(model, x, model[0], prune_fraction=2 / 6, method="l1", dependency_graph=dep)
+    assert torch.equal(model[0].weight, weight[:, complement_indices(6, weakest)])
 
 
 def test_select_prune_indices_among_never_picks_outside_the_candidates():
@@ -286,10 +360,11 @@ def test_select_prune_indices_among_never_picks_outside_the_candidates():
         assert torch.equal(picked, picked.sort().values)
 
 
-class _SubResidual(nn.Module):
-    """A residual block merged with subtraction, which DependencyGraph has no
-    built-in propagator for. `method=True` writes it as `.sub()` (an fx
-    `call_method` node) instead of `torch.sub` (a `call_function` node)."""
+class _MaxResidual(nn.Module):
+    """A residual block merged with an elementwise maximum, which
+    DependencyGraph has no built-in propagator for. `method=True` writes it
+    as `.maximum()` (an fx `call_method` node) instead of `torch.maximum` (a
+    `call_function` node)."""
 
     def __init__(self, method: bool = False):
         super().__init__()
@@ -300,37 +375,37 @@ class _SubResidual(nn.Module):
 
     def forward(self, x):
         y = self.a(x)
-        z = self.b(y).sub(y) if self.method else torch.sub(self.b(y), y)
+        z = self.b(y).maximum(y) if self.method else torch.maximum(self.b(y), y)
         return self.head(z)
 
 
 def test_op_propagator_teaches_dependency_graph_a_new_op(temporarily_register):
-    """`torch.sub` couples its two branches exactly like `+` does, so the
-    built-in `propagate_add` handles it once registered -- per graph, or
-    globally -- without touching graph.py."""
+    """`torch.maximum` couples its two branches exactly like `+` does, so
+    the built-in `propagate_elementwise` handles it once registered -- per
+    graph, or globally -- without touching graph.py."""
     x = torch.randn(1, 3, 8, 8)
     keep = torch.tensor([0, 1, 3, 5])
 
     torch.manual_seed(0)
-    with pytest.raises(NotImplementedError, match="sub"):
-        DependencyGraph(_SubResidual(), x).get_pruning_group("b", keep)  # unknown op -> refused, not guessed
+    with pytest.raises(NotImplementedError, match="maximum"):
+        DependencyGraph(_MaxResidual(), x).get_pruning_group("b", keep)  # unknown op -> refused, not guessed
 
     torch.manual_seed(0)
-    model = _SubResidual()
+    model = _MaxResidual()
     a_weight, b_weight = model.a.weight.detach().clone(), model.b.weight.detach().clone()
-    group = DependencyGraph(model, x, op_propagators={torch.sub: propagate_add}).get_pruning_group("b", keep)
+    group = DependencyGraph(model, x, op_propagators={torch.maximum: propagate_elementwise}).get_pruning_group("b", keep)
     assert set(group.output_targets) == {"a", "b"} and set(group.input_targets) == {"b", "head"}
     group.prune()
     assert torch.equal(model.a.weight, a_weight[keep]) and torch.equal(model.b.weight, b_weight[keep][:, keep])
     assert model(x).shape == (1, 2, 8, 8)
-    assert torch.sub not in OP_PROPAGATORS  # scoped to that one graph, not leaked globally
+    assert torch.maximum not in OP_PROPAGATORS  # scoped to that one graph, not leaked globally
 
-    temporarily_register(OP_PROPAGATORS, "sub", propagate_add)
-    model = _SubResidual(method=True)
+    temporarily_register(OP_PROPAGATORS, "maximum", propagate_elementwise)
+    model = _MaxResidual(method=True)
     DependencyGraph(model, x).get_pruning_group("b", keep).prune()
     assert model(x).shape == (1, 2, 8, 8)
-    with pytest.raises(ValueError, match="op propagator 'sub' is already registered"):
-        register_op_propagator("sub", propagate_add)
+    with pytest.raises(ValueError, match="op propagator 'maximum' is already registered"):
+        register_op_propagator("maximum", propagate_elementwise)
 
 
 def test_op_propagator_sees_only_the_walk_interface():
@@ -339,17 +414,40 @@ def test_op_propagator_sees_only_the_walk_interface():
     call `group.prune()` halfway through a walk. It now sees five methods."""
     seen = []
 
-    def checking_sub(walk, source, node, idx):
+    def checking_maximum(walk, source, node, idx):
         seen.append({n for n in dir(walk) if not n.startswith("_")})
-        propagate_add(walk, source, node, idx)
+        propagate_elementwise(walk, source, node, idx)
 
     torch.manual_seed(0)
-    model = _SubResidual()
+    model = _MaxResidual()
     x = torch.randn(1, 3, 8, 8)
-    DependencyGraph(model, x, op_propagators={torch.sub: checking_sub}).get_pruning_group("b", torch.tensor([0, 1, 3, 5])).prune()
+    DependencyGraph(model, x, op_propagators={torch.maximum: checking_maximum}).get_pruning_group("b", torch.tensor([0, 1, 3, 5])).prune()
 
     assert seen and all(s == {"shape", "add_output_target", "add_input_target", "forward", "find_producer"} for s in seen)
     assert model(x).shape == (1, 2, 8, 8)
+
+
+class _LogSigmoidNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a, self.b = nn.Conv2d(3, 6, 1), nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        return self.b(nn.functional.logsigmoid(self.a(x)))
+
+
+def test_channelwise_propagator_teaches_dependency_graph_a_functional_op():
+    """A function nobody registered is refused, with the fix in the
+    message; `propagate_channelwise` registers it, per graph or globally."""
+    x = torch.randn(1, 3, 4, 4)
+    keep = torch.tensor([0, 2, 5])
+    with pytest.raises(NotImplementedError, match="propagate_channelwise"):
+        DependencyGraph(_LogSigmoidNet(), x).get_pruning_group("a", keep)
+
+    model = _LogSigmoidNet()
+    dep = DependencyGraph(model, x, op_propagators={nn.functional.logsigmoid: propagate_channelwise})
+    dep.get_pruning_group("a", keep).prune()
+    assert model.a.out_channels == model.b.in_channels == 3 and model(x).shape == (1, 2, 4, 4)
 
 
 def test_every_method_argument_accepts_an_implementation(temporarily_register):

@@ -37,10 +37,18 @@ Known limitations, not fixed here:
 - Models with data-dependent control flow (dynamic `if`s on tensor values,
   some HuggingFace Transformer forward passes) may fail `torch.fx`'s default
   tracer entirely; pass a model-specific `tracer=` if you have one.
-- Only `torch.add`/`operator.add`/`operator.iadd` (and the tensor `add`
-  methods) are recognized as elementwise merges out of the box -- not
-  `torch.sub`, not a custom merge function. Adding one is a
-  `register_op_propagator(torch.sub, propagate_add)` call, not an edit here.
+- Elementwise `+ - * /` (as functions, operators or tensor methods) are
+  recognized as merges out of the box, and common activations, dropout,
+  pooling and resizing as channel-wise functions -- not `torch.maximum`,
+  not a custom merge function or activation. Adding one is a
+  `register_op_propagator(torch.maximum, propagate_elementwise)` (or
+  `propagate_channelwise`) call, not an edit here. A function or method
+  nobody registered raises, even if it keeps the channel count: unlike a
+  module, a function's shape says too little (`torch.flip(x, [1])` keeps
+  every channel and reorders them).
+- Channels are dim 1, as in an NCHW conv output. A Linear applied to a
+  `[N, T, features]` sequence keeps its features in the last dimension,
+  which an elementwise merge or a `cat` does not see as channels.
 - `torch.cat` is only understood along the channel dimension, and only one
   of its branches is expected to be pruned at a time -- pruning two
   concatenated branches in the same `get_pruning_group` call can silently
@@ -70,9 +78,11 @@ here. Every Conv2d/Linear/BatchNorm decision above goes through a
 `module_rules.ModuleRule` (its `ChannelRole` -- does a prune stop at this
 module or pass through it -- and how to rebuild it smaller); pass
 `module_rules={nn.Conv1d: MyConv1dRule()}` to one `DependencyGraph`, or
-`module_rules.register_module_rule` it globally. Every add/cat/flatten
-decision goes through an op propagator in `op_rules.OP_PROPAGATORS`
-(`propagate_add`, `propagate_cat`, `propagate_flatten`), which sees one
+`module_rules.register_module_rule` it globally. Every decision about an
+operation between layers -- an elementwise merge, a functional activation,
+a cat, a flatten -- goes through an op propagator in `op_rules.OP_PROPAGATORS`
+(`propagate_elementwise`, `propagate_channelwise`, `propagate_cat`,
+`propagate_flatten`), which sees one
 walk only through the small `Propagation` interface (`shape`,
 `add_output_target` / `add_input_target`, `forward`, `find_producer`); pass
 `op_propagators={...}` to one graph, or `register_op_propagator` globally.
@@ -101,6 +111,7 @@ Two opt-in additions for blocks the module rules can't describe:
 """
 from __future__ import annotations
 
+import itertools
 from collections import ChainMap
 from typing import Mapping
 
@@ -117,18 +128,25 @@ from .registry import resolve_by_type
 
 
 class DependencyGraph:
-    """Traces `model` once with `torch.fx` and answers "if I prune these
-    output channels of this layer, what else must change?" as many times as
-    needed (channel counts change between prunes, but the graph's topology
-    and recorded spatial sizes don't, so one trace covers a whole pruning
-    session).
+    """Traces `model` with `torch.fx` and answers "if I prune these output
+    channels of this layer, what else must change?" as many times as needed.
+    One graph covers a whole pruning session: a prune changes channel
+    counts, not topology, and when one has resized a parameter or buffer
+    since the graph last looked (through this graph or any other route),
+    `get_pruning_group` re-traces before walking. It used to keep the shapes
+    from its first trace, so after one branch of a `cat` was pruned, the
+    next prune of another branch offset its indices by the first branch's
+    old width -- the wrong input channels of the layer after the `cat`.
 
     `example_input` is passed to `torch.fx.passes.shape_prop.ShapeProp` --
-    a single forward pass used only to record every node's output shape
-    (needed for the flatten-boundary and `cat`-offset calculations), not to
-    train or evaluate anything. If your model's BatchNorm layers are in
-    training mode this will nudge their running statistics like any other
-    forward pass would; call `model.eval()` first if that matters to you.
+    a forward pass used only to record every node's output shape (needed
+    for the flatten-boundary and `cat`-offset calculations), not to train or
+    evaluate anything. It runs without gradients and in eval mode, each
+    submodule's own mode restored afterwards, so it leaves BatchNorm running
+    statistics untouched. (It ran in whatever mode the model was in, which
+    nudged them once per trace.) The trace itself still sees the model's own
+    mode, so a branch that only runs in training -- an auxiliary head -- is
+    part of the graph when the model is in training mode.
 
     `module_rules`, if given, adds to (or overrides) the global
     `module_rules.MODULE_RULES` for this graph only -- see that module for
@@ -138,9 +156,11 @@ class DependencyGraph:
     are layered over the live global registries (a `ChainMap`), so the graph
     sees one rule table either way.
 
-    The graph only holds what's fixed once traced; each `get_pruning_group`
-    call walks it with a fresh `Propagation`, which holds that one walk's
-    state.
+    The graph only holds what's fixed for the model as it currently is; each
+    `get_pruning_group` call walks it with a fresh `Propagation`, which holds
+    that one walk's state. A layer passed as a module object is looked up
+    in the model as it is now, so a module an earlier prune swapped in is
+    found too (a lookup table built at trace time didn't know it).
     """
 
     def __init__(
@@ -156,15 +176,32 @@ class DependencyGraph:
         self.special_handlers = special_handlers or {}
         self.module_rules = ChainMap(dict(module_rules or {}), MODULE_RULES.entries())
         self.op_propagators = ChainMap(dict(op_propagators or {}), OP_PROPAGATORS.entries())
-        tracer = tracer or fx.Tracer()
-        graph = tracer.trace(model)
-        traced = fx.GraphModule(model, graph)
-        ShapeProp(traced).propagate(example_input)
+        self._tracer = tracer or fx.Tracer()
+        self._example_input = example_input
+        self._trace()
+
+    def _tensor_shapes(self) -> list[tuple[str, torch.Size]]:
+        """Every parameter's and buffer's name and shape: what a prune
+        changes, however it was done."""
+        return [(name, t.shape) for name, t in itertools.chain(self.model.named_parameters(), self.model.named_buffers())]
+
+    def _trace(self) -> None:
+        """Trace the model as it is now and record every node's output
+        shape (see the class docstring for why ShapeProp runs in eval mode)."""
+        traced = fx.GraphModule(self.model, self._tracer.trace(self.model))
+        modes = [(m, m.training) for m in self.model.modules()]
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                ShapeProp(traced).propagate(self._example_input)
+        finally:
+            for m, training in modes:
+                m.training = training
 
         self._node_by_target: dict[str, fx.Node] = {
             node.target: node for node in traced.graph.nodes if node.op == "call_module"
         }
-        self._name_by_id: dict[int, str] = {id(m): name for name, m in model.named_modules()}
+        self._traced_shapes = self._tensor_shapes()
 
     def get_pruning_group(self, layer: nn.Module | str, keep_idx: torch.Tensor) -> PruningGroup:
         """`layer` (a submodule of `model`, or its dotted qualified name)
@@ -184,6 +221,8 @@ class DependencyGraph:
         contract `ModuleRule.rebuild` follows, so the handler is free to
         mutate `module` in place and return it, or build and return a fresh
         one."""
+        if self._tensor_shapes() != self._traced_shapes:
+            self._trace()  # something was resized since: the recorded channel widths are stale
         target = self._resolve_name(layer)
         module = self._module(target)
         group = PruningGroup(self.model, self.module_rules)
@@ -203,7 +242,8 @@ class DependencyGraph:
                 f"-- start from the layer that feeds it instead"
             )
 
-        prune_idx = complement_indices(module.weight.shape[0], keep_idx)
+        n_out = find_module_rule(module, self.module_rules).output_weight(module).shape[0]  # a MIXING role means a rule
+        prune_idx = complement_indices(n_out, keep_idx)
         group.add_output_target(target, prune_idx)
         Propagation(self, group).forward(node, prune_idx)
         return group
@@ -213,7 +253,7 @@ class DependencyGraph:
     def _resolve_name(self, layer: nn.Module | str) -> str:
         if isinstance(layer, str):
             return layer
-        name = self._name_by_id.get(id(layer))
+        name = next((name for name, m in self.model.named_modules() if m is layer), None)
         if name is None:
             raise ValueError(f"{layer!r} is not a submodule of the traced model")
         return name
@@ -249,6 +289,11 @@ class DependencyGraph:
             raise RuntimeError(
                 f"no shape recorded for node {node.name!r} -- ShapeProp should have annotated every "
                 f"node when DependencyGraph was constructed"
+            )
+        if not isinstance(meta, TensorMetadata):
+            raise NotImplementedError(
+                f"node {node.name!r} returns a {type(meta).__name__} of tensors, not one tensor, so "
+                f"DependencyGraph can't follow channels through it"
             )
         return meta.shape
 
@@ -381,7 +426,8 @@ class Propagation:
         if propagator is None:
             raise NotImplementedError(
                 f"{node.op} {node.target!r} ({node.name}) is downstream of a pruned layer and "
-                f"DependencyGraph doesn't know how to propagate through it"
+                f"DependencyGraph doesn't know how to propagate through it -- if it keeps channel c as "
+                f"channel c, register_op_propagator(that target, propagate_channelwise)"
             )
         propagator(self, source, node, idx)
 

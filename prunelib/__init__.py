@@ -40,7 +40,14 @@ from .selection import (
 )
 from .clustering import kmeans, kmeans_prune_indices  # also registers the "kmeans" selection rule
 from .module_rules import MODULE_RULES, ChannelRole, ModuleRule, find_module_rule, register_module_rule
-from .op_rules import OP_PROPAGATORS, propagate_add, propagate_cat, propagate_flatten, register_op_propagator
+from .op_rules import (
+    OP_PROPAGATORS,
+    propagate_cat,
+    propagate_channelwise,
+    propagate_elementwise,
+    propagate_flatten,
+    register_op_propagator,
+)
 from .group import PruningGroup
 from .graph import DependencyGraph, LeafTracer, Propagation
 from .oneshot import prune_model
@@ -110,7 +117,8 @@ __all__ = [
     "ChannelRole",
     "find_module_rule",
     "Propagation",
-    "propagate_add",
+    "propagate_elementwise",
+    "propagate_channelwise",
     "propagate_cat",
     "propagate_flatten",
     # quantization

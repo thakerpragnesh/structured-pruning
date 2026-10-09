@@ -1,8 +1,10 @@
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.utils.prune as torch_prune
 
-from prunelib.surgery import prune_attention_heads, prune_conv_bn, prune_ffn_block
+from prunelib.masking import mask_channels
+from prunelib.surgery import prune_attention_heads, prune_conv_bn, prune_ffn_block, slice_conv2d, slice_linear
 
 
 def test_d6_conv_values_are_correct_not_just_shape():
@@ -249,6 +251,86 @@ def test_rebuilt_modules_are_drop_in_substitutes():
     fc1, fc2 = nn.Linear(4, 6, device="meta"), nn.Linear(6, 2, device="meta")
     new_fc1, new_fc2 = prune_ffn_block(fc1, fc2, keep)
     assert new_fc1.weight.device.type == new_fc2.weight.device.type == "meta"
+
+
+class _WSConv2d(nn.Conv2d):
+    """Weight-standardized conv (timm's StdConv2d does this): a Conv2d
+    subclass whose forward computes something else."""
+
+    def forward(self, x):
+        w = self.weight
+        w = (w - w.mean(dim=(1, 2, 3), keepdim=True)) / (w.std(dim=(1, 2, 3), keepdim=True) + 1e-5)
+        return nn.functional.conv2d(x, w, self.bias, self.stride, self.padding)
+
+
+class _ScaledBatchNorm(nn.BatchNorm2d):
+    """A BatchNorm subclass whose constructor doesn't take BatchNorm's."""
+
+    def __init__(self, channels):
+        super().__init__(channels, momentum=0.01)
+
+
+def test_rebuilt_modules_keep_their_class_mode_and_frozen_state():
+    """Liskov: a subclass gets its parent's module rule, but the rebuild
+    constructed a fresh `nn.Conv2d` / `nn.Linear`, so a weight-standardized
+    conv silently became a plain one and computed something else. A fresh
+    module also came back in training mode and trainable, inside a model
+    that was in eval mode with that layer frozen; and a BatchNorm subclass
+    with its own constructor crashed. Replacements are copies now."""
+    torch.manual_seed(0)
+    conv, bn = _WSConv2d(3, 6, 3, padding=1), _ScaledBatchNorm(6)
+    linear = nn.Linear(6, 4)
+    for m in (conv, bn, linear):
+        m.eval()
+    linear.weight.requires_grad_(False)
+    keep = torch.tensor([0, 2, 5])
+
+    new_conv, new_bn, _ = prune_conv_bn(conv, keep, bn=bn)
+    new_linear = slice_linear(linear, keep_in=keep)
+    assert type(new_conv) is _WSConv2d and type(new_bn) is _ScaledBatchNorm and new_bn.momentum == 0.01
+    assert not any(m.training for m in (new_conv, new_bn, new_linear))
+    assert not new_linear.weight.requires_grad and new_linear.bias.requires_grad
+
+    expected = _WSConv2d(3, 3, 3, padding=1)
+    with torch.no_grad():
+        expected.weight.copy_(conv.weight[keep]), expected.bias.copy_(conv.bias[keep])
+    x = torch.randn(1, 3, 5, 5)
+    assert torch.allclose(new_conv(x), expected(x))
+
+
+def test_rebuilt_module_never_shares_storage_with_the_original():
+    linear = nn.Linear(4, 3)
+    new = slice_linear(linear)  # keeps everything: the one case with no indexing to copy for it
+    with torch.no_grad():
+        new.weight.zero_()
+    assert linear.weight.abs().sum() > 0
+
+
+def test_rebuilding_a_masked_module_bakes_the_mask_in_and_drops_the_hook():
+    """`PruningGroup.prune()` may rebuild a module `.mask()` left masked
+    (`torch.nn.utils.prune`'s reparametrization). The copy must come back a
+    plain module holding the masked values -- not carry a pruning hook that
+    recomputes its weight from a full-size mask."""
+    torch.manual_seed(0)
+    conv = nn.Conv2d(3, 6, 3)
+    mask_channels(conv, torch.tensor([1, 4]))
+    keep = torch.tensor([0, 1, 2, 3])
+
+    new = slice_conv2d(conv, keep_out=keep)
+    assert not torch_prune.is_pruned(new) and not hasattr(new, "weight_orig") and not hasattr(new, "weight_mask")
+    assert set(dict(new.named_parameters())) == {"weight", "bias"}
+    assert torch.equal(new.weight, conv.weight[keep]) and (new.weight[1] == 0).all() and new.bias[1] == 0
+    assert torch_prune.is_pruned(conv)  # the original is untouched, still masked
+
+
+def test_a_computed_weight_is_refused_not_resized():
+    """Weight norm (or spectral norm, or any parametrization) recomputes the
+    weight from other tensors. A copy with a resized `weight` would recompute
+    it at its old size, so this refuses instead; the fresh-module rebuild
+    used to drop the reparametrization without a word."""
+    conv = torch.nn.utils.parametrizations.weight_norm(nn.Conv2d(3, 6, 3))
+    with pytest.raises(NotImplementedError, match="computed from other tensors"):
+        slice_conv2d(conv, keep_out=torch.tensor([0, 1]))
 
 
 def test_prune_conv_bn_rejects_grouped_convs():

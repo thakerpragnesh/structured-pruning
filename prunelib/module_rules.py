@@ -12,9 +12,16 @@ answers its questions once, in a `ModuleRule`:
 
 - `role(module)`: how channel indices flow through it (`ChannelRole`).
 - `rebuild(module, prune_out, prune_in)`: the smaller replacement module.
-- `mask(module, prune_out)`: zero those output channels in place, for
-  `PruningGroup.mask()`. Optional -- the default zeroes dim 0 of `weight`
-  and `bias`, which fits every built-in type.
+
+and three optional ones, whose defaults assume output channels are dim 0
+of `weight` -- true of every built-in type, not of `ConvTranspose2d`
+(`[in, out, kh, kw]`):
+
+- `output_weight(module)`: the weight arranged `[out_channels, ...]`, which
+  a prune's channel count and channel scores are read from.
+- `mask(module, prune_out)` / `commit_mask(module)`: zero those output
+  channels in place for `PruningGroup.mask()`, then bake that in for
+  `.commit_and_compress()`.
 
 and the graph code depends only on those answers. The methods are
 positional-only, so a rule may name its parameters for its own type
@@ -40,7 +47,7 @@ import torch
 import torch.nn as nn
 
 from .indices import complement_indices
-from .masking import mask_channels
+from .masking import commit_mask, mask_channels
 from .registry import Registry, resolve_by_type
 from .surgery import is_depthwise_conv, slice_batchnorm, slice_conv2d, slice_depthwise_conv2d, slice_linear
 
@@ -75,6 +82,16 @@ class ModuleRule(ABC):
     ) -> nn.Module:
         """A new module with those output / input channels removed."""
 
+    def output_weight(self, module: nn.Module, /) -> torch.Tensor:
+        """`module`'s weight arranged `[out_channels, ...]`: what
+        `DependencyGraph.get_pruning_group` counts a starting layer's
+        channels from, and what `oneshot.prune_model` scores. The default is
+        `module.weight`; a type that stores output channels elsewhere returns
+        a view with them moved to dim 0 (and overrides `mask` too). Both
+        callers used to read `module.weight` themselves, so a rule had no way
+        to say otherwise."""
+        return module.weight
+
     def mask(self, module: nn.Module, prune_out: torch.Tensor, /) -> None:
         """Zero output channels `prune_out` of `module` in place, shapes
         unchanged, so that a later `rebuild` gives the same model (phase 1
@@ -83,6 +100,14 @@ class ModuleRule(ABC):
         channels live elsewhere, or raise `NotImplementedError` for one
         that can't be masked to zero."""
         mask_channels(module, prune_out)
+
+    def commit_mask(self, module: nn.Module, /) -> None:
+        """Bake whatever `mask` applied into `module`'s real tensors, before
+        `rebuild` (phase 2, `PruningGroup.commit_and_compress()`); a no-op
+        for a module that was never masked. The default undoes
+        `masking.mask_channels`' reparametrization (`masking.commit_mask`);
+        override it together with `mask` if you mask another way."""
+        commit_mask(module)
 
 
 def _keep(n: int, prune: torch.Tensor | None) -> torch.Tensor | None:

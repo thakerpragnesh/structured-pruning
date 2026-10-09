@@ -1,7 +1,8 @@
+import pytest
 import torch
 import torch.nn as nn
 
-from prunelib.evaluate import count_params, estimate_size_bytes, measure_latency
+from prunelib.evaluate import count_encoder_params, count_params, estimate_size_bytes, measure_latency
 
 
 def test_measure_latency_restores_every_submodule_mode():
@@ -33,3 +34,15 @@ def test_estimate_size_bytes_scales_with_bit_width():
 def test_estimate_size_bytes_defaults_to_float32():
     model = nn.Linear(10, 5)
     assert estimate_size_bytes(model) == estimate_size_bytes(model, bits_per_param=32.0)
+
+
+def test_count_encoder_params_counts_the_named_submodule_or_raises():
+    """It fell back to the whole model when the submodule was missing, so a
+    task model wrapping its encoder (HF `BertForSequenceClassification`
+    keeps it at `bert.encoder`) reported embeddings and head as encoder
+    parameters. A dotted path reaches it; a missing one raises."""
+    model = nn.ModuleDict({"embed": nn.Embedding(10, 4), "bert": nn.ModuleDict({"encoder": nn.Linear(4, 4)})})
+    assert count_encoder_params(model, "bert.encoder") == 20
+    assert count_encoder_params(model["bert"]) == 20
+    with pytest.raises(AttributeError, match="encoder"):
+        count_encoder_params(model)

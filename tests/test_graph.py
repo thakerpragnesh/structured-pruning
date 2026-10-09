@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -162,6 +164,59 @@ def test_cat_offsets_downstream_input_indices_for_the_second_branch():
     assert out.shape == (1, 5, 8, 8)
 
 
+def test_reused_graph_offsets_a_cat_by_each_branchs_current_width():
+    """One graph is meant to cover a pruning session, but it kept the shapes
+    of its first trace. After `branch_a` shrank from 4 channels to 2, a prune
+    of `branch_b`'s channel 0 was offset by `branch_a`'s old width (column 4
+    of `after`, i.e. `branch_b`'s channel 2) instead of its current one
+    (column 2), and nothing failed."""
+    torch.manual_seed(0)
+    model = ConcatBranches()
+    x = torch.randn(1, 3, 8, 8)
+    dep = DependencyGraph(model, x)
+    dep.get_pruning_group(model.branch_a, torch.tensor([0, 1])).prune()  # after: 2 (a) + 6 (b) = 8 inputs
+    after = model.after.weight.detach().clone()
+
+    group = dep.get_pruning_group(model.branch_b, torch.tensor([1, 2, 3, 4, 5]))
+    assert group.input_targets["after"].tolist() == [2]
+    group.prune()
+    assert torch.equal(model.after.weight, after[:, [0, 1, 3, 4, 5, 6, 7]])
+
+
+def test_reused_graph_accepts_a_module_an_earlier_prune_swapped_in():
+    """The graph mapped module objects to names when it was built, so the
+    module a prune put in a layer's place -- the one `model[2]` returns from
+    then on -- was "not a submodule of the traced model"."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.Conv2d(8, 6, 3, padding=1), nn.ReLU(), nn.Conv2d(6, 2, 1))
+    x = torch.randn(1, 3, 6, 6)
+    dep = DependencyGraph(model, x)
+    prune_model(model, x, model[0], prune_fraction=0.25, dependency_graph=dep)
+    prune_model(model, x, model[2], prune_fraction=0.5, dependency_graph=dep)  # model[2] was rebuilt by the first prune
+
+    assert (model[0].out_channels, model[2].in_channels, model[2].out_channels, model[4].in_channels) == (6, 6, 3, 3)
+    with pytest.raises(ValueError, match="not a submodule"):
+        dep.get_pruning_group(nn.Conv2d(3, 8, 3), torch.tensor([0]))
+
+
+def test_tracing_leaves_batchnorm_statistics_and_train_modes_alone():
+    """ShapeProp's forward pass ran in the model's own mode, so tracing a
+    model in training mode nudged every BatchNorm's running statistics --
+    and a graph now re-traces after each prune that resizes something."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(3, 4, 3), nn.BatchNorm2d(4), nn.ReLU(), nn.Conv2d(4, 2, 1), nn.BatchNorm2d(2))
+    model[4].eval()  # a frozen BatchNorm inside a training model: mixed modes come back as they were
+    stats = {name: t.clone() for name, t in model.named_buffers()}
+
+    dep = DependencyGraph(model, torch.randn(2, 3, 6, 6))
+    dep.get_pruning_group("0", torch.tensor([0, 1, 3])).prune()
+    dep.get_pruning_group("3", torch.tensor([1]))  # resized since the first trace: re-traces
+
+    assert model.training and model[1].training and not model[4].training
+    assert torch.equal(model[1].running_mean, stats["1.running_mean"][[0, 1, 3]])
+    assert all(torch.equal(t, stats[name]) for name, t in model.named_buffers() if not name.startswith("1."))
+
+
 class ConvThenClassifier(nn.Module):
     def __init__(self):
         super().__init__()
@@ -192,6 +247,157 @@ def test_flatten_boundary_expands_channel_indices_to_flat_indices():
     assert model.fc.in_features == 2 * spatial
     out = model(x)
     assert out.shape == (1, 10)
+
+
+class _FlattenInto(nn.Module):
+    def __init__(self, flatten):
+        super().__init__()
+        self.flatten = flatten
+        self.a, self.pool, self.fc = nn.Conv2d(3, 4, 3, padding=1), nn.AdaptiveAvgPool2d(2), nn.Linear(16, 5)
+
+    def forward(self, x):
+        return self.fc(self.flatten(self.pool(self.a(x))))
+
+
+@pytest.mark.parametrize("flatten", [lambda y: y.view(y.size(0), -1), lambda y: y.reshape(y.shape[0], -1)])
+def test_classifier_flatten_written_with_the_batch_size_is_recognized(flatten):
+    """`x.view(x.size(0), -1)` is the usual way to flatten into a classifier
+    head, but the walk reached the `size` call (a user of the pruned tensor)
+    and refused it. Reading a shape carries no channels, so it is skipped."""
+    torch.manual_seed(0)
+    model = _FlattenInto(flatten).eval()
+    x = torch.randn(2, 3, 8, 8)
+    group = DependencyGraph(model, x).get_pruning_group("a", torch.tensor([0, 2]))
+    assert group.input_targets["fc"].tolist() == [4, 5, 6, 7, 12, 13, 14, 15]
+    group.prune()
+    assert model(x).shape == (2, 5)
+
+
+def test_a_reshape_that_isnt_the_classifier_flatten_is_refused_at_the_reshape():
+    """Every view/reshape/flatten of a 4D tensor was taken for the
+    classifier-head flatten. `x.flatten(2)` keeps the channel dimension,
+    yet its indices were expanded by `H * W`, and the walk failed later at
+    whatever came next, naming that layer instead of the reshape."""
+    model = _FlattenInto(lambda y: torch.flatten(y, 2).mean(-1))
+    model.fc = nn.Linear(4, 5)
+    with pytest.raises(NotImplementedError, match=r"reshaping \(1, 4, 2, 2\) to \(1, 4, 4\) isn't"):
+        DependencyGraph(model, torch.randn(1, 3, 8, 8)).get_pruning_group("a", torch.tensor([0, 2]))
+
+
+class _ActivationForms(nn.Module):
+    def __init__(self, form):
+        super().__init__()
+        self.form = form
+        self.a, self.b = nn.Conv2d(3, 6, 3, padding=1), nn.Conv2d(6, 2, 1)
+        self.act, self.pool = nn.ReLU(), nn.MaxPool2d(2)
+
+    def forward(self, x):
+        y = self.a(x)
+        if self.form == "module":
+            y = self.pool(self.act(y))
+        elif self.form == "function":
+            y = nn.functional.max_pool2d(nn.functional.relu(y), 2)
+        else:
+            y = nn.functional.max_pool2d(y.relu(), 2)
+        return self.b(y)
+
+
+@pytest.mark.parametrize("form", ["function", "method"])
+def test_functional_activations_prune_like_their_modules(form):
+    """Liskov: `nn.ReLU()` and `nn.MaxPool2d` passed a prune through, but
+    the same ops written `F.relu(y)`, `y.relu()` or `F.max_pool2d(y, 2)`
+    raised, so whether a model could be pruned depended on how its
+    activations were spelled. Both forms now prune identically."""
+    x = torch.randn(1, 3, 8, 8)
+    keep = torch.tensor([0, 2, 3, 5])
+    torch.manual_seed(0)
+    reference = _ActivationForms("module")
+    torch.manual_seed(0)
+    model = _ActivationForms(form)
+    for m in (reference, model):
+        DependencyGraph(m, x).get_pruning_group("a", keep).prune()
+    assert torch.equal(model.a.weight, reference.a.weight) and torch.equal(model.b.weight, reference.b.weight)
+    assert torch.equal(model(x), reference(x))
+
+
+class _ScaledAndGated(nn.Module):
+    """`a`'s output scaled by constants, then gated by a 1-channel spatial
+    map that broadcasts across every channel."""
+
+    def __init__(self):
+        super().__init__()
+        self.a, self.gate, self.b = nn.Conv2d(3, 6, 1), nn.Conv2d(3, 1, 1), nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        return self.b((self.a(x) * 0.5 + 1) * torch.sigmoid(self.gate(x)))
+
+
+def test_scalars_and_channel_broadcast_operands_share_no_channels():
+    """`x * 0.5` and `x + 1` were refused (`*` had no propagator; `+` wanted
+    a second tensor), and `+` with a `[N, 1, H, W]` map coupled the map's
+    1-channel conv as if it had `a`'s channels. Neither shares channels
+    with `a`, so the prune passes them by."""
+    torch.manual_seed(0)
+    model = _ScaledAndGated().eval()
+    x = torch.randn(2, 3, 5, 5)
+    reference = copy.deepcopy(model)
+    with torch.no_grad():
+        reference.b.weight[:, [1, 4]] = 0
+
+    group = DependencyGraph(model, x).get_pruning_group("a", torch.tensor([0, 2, 3, 5]))
+    assert set(group.output_targets) == {"a"} and set(group.input_targets) == {"b"}
+    group.prune()
+    assert model.gate.out_channels == 1 and torch.allclose(model(x), reference(x), atol=1e-6)
+
+
+class _SqueezeExcite(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Conv2d(3, 6, 3, padding=1)
+        self.fc1, self.fc2 = nn.Conv2d(6, 3, 1), nn.Conv2d(3, 6, 1)
+        self.b = nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        y = torch.relu(self.a(x))
+        scale = torch.sigmoid(self.fc2(torch.relu(self.fc1(nn.functional.adaptive_avg_pool2d(y, 1)))))
+        return self.b(y * scale)
+
+
+def test_squeeze_excitation_block_prunes_to_the_same_function():
+    """`y * scale` was refused, so no squeeze-and-excitation block
+    (MobileNetV3's, EfficientNet's) could be pruned through. Pruning `a`
+    now also removes those channels from `fc1`'s input and `fc2`'s output,
+    and the result computes exactly what the original does once the
+    channels are cut off downstream."""
+    torch.manual_seed(0)
+    model = _SqueezeExcite().eval()
+    x = torch.randn(2, 3, 6, 6)
+    reference = copy.deepcopy(model)
+    with torch.no_grad():
+        reference.b.weight[:, [1, 4]] = 0
+        reference.fc1.weight[:, [1, 4]] = 0
+
+    group = DependencyGraph(model, x).get_pruning_group("a", torch.tensor([0, 2, 3, 5]))
+    assert set(group.output_targets) == {"a", "fc2"} and set(group.input_targets) == {"fc1", "b"}
+    group.prune()
+    assert torch.allclose(model(x), reference(x), atol=1e-6)
+
+
+def test_mobilenet_v3_prunes_through_its_squeeze_excitation_blocks():
+    """The same on a real architecture: each MobileNetV3 block gates its
+    depthwise conv's output with `scale * input`, written as a plain `*`.
+    Pruning a block's expansion conv reaches the depthwise conv, the
+    squeeze-and-excitation convs and the projection, and the model runs."""
+    torchvision = pytest.importorskip("torchvision")
+    torch.manual_seed(0)
+    model = torchvision.models.mobilenet_v3_small(weights=None).eval()
+    x = torch.randn(1, 3, 64, 64)
+
+    group = prune_model(model, x, "features.4.block.0.0", prune_fraction=0.5)
+    block = "features.4.block."
+    assert set(group.output_targets) == {block + n for n in ("0.0", "0.1", "1.0", "1.1", "2.fc2")}
+    assert set(group.input_targets) == {block + "2.fc1", block + "3.0"}
+    assert model(x).shape == (1, 1000)
 
 
 class DepthwiseSandwich(nn.Module):

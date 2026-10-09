@@ -15,15 +15,18 @@ Here there is exactly one function that produces a score, and exactly one
 function that selects indices from a score. Nothing else touches the tensor in
 between, so the two cannot drift apart the way they did before.
 
-Every scorer accepts either a Conv2d weight `[out_channels, in_channels, kh,
-kw]` or a Linear weight `[out_features, in_features]` -- a Linear layer's
-weight *is* a Conv2d weight with a 1x1 kernel: each output feature's row is
+Every scorer accepts any weight laid out `[out, in, *kernel]`: a Conv2d
+weight `[out_channels, in_channels, kh, kw]`, a Linear weight
+`[out_features, in_features]`, a Conv1d or Conv3d weight. A Linear layer's
+weight *is* a conv weight with a 1x1 kernel: each output feature's row is
 its entire "kernel" over the input features, with no spatial extent to
-flatten. `_channel_view` below reshapes either to a common `(out, in,
-spatial)` so one code path covers both, instead of every caller reshaping a
+flatten. `_channel_view` below reshapes any of them to a common `(out, in,
+spatial)` so one code path covers all, instead of every caller reshaping a
 Linear weight to a fake `[out, in, 1, 1]` conv tensor to reuse this module (as
 `experiments/02_bert_sst2_sweep.py` used to -- see its `_score_ffn_neurons`
-before this change).
+before this change). It used to accept only 2D and 4D weights, so a Conv1d
+taught to `DependencyGraph` through a `module_rules.ModuleRule` still
+couldn't be scored by `oneshot.prune_model`.
 
 Scorers live in `SALIENCY_METHODS` (a `registry.Registry`), so a new
 criterion is added from the caller's own code -- `@register_saliency_method(
@@ -45,23 +48,23 @@ register_saliency_method = SALIENCY_METHODS.register
 
 
 def _channel_view(weight: torch.Tensor) -> torch.Tensor:
-    """Reshape a weight to `(out_channels, in_channels, spatial)`.
+    """Reshape a weight `[out, in, *kernel]` to `(out_channels,
+    in_channels, spatial)`.
 
     A 2D Linear weight `(out, in)` becomes `(out, in, 1)`: one "spatial"
     position, matching a 1x1 kernel. A 4D Conv2d weight `(out, in, kh, kw)`
-    becomes `(out, in, kh * kw)`. Every scorer below reduces over the last
-    axis (and sums over the input-channel axis), so this is the only place
-    that needs to know about the shape difference between the two layer
-    types.
+    becomes `(out, in, kh * kw)`, and a Conv1d/Conv3d weight its own kernel
+    flattened the same way. Every scorer below reduces over the last axis
+    (and sums over the input-channel axis), so this is the only place that
+    needs to know about the shape difference between layer types.
     """
     if weight.dim() == 2:
         return weight.unsqueeze(-1)
-    if weight.dim() == 4:
-        out_ch, in_ch, kh, kw = weight.shape
-        return weight.reshape(out_ch, in_ch, kh * kw)
+    if weight.dim() > 2:
+        return weight.flatten(start_dim=2)
     raise ValueError(
-        f"expected a 2D Linear weight [out_features, in_features] or a 4D Conv2d "
-        f"weight [out_channels, in_channels, kh, kw], got shape {tuple(weight.shape)}"
+        f"expected a weight laid out [out, in, *kernel] -- a Linear's [out_features, in_features], a "
+        f"Conv2d's [out_channels, in_channels, kh, kw] -- got shape {tuple(weight.shape)}"
     )
 
 
@@ -74,8 +77,9 @@ def max_k_saliency(weight: torch.Tensor, k: int = 3) -> torch.Tensor:
     scores across all input channels/features to get one score per output
     unit.
 
-    weight: Conv2d weight `[out_channels, in_channels, kh, kw]`, or Linear
-        weight `[out_features, in_features]`
+    weight: Conv2d weight `[out_channels, in_channels, kh, kw]`, Linear
+        weight `[out_features, in_features]`, or any other `[out, in,
+        *kernel]` weight
     returns: [out_channels] (or [out_features]) tensor, higher = more
         important (keep it)
 

@@ -26,15 +26,15 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (126 tests,
+compress once at the end — cleanly and with a real test suite (146 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
 
 **3. Architecture-agnostic pruning plus quantization.** `prunelib/graph.py`
 (with `group.py`, `op_rules.py` and `oneshot.py`) traces any `torch.fx`-traceable model and resolves which layers a prune
-decision couples to (residual adds, `cat`, flatten-into-classifier,
-depthwise convs), so pruning isn't limited to VGG's flat `.features`.
+decision couples to (residual adds, squeeze-and-excitation gates, `cat`,
+flatten-into-classifier, depthwise convs), so pruning isn't limited to VGG's flat `.features`.
 `prunelib/quantization.py` adds the thesis's three post-training
 quantization methods (Float16, linear INT8, Fixed-Point32) as a separate
 stage applied after pruning. Both are covered below.
@@ -126,13 +126,14 @@ Everything above needs the caller to already know the seam (`next_conv=`,
 which two Linears form an FFN block). `prunelib.graph.DependencyGraph`
 doesn't — it traces an arbitrary model with `torch.fx` and works out which
 other layers a prune decision couples to (a residual/skip partner, a
-downstream conv/Linear, a `cat`, a flatten into a classifier head) on its
-own:
+squeeze-and-excitation gate, a downstream conv/Linear, a `cat`, a flatten
+into a classifier head) on its own, whether activations are written as
+modules (`nn.ReLU()`) or functions (`F.relu(x)`):
 
 ```python
 from prunelib import DependencyGraph
 
-dep = DependencyGraph(model, example_input)          # traced once, reused for as many prunes as you like
+dep = DependencyGraph(model, example_input)          # one graph, reused for as many prunes as you like
 group = dep.get_pruning_group(model.layer2[0].conv2, keep_idx)
 group.prune()                                         # mutates model in place -- see group.py's docstring for why
 ```
@@ -198,7 +199,7 @@ dispatches on it picks the new entry up:
 
 ```python
 from prunelib import (
-    ChannelRole, DistanceMetric, ModuleRule, propagate_add, register_distance_metric,
+    ChannelRole, DistanceMetric, ModuleRule, propagate_elementwise, register_distance_metric,
     register_module_rule, register_op_propagator, register_quantization_method,
     register_saliency_method,
 )
@@ -216,11 +217,14 @@ register_quantization_method("log2", my_log2_round_trip)   # quantize_model_(mod
 class Conv1dRule(ModuleRule):                  # teach DependencyGraph a new layer type
     def role(self, conv): return ChannelRole.MIXING
     def rebuild(self, conv, prune_out, prune_in): ...
-    # mask(self, conv, prune_out) is optional: the default zeroes dim 0 of weight and bias
+    # optional, for a type whose output channels aren't dim 0 of its weight (ConvTranspose2d):
+    # output_weight(self, conv) -> weight as [out, ...]; mask(self, conv, prune_out); commit_mask(self, conv)
 register_module_rule(nn.Conv1d, Conv1dRule())  # or DependencyGraph(..., module_rules={...}) for one graph
+                                               # prune_model then scores and prunes Conv1d too
 
-register_op_propagator(torch.sub, propagate_add)  # a residual merged with `-` couples like `+`
-                                                  # (or DependencyGraph(..., op_propagators={...}))
+register_op_propagator(torch.maximum, propagate_elementwise)  # a residual merged with torch.maximum couples like `+`
+                                                              # (or DependencyGraph(..., op_propagators={...}));
+                                                              # propagate_channelwise for your own activation function
 ```
 
 Every `method=` argument also takes the implementation itself, for a
@@ -228,8 +232,10 @@ one-off not worth registering: a selector `(weight, prune_amount) ->
 prune_idx` for `prune_model` / `prune_vgg_layer` / `mask_vgg_layer`, a
 scorer for `compute_score`, a same-shape round-trip for `quantize_model_`. Every pruned module is rebuilt by
 `surgery.py`'s `slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` /
-`slice_batchnorm`, which keep the original's device, dtype and
-`padding_mode`; `tests/test_extension_points.py` has a worked example of
+`slice_batchnorm`, each of which returns a copy of the original with only
+its channels resized: same class (a `Conv2d` subclass stays that
+subclass), configuration, device, dtype, train/eval mode and
+`requires_grad`. `tests/test_extension_points.py` has a worked example of
 each extension point.
 
 ## Results
@@ -253,10 +259,10 @@ and how much of the network is pruned, and will not be identical across runs.
 | `saliency.py` — Max-k/L1/L2/random, Conv2d and Linear weights | Unit-tested, 10/10 passing |
 | `surgery.py` — Conv/BN/FFN/attention-head structural surgery | Unit-tested, verified against a real HF BERT forward pass |
 | `masking.py` / `vgg.py` — two-phase mask-then-compress | Unit-tested, including a whole-VGG16 mask → compress run |
-| `graph.py` / `group.py` / `op_rules.py` / `oneshot.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), two-phase `PruningGroup`, `special_handlers`, `prune_model` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
+| `graph.py` / `group.py` / `op_rules.py` / `oneshot.py` — `torch.fx`-traced dependency resolution (elementwise merges incl. squeeze-and-excitation, functional activations, cat/flatten/depthwise), two-phase `PruningGroup`, `special_handlers`, `prune_model` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage; torchvision MobileNetV3-Small pruned through its squeeze-and-excitation blocks (`test_graph.py`) |
 | `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
-| `registry.py` / `selection.py` / `distance.py` / `module_rules.py` — public extension points (scorers, selection rules, metrics, quantization methods, prunable layer types, graph ops) | Unit-tested, including a custom Conv1d rule and a `torch.sub` residual driving `DependencyGraph` end to end; refactor verified bit-identical against the previous implementation on every pruning path |
+| `registry.py` / `selection.py` / `distance.py` / `module_rules.py` — public extension points (scorers, selection rules, metrics, quantization methods, prunable layer types, graph ops) | Unit-tested, including a custom Conv1d rule and a `torch.maximum` residual driving `DependencyGraph` end to end; refactor verified bit-identical against the previous implementation on every pruning path |
 | `clustering.py` — K-Means (Manhattan/Euclidean/Cosine) selection, prune lowest-L1 within each cluster | Unit-tested, including a brute-force check of the selection rule and end-to-end through `prune_model` and both VGG paths; paper's accuracy numbers not yet reproduced here |
 | `experiments/01` VGG-CIFAR10 sweep | `--tiny-check` runs the real `torchvision.models.vgg16` class through real `prune_vgg_layer`/`prune_conv_bn` calls end to end (verified, ~3-4 min on CPU); full run (real CIFAR-10 + ImageNet weights) not yet executed |
 | `experiments/02` BERT FFN sweep | Pipeline verified in `--smoke` against real `transformers` model classes; full run not yet executed |
@@ -330,7 +336,7 @@ fine-tuned model in this codebase, only verified mechanically so far.
 ```
 prunelib/
     registry.py   name -> implementation registries, the shared extension mechanism
-    saliency.py   Max-k (correct), L1, L2, random -- Conv2d or Linear weights
+    saliency.py   Max-k (correct), L1, L2, random -- any [out, in, *kernel] weight
     selection.py  weight + budget -> indices to prune, by any registered rule
     clustering.py K-Means channel selection: prune lowest-L1 within each cluster
     distance.py   Manhattan/Euclidean/Cosine metrics (+ matching K-Means centroids)
@@ -339,9 +345,10 @@ prunelib/
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     module_rules.py  per-layer-type rules DependencyGraph prunes through (Conv2d,
                   Linear, BatchNorm built in; register more)
-    op_rules.py   how a prune passes through add/cat/flatten (register more ops)
+    op_rules.py   how a prune passes through + - * /, functional activations,
+                  cat, flatten (register more ops)
     graph.py      torch.fx dependency resolution: which layers one prune decision
-                  touches (add/cat/flatten/depthwise); special_handlers/LeafTracer
+                  touches (merges/cat/flatten/depthwise); special_handlers/LeafTracer
                   (attention-block hook)
     group.py      PruningGroup: applies that decision -- .prune(), or
                   .mask() then .commit_and_compress()
@@ -364,7 +371,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          126 tests, each naming the defect or behavior it guards against
+tests/          146 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation
