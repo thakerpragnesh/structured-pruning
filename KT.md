@@ -92,7 +92,7 @@ prunelib/
                                (every conv layer, including the last -> classifier[0];
                                only build_vgg16 needs torchvision)
     scanners.py   (67 lines)   Pairwise distance matrix + co-activation scanning
-    evaluate.py   (59 lines)   Parameter counts, measured latency, estimated size at a bit-width
+    evaluate.py   (60 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                 (74 lines)  full pipeline, seconds, no dependencies beyond torch
     01_vgg_cifar10_sweep.py   (183 lines)  VGG16/CIFAR-10 — three run modes, see section 4 (experiments/)
