@@ -1,6 +1,17 @@
+import torch
 import torch.nn as nn
 
-from prunelib.evaluate import count_params, estimate_size_bytes
+from prunelib.evaluate import count_params, estimate_size_bytes, measure_latency
+
+
+def test_measure_latency_restores_every_submodule_mode():
+    """It switched the model to eval mode to time it and left it there, so a
+    model timed mid-training stopped using dropout and updating BatchNorm
+    statistics. Mixed modes (a frozen layer kept in eval) come back too."""
+    model = nn.Sequential(nn.Linear(4, 4), nn.BatchNorm1d(4), nn.Dropout(0.5)).train()
+    model[1].eval()
+    measure_latency(model, torch.randn(2, 4), n_warmup=1, n_iters=1)
+    assert [m.training for m in model.modules()] == [True, True, False, True]
 
 
 def test_estimate_size_bytes_scales_with_bit_width():

@@ -8,12 +8,17 @@ interface.
 module (`_visit`), one deciding where a skip connection's channels were
 produced (`_find_producer`), one deciding how to rebuild it (`prune`). Supporting
 another layer type meant editing all three consistently. Now each type
-answers two questions once, in a `ModuleRule`:
+answers its questions once, in a `ModuleRule`:
 
 - `role(module)`: how channel indices flow through it (`ChannelRole`).
 - `rebuild(module, prune_out, prune_in)`: the smaller replacement module.
+- `mask(module, prune_out)`: zero those output channels in place, for
+  `PruningGroup.mask()`. Optional -- the default zeroes dim 0 of `weight`
+  and `bias`, which fits every built-in type.
 
-and the graph code depends only on those answers. Built-in rules cover
+and the graph code depends only on those answers. The methods are
+positional-only, so a rule may name its parameters for its own type
+(`role(self, conv)`) and still accept every call the base does. Built-in rules cover
 `nn.Conv2d` (ungrouped or depthwise), `nn.Linear`, `nn.BatchNorm1d` and
 `nn.BatchNorm2d`; `register_module_rule(nn.Conv1d, MyConv1dRule())` adds a
 type globally, or pass `module_rules={...}` to one `DependencyGraph`.
@@ -35,6 +40,7 @@ import torch
 import torch.nn as nn
 
 from .indices import complement_indices
+from .masking import mask_channels
 from .registry import Registry, resolve_by_type
 from .surgery import is_depthwise_conv, slice_batchnorm, slice_conv2d, slice_depthwise_conv2d, slice_linear
 
@@ -59,15 +65,24 @@ class ModuleRule(ABC):
     stores), `None` meaning that dimension is untouched."""
 
     @abstractmethod
-    def role(self, module: nn.Module) -> ChannelRole:
+    def role(self, module: nn.Module, /) -> ChannelRole:
         """Raise `NotImplementedError` for a configuration of this type the
         rule can't handle (e.g. a grouped conv that isn't depthwise)."""
 
     @abstractmethod
     def rebuild(
-        self, module: nn.Module, prune_out: torch.Tensor | None, prune_in: torch.Tensor | None
+        self, module: nn.Module, prune_out: torch.Tensor | None, prune_in: torch.Tensor | None, /
     ) -> nn.Module:
         """A new module with those output / input channels removed."""
+
+    def mask(self, module: nn.Module, prune_out: torch.Tensor, /) -> None:
+        """Zero output channels `prune_out` of `module` in place, shapes
+        unchanged, so that a later `rebuild` gives the same model (phase 1
+        of `PruningGroup.mask()`). The default masks dim 0 of `weight` and
+        `bias` (`masking.mask_channels`). Override it for a type whose output
+        channels live elsewhere, or raise `NotImplementedError` for one
+        that can't be masked to zero."""
+        mask_channels(module, prune_out)
 
 
 def _keep(n: int, prune: torch.Tensor | None) -> torch.Tensor | None:
@@ -111,6 +126,14 @@ class BatchNormRule(ModuleRule):
 
     def rebuild(self, bn, prune_out, prune_in):
         return slice_batchnorm(bn, complement_indices(bn.num_features, _per_channel_prune(prune_out, prune_in, bn)))
+
+    def mask(self, bn, prune_out):
+        if not bn.affine:
+            raise NotImplementedError(
+                f"{type(bn).__name__}(affine=False) can't be masked: it has no weight or bias to zero, and its "
+                f"running mean turns a zeroed input channel into a non-zero constant -- call .prune() instead"
+            )
+        super().mask(bn, prune_out)
 
 
 # Keyed by module class; a rule also covers that class's subclasses.

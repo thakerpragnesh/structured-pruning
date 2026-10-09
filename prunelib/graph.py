@@ -48,6 +48,10 @@ Known limitations, not fixed here:
   shared `cat` node is a no-op once the first has already visited it).
 - Grouped convolutions are only handled in the depthwise special case
   (`groups == in_channels == out_channels`); anything else raises.
+- A skip connection's other branch is traced back only through ops that
+  keep channels one-to-one (adds, activations, scaling). A branch built
+  with `cat`, `chunk` or a flatten raises `NotImplementedError` naming the
+  op, rather than guessing how its indices map.
 - The starting layer of a prune must *produce* its channels (an ungrouped
   Conv2d or a Linear -- `ChannelRole.MIXING`). A depthwise conv or a
   BatchNorm only carries channels its producer decided, so starting there
@@ -69,7 +73,8 @@ module or pass through it -- and how to rebuild it smaller); pass
 `module_rules.register_module_rule` it globally. Every add/cat/flatten
 decision goes through an op propagator in `op_rules.OP_PROPAGATORS`
 (`propagate_add`, `propagate_cat`, `propagate_flatten`), which sees one
-walk only through the small `Propagation` interface; pass
+walk only through the small `Propagation` interface (`shape`,
+`add_output_target` / `add_input_target`, `forward`, `find_producer`); pass
 `op_propagators={...}` to one graph, or `register_op_propagator` globally.
 Per-graph tables are layered over the global registries, not copied from
 them, so a rule registered globally later still reaches an existing graph.
@@ -102,7 +107,7 @@ from typing import Mapping
 import torch
 import torch.fx as fx
 import torch.nn as nn
-from torch.fx.passes.shape_prop import ShapeProp
+from torch.fx.passes.shape_prop import ShapeProp, TensorMetadata
 
 from .group import PruningGroup, SpecialHandler
 from .indices import complement_indices
@@ -254,10 +259,13 @@ class DependencyGraph:
         used to decide whether a prune's index set can pass straight through
         a `call_module` node untouched; it says nothing about whether the
         module *owns* weights that need pruning too (modules with a
-        `ModuleRule` are handled separately, before this check runs)."""
-        out_shape = self._shape(node)
+        `ModuleRule` are handled separately, before this check runs). A node
+        that takes or returns a tuple (`chunk`, `split`) never qualifies."""
         inputs = node.all_input_nodes
-        if len(out_shape) < 2 or not inputs:
+        if not inputs or not all(isinstance(n.meta.get("tensor_meta"), TensorMetadata) for n in (node, *inputs)):
+            return False
+        out_shape = self._shape(node)
+        if len(out_shape) < 2:
             return False
         for inp in inputs:
             in_shape = self._shape(inp)
@@ -271,19 +279,32 @@ class Propagation:
     `PruningGroup` it fills in, and the nodes it has already passed through.
     `get_pruning_group` starts a fresh one per call.
 
-    This is also everything an op propagator (`register_op_propagator`) is
-    given to work with: `shape(node)` to read a recorded shape, `group` to
-    record targets into, and `forward` / `find_producer` to continue the
-    walk."""
+    This is also the whole interface an op propagator
+    (`register_op_propagator`) is given: `shape(node)` to read a recorded
+    shape, `add_output_target` / `add_input_target` to record what must
+    shrink, and `forward` / `find_producer` to continue the walk. The graph
+    and the group stay private -- a propagator used to be handed both, so
+    it could reach the graph's internals or call `group.prune()` halfway
+    through a walk."""
 
     def __init__(self, graph: DependencyGraph, group: PruningGroup):
-        self.graph = graph
-        self.group = group
+        self._graph = graph
+        self._group = group
         self._visited: set[str] = set()
 
     def shape(self, node: fx.Node) -> torch.Size:
         """`node`'s output shape, as recorded when the graph was traced."""
-        return self.graph._shape(node)
+        return self._graph._shape(node)
+
+    def add_output_target(self, name: str, idx: torch.Tensor) -> bool:
+        """Module `name` loses output channels `idx` (see
+        `PruningGroup.add_output_target`)."""
+        return self._group.add_output_target(name, idx)
+
+    def add_input_target(self, name: str, idx: torch.Tensor) -> bool:
+        """Module `name` loses input channels `idx` (see
+        `PruningGroup.add_input_target`)."""
+        return self._group.add_input_target(name, idx)
 
     def forward(self, node: fx.Node, idx: torch.Tensor) -> None:
         """Carry a prune of channels `idx` of `node`'s output into every node
@@ -302,8 +323,15 @@ class Propagation:
         module (Conv2d/Linear) that actually produced this branch's channels
         -- e.g. for `out += identity`, this is what finds the block's own
         input-producing conv when `identity` is a bare reference to it, or
-        the shortcut/downsample conv when there is one."""
-        graph = self.graph
+        the shortcut/downsample conv when there is one.
+
+        It only walks back through ops that keep channels one-to-one (an
+        add, an activation, a scale); anything that moves them -- a `cat`,
+        a flatten -- raises `NotImplementedError` naming the op. It used to
+        walk through every op as if indices carried over unchanged, so a
+        skip branch built with `cat` recorded the wrong channels and failed
+        later with a misleading "two branches disagree" error."""
+        graph = self._graph
         seen: set[str] = set()
         stack = [node]
         while stack:
@@ -318,7 +346,7 @@ class Propagation:
                 if role is ChannelRole.MIXING:
                     return n
                 if role is ChannelRole.PER_CHANNEL:
-                    self.group.add_output_target(n.target, idx)
+                    self.add_output_target(n.target, idx)
                     stack.extend(n.all_input_nodes)
                     continue
                 if graph._is_channel_preserving(n):
@@ -328,6 +356,11 @@ class Propagation:
                     f"can't trace the skip connection back through {n.target!r} ({type(module).__name__})"
                 )
             elif n.op in ("call_function", "call_method"):
+                if not graph._is_channel_preserving(n):
+                    raise NotImplementedError(
+                        f"can't trace the skip connection back through {n.name!r} ({n.op}): its output channels "
+                        f"aren't its inputs' channels one-to-one, so the pruned indices don't carry over"
+                    )
                 stack.extend(n.all_input_nodes)
             elif n.op == "placeholder":
                 raise NotImplementedError(
@@ -344,7 +377,7 @@ class Propagation:
         if node.op == "call_module":
             self._visit_module(source, node, idx)
             return
-        propagator = self.graph._op_propagator(node)
+        propagator = self._graph._op_propagator(node)
         if propagator is None:
             raise NotImplementedError(
                 f"{node.op} {node.target!r} ({node.name}) is downstream of a pruned layer and "
@@ -353,19 +386,19 @@ class Propagation:
         propagator(self, source, node, idx)
 
     def _visit_module(self, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
-        module = self.graph._module(node.target)
-        role = self.graph._role(node.target, module)
+        module = self._graph._module(node.target)
+        role = self._graph._role(node.target, module)
         if role is ChannelRole.MIXING:
-            self.group.add_input_target(node.target, idx)
+            self.add_input_target(node.target, idx)
             return
         if role is ChannelRole.PER_CHANNEL:
-            self.group.add_output_target(node.target, idx)
+            self.add_output_target(node.target, idx)
             self.forward(node, idx)
             return
-        propagator = self.graph._op_propagator(node, module)
+        propagator = self._graph._op_propagator(node, module)
         if propagator is not None:
             propagator(self, source, node, idx)
-        elif self.graph._is_channel_preserving(node):
+        elif self._graph._is_channel_preserving(node):
             self.forward(node, idx)
         else:
             raise NotImplementedError(

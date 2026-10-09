@@ -1,8 +1,10 @@
+import pytest
 import torch
 import torch.nn.utils.prune as prune
 
 from prunelib import build_vgg16, compress_masked_vgg, count_params, mask_vgg_layer, prune_vgg_layer
 from prunelib.masking import surviving_channels
+from prunelib.selection import available_methods
 from prunelib.vgg import vgg_conv_bn_positions
 
 
@@ -48,20 +50,34 @@ def test_mask_vgg_layer_excludes_already_masked_channels_on_repeat_calls():
     assert zeroed == first + second + third  # every call's contribution is additive, none wasted on re-selection
 
 
-def test_mask_vgg_layer_stops_gracefully_when_fully_masked():
-    model = _tiny_vgg()
+def _vgg_shaped(n_out=64):
+    """Just enough of torchvision's VGG layout for `mask_vgg_layer` (a
+    `.features` Sequential, a `.classifier` starting with a Linear), at a
+    fraction of VGG16's memory -- the test below builds one per method."""
+    model = torch.nn.Module()
+    model.features = torch.nn.Sequential(torch.nn.Conv2d(3, n_out, 3, padding=1), torch.nn.BatchNorm2d(n_out))
+    model.classifier = torch.nn.Sequential(torch.nn.Linear(n_out * 49, 5))
+    return model
+
+
+@pytest.mark.parametrize("method", available_methods())
+def test_mask_vgg_layer_stops_gracefully_when_fully_masked(method):
+    """Every selection rule, not just `"max_k"`: `"kmeans"` used to raise on
+    the last few channels instead of masking them."""
+    torch.manual_seed(0)
+    model = _vgg_shaped()
     conv_idx, _ = vgg_conv_bn_positions(model.features)[0]
     n_out = model.features[conv_idx].out_channels
 
     total = 0
     for _ in range(30):  # enough calls at 10%/call to exhaust every channel
-        newly = mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method="max_k")
+        newly = mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method=method)
         total += newly
         if newly == 0:
             break
 
     assert total == n_out  # every channel eventually masked, none double-counted
-    assert mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method="max_k") == 0  # nothing left
+    assert mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method=method) == 0  # nothing left
 
 
 def test_compress_masked_vgg_matches_masked_accuracy_numerically():

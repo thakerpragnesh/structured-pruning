@@ -150,16 +150,21 @@ def kmeans_prune_indices(
         is ever emptied, and within any one cluster the weakest channels
         always go first.
 
-    Raises if `prune_amount` exceeds the number of non-representative
-    channels (i.e. `out - n_clusters`), since satisfying it would mean
-    emptying a cluster.
+    Pruning every channel with the default `n_clusters` returns every
+    index, as every other selection rule does: no channel survives, so
+    there is no cluster left to keep a representative of. (It used to
+    raise, so `mask_vgg_layer`, which may mask a layer down to nothing,
+    crashed on `"kmeans"` where `"max_k"` finished.) With an explicit
+    `n_clusters`, it raises if `prune_amount` exceeds the number of
+    non-representative channels (i.e. `out - n_clusters`), since satisfying
+    it would mean emptying a cluster.
     """
     n_out = weight.shape[0]
     prune_amount = max(0, min(int(prune_amount), n_out))
     if prune_amount == 0:
         return torch.empty(0, dtype=torch.long)
-    if prune_amount >= n_out:
-        raise ValueError(f"prune_amount {prune_amount} would remove every one of the {n_out} channels")
+    if prune_amount == n_out and n_clusters is None:
+        return torch.arange(n_out)
     if n_clusters is None:
         n_clusters = n_out - prune_amount
     if prune_amount > n_out - n_clusters:

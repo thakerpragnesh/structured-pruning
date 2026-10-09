@@ -35,14 +35,24 @@ def measure_latency(
     n_warmup: int = 10,
     n_iters: int = 50,
 ) -> float:
-    """Mean forward-pass latency in milliseconds, CPU wall-clock."""
+    """Mean forward-pass latency in milliseconds, CPU wall-clock, measured
+    in eval mode. Every submodule's own train/eval mode is restored
+    afterwards, mixed modes included (a frozen BatchNorm kept in eval inside
+    a training model). It used to be left in eval mode, so a model timed
+    mid-training quietly stopped using dropout and updating BatchNorm
+    statistics."""
+    modes = [(m, m.training) for m in module.modules()]
     module.eval()
-    for _ in range(n_warmup):
-        module(example_input)
-    start = time.perf_counter()
-    for _ in range(n_iters):
-        module(example_input)
-    elapsed = time.perf_counter() - start
+    try:
+        for _ in range(n_warmup):
+            module(example_input)
+        start = time.perf_counter()
+        for _ in range(n_iters):
+            module(example_input)
+        elapsed = time.perf_counter() - start
+    finally:
+        for m, training in modes:
+            m.training = training
     return (elapsed / n_iters) * 1000.0
 
 

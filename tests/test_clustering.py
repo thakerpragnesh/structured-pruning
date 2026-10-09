@@ -10,6 +10,7 @@ from prunelib import (
     select_prune_indices,
     select_prune_indices_by_method,
 )
+from prunelib.selection import available_methods
 
 
 def _grouped_channels(group_sizes, dim=16, noise=0.01, seed=0):
@@ -115,6 +116,19 @@ def test_kmeans_prune_with_fewer_clusters_prunes_lowest_l1_non_representatives()
 def test_kmeans_prune_refuses_to_empty_a_cluster():
     with pytest.raises(ValueError, match="representative"):
         kmeans_prune_indices(torch.randn(10, 4), prune_amount=8, n_clusters=3)
+
+
+def test_kmeans_prune_every_channel_matches_the_other_selection_rules():
+    """Liskov: asked for every channel, `max_k`/`l1`/`l2`/`random` return
+    them all, but `"kmeans"` raised -- so `mask_vgg_layer`, which may mask a
+    layer down to nothing, crashed on it where `"max_k"` finished. With the
+    default `n_clusters` no cluster is left to protect, so it returns every
+    index too; an explicit `n_clusters` still can't be emptied."""
+    w = torch.randn(5, 4)
+    for method in available_methods():
+        assert select_prune_indices_by_method(w, 5, method=method).tolist() == list(range(5)), method
+    with pytest.raises(ValueError, match="representative"):
+        kmeans_prune_indices(w, 5, n_clusters=2)
 
 
 def test_kmeans_prune_zero_amount_is_a_no_op():

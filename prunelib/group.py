@@ -17,8 +17,8 @@ it's been computed there's nothing left for the caller to reassemble.
 
 `.mask()` / `.commit_and_compress()` are the two-phase mask-then-compress
 workflow from `masking.py`, extended to a whole dependency group instead of
-one layer at a time -- `.mask()` zeroes every targeted module's channels via
-reparametrization (safe to fine-tune against, shapes unchanged),
+one layer at a time -- `.mask()` zeroes every targeted module's channels
+through its module rule (safe to fine-tune against, shapes unchanged),
 `.commit_and_compress()` bakes the zeros in and runs the same rebuild
 `.prune()` does. `.prune()` is the one-shot alternative.
 
@@ -34,7 +34,7 @@ from typing import Callable, Mapping
 import torch
 import torch.nn as nn
 
-from .masking import commit_mask, mask_channels
+from .masking import commit_mask
 from .module_rules import ModuleRule, find_module_rule
 
 SpecialHandler = Callable[[nn.Module, torch.Tensor], nn.Module]
@@ -120,10 +120,7 @@ class PruningGroup:
         (mutated) model for convenience."""
         for name in dict.fromkeys([*self.output_targets, *self.input_targets]):
             module = self.model.get_submodule(name)
-            rule = find_module_rule(module, self.module_rules)
-            if rule is None:
-                raise TypeError(f"{name!r}: don't know how to prune a {type(module).__name__}")
-            new_module = rule.rebuild(module, self.output_targets.get(name), self.input_targets.get(name))
+            new_module = self._rule(name, module).rebuild(module, self.output_targets.get(name), self.input_targets.get(name))
             _set_submodule(self.model, name, new_module)
 
         for name, (handler, keep_idx) in self.special_targets.items():
@@ -133,12 +130,19 @@ class PruningGroup:
 
         return self.model
 
+    def _rule(self, name: str, module: nn.Module) -> ModuleRule:
+        rule = find_module_rule(module, self.module_rules)
+        if rule is None:
+            raise TypeError(f"{name!r}: don't know how to prune a {type(module).__name__}")
+        return rule
+
     def mask(self) -> None:
         """Phase 1 of the two-phase mask-then-compress workflow (see
         `masking.py`'s module docstring), extended here to a whole
         dependency group instead of one layer at a time: zero every
-        *output*-target module's pruned channels via reparametrization
-        (`masking.mask_channels`) rather than immediately rebuilding smaller
+        *output*-target module's pruned channels in place, through its
+        module rule's `mask` (by default `masking.mask_channels`'s
+        reparametrization), rather than immediately rebuilding smaller
         modules. Shapes are unchanged, so the model keeps running -- gradients
         naturally don't reach the masked positions, so it's safe to fine-tune
         or evaluate with the mask active, across as many groups/iterations as
@@ -152,7 +156,10 @@ class PruningGroup:
         can wait for `.commit_and_compress()`. Raises `NotImplementedError`
         for a group with `special_targets`: a handler rebuilds its module in
         one step, with nothing to reparametrize, so masking would leave that
-        module unmasked while fine-tuning -- call `.prune()` instead.
+        module unmasked while fine-tuning -- call `.prune()` instead. A
+        module rule can refuse too (a `BatchNorm` with `affine=False`); any
+        modules masked before the refusal are still rebuilt correctly by
+        `.prune()`, which only reads their kept channels.
         """
         if self.special_targets:
             raise NotImplementedError(
@@ -162,7 +169,11 @@ class PruningGroup:
         for name, idx in self.output_targets.items():
             if idx.numel() == 0:
                 continue
-            mask_channels(self.model.get_submodule(name), idx)
+            module = self.model.get_submodule(name)
+            try:
+                self._rule(name, module).mask(module, idx)
+            except NotImplementedError as exc:
+                raise NotImplementedError(f"{name!r}: {exc}") from None
 
     def commit_and_compress(self) -> nn.Module:
         """Phase 2: bake every mask `.mask()` applied into real zeros

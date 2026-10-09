@@ -21,6 +21,8 @@ Two kinds of rule, behind one entry point (`select_prune_indices_by_method`):
 
 A callable can be passed as `method=` directly too, with the selector
 signature above, for a one-off rule not worth registering.
+`select_prune_indices_among` applies any of them to a subset of channels
+(the not-yet-masked ones, in an iterative masking loop).
 
 `prune_count` is the other half of "what to prune": how many channels a
 `prune_fraction` budget means. `oneshot.prune_model`, `vgg.prune_vgg_layer`
@@ -78,3 +80,27 @@ def select_prune_indices_by_method(
     if method in SALIENCY_METHODS:
         return select_prune_indices(compute_score(weight, method=method, **kwargs), prune_amount)
     raise ValueError(f"unknown method {method!r}, expected one of {available_methods()}")
+
+
+def select_prune_indices_among(
+    weight: torch.Tensor,
+    candidates: torch.Tensor,
+    prune_amount: int,
+    method: Union[str, Selector] = "max_k",
+    **kwargs,
+) -> torch.Tensor:
+    """`select_prune_indices_by_method`, restricted to the output channels
+    in `candidates`: the rule only sees those channels' weights, and the
+    result is indices into `weight`'s dim 0, ascending.
+
+    Iterative masking needs this for correctness: an already-masked
+    channel's weight is zero, the lowest score under every criterion, so
+    selecting over all channels would pick it again every iteration and the
+    schedule would advance far slower than its budget (KT.md section 3).
+    Pass the unmasked channels (`masking.surviving_channels`) as
+    `candidates`. This used to live inside `vgg.mask_vgg_layer`, out of
+    reach of any other masking loop."""
+    positions = select_prune_indices_by_method(
+        weight.detach().index_select(0, candidates), prune_amount, method=method, **kwargs
+    )
+    return candidates[positions].sort().values

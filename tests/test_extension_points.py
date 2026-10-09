@@ -7,6 +7,8 @@ library. Before `registry.py`, each of these was a private dict or an
 if-chain inside the library (KT.md section 7 said "register it in
 `_METHODS`"), so these tests had nothing public to exercise.
 """
+import inspect
+
 import pytest
 import torch
 import torch.nn as nn
@@ -28,13 +30,15 @@ from prunelib import (
     quantize_model_,
     register_op_propagator,
     register_saliency_method,
+    select_prune_indices_among,
     select_prune_indices_by_method,
 )
 from prunelib.distance import DISTANCE_METRICS
+from prunelib.module_rules import Conv2dRule
 from prunelib.quantization import QUANTIZATION_METHODS
 from prunelib.registry import Registry
 from prunelib.saliency import SALIENCY_METHODS
-from prunelib.selection import SELECTION_METHODS
+from prunelib.selection import SELECTION_METHODS, available_methods
 
 
 @pytest.fixture
@@ -227,6 +231,61 @@ def test_per_graph_overrides_are_layered_over_the_live_global_registry(temporari
     assert set(group.output_targets) == {"0", "1"} and set(group.input_targets) == {"3"}
 
 
+def test_module_rule_methods_are_positional_only():
+    """Liskov: the built-in rules name their parameters for their own type
+    (`role(self, conv)`), so `rule.role(module=m)` -- valid against the
+    base's `role(self, module)` -- raised TypeError on every one of them.
+    The base methods are positional-only now, so the contract is a
+    positional call, which every rule (built-in or `_Conv1dRule`) accepts."""
+    for name in ("role", "rebuild", "mask"):
+        params = list(inspect.signature(getattr(ModuleRule, name)).parameters.values())[1:]
+        assert all(p.kind is inspect.Parameter.POSITIONAL_ONLY for p in params), name
+        for rule in [*MODULE_RULES.entries().values(), _Conv1dRule()]:
+            inspect.signature(getattr(rule, name)).bind(*[None] * len(params))  # raises if the call doesn't fit
+
+
+class _RecordingConv2dRule(Conv2dRule):
+    """The built-in Conv2d rule, plus a record of every `mask` call."""
+
+    def __init__(self):
+        self.masked = []
+
+    def mask(self, conv, prune_out):
+        self.masked.append(prune_out.tolist())
+        super().mask(conv, prune_out)
+
+
+def test_pruning_group_masks_through_the_module_rule():
+    """Dependency inversion: `PruningGroup.mask()` called
+    `masking.mask_channels` on every layer itself, so a rule could say how to
+    rebuild its type but not how to mask it -- a layer whose output channels
+    aren't dim 0 of its weight would have been zeroed on the wrong axis. It
+    now asks the rule."""
+    rule = _RecordingConv2dRule()
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(3, 6, 3, padding=1), nn.ReLU(), nn.Conv2d(6, 2, 1))
+    dep = DependencyGraph(model, torch.randn(1, 3, 6, 6), module_rules={nn.Conv2d: rule})
+    dep.get_pruning_group("0", torch.tensor([0, 2, 5])).mask()
+
+    assert rule.masked == [[1, 3, 4]]  # the output target only; "2" shrinks on input, at compress time
+    assert (model[0].weight[[1, 3, 4]] == 0).all() and (model[0].weight[[0, 2, 5]] != 0).any()
+
+
+def test_select_prune_indices_among_never_picks_outside_the_candidates():
+    """Iterative masking selects among the not-yet-masked channels only, or a
+    masked channel (zero weight, the lowest score under every rule) wins
+    again every iteration. That step lived inside `vgg.mask_vgg_layer`; it
+    is a selection function now, usable by any masking loop."""
+    torch.manual_seed(0)
+    w = torch.randn(6, 3, 3, 3)
+    w[[1, 4]] = 0  # already masked
+    candidates = torch.tensor([0, 2, 3, 5])
+    for method in available_methods():
+        picked = select_prune_indices_among(w, candidates, 2, method=method)
+        assert picked.numel() == 2 and set(picked.tolist()) <= set(candidates.tolist()), method
+        assert torch.equal(picked, picked.sort().values)
+
+
 class _SubResidual(nn.Module):
     """A residual block merged with subtraction, which DependencyGraph has no
     built-in propagator for. `method=True` writes it as `.sub()` (an fx
@@ -272,6 +331,25 @@ def test_op_propagator_teaches_dependency_graph_a_new_op(temporarily_register):
     assert model(x).shape == (1, 2, 8, 8)
     with pytest.raises(ValueError, match="op propagator 'sub' is already registered"):
         register_op_propagator("sub", propagate_add)
+
+
+def test_op_propagator_sees_only_the_walk_interface():
+    """Interface segregation: a propagator was handed the `PruningGroup`
+    being filled and, through it, the whole `DependencyGraph`, so it could
+    call `group.prune()` halfway through a walk. It now sees five methods."""
+    seen = []
+
+    def checking_sub(walk, source, node, idx):
+        seen.append({n for n in dir(walk) if not n.startswith("_")})
+        propagate_add(walk, source, node, idx)
+
+    torch.manual_seed(0)
+    model = _SubResidual()
+    x = torch.randn(1, 3, 8, 8)
+    DependencyGraph(model, x, op_propagators={torch.sub: checking_sub}).get_pruning_group("b", torch.tensor([0, 1, 3, 5])).prune()
+
+    assert seen and all(s == {"shape", "add_output_target", "add_input_target", "forward", "find_producer"} for s in seen)
+    assert model(x).shape == (1, 2, 8, 8)
 
 
 def test_every_method_argument_accepts_an_implementation(temporarily_register):

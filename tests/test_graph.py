@@ -372,6 +372,66 @@ def test_mask_then_commit_and_compress_matches_direct_prune():
     assert out.shape == (1, 5, 8, 8)
 
 
+def test_mask_refuses_a_non_affine_batchnorm_and_prune_still_works():
+    """`.mask()` then `.commit_and_compress()` is meant to equal `.prune()`,
+    but on a `BatchNorm2d(affine=False)` `.mask()` died inside
+    `torch.ones_like` (no weight to mask) while `.prune()` worked. Such a
+    BatchNorm can't be masked at all -- its running mean turns a zeroed
+    channel into a non-zero constant -- so its rule now refuses, naming the
+    layer, and `.prune()` still matches a direct prune even though the conv
+    before it was masked before the refusal."""
+
+    def build():
+        torch.manual_seed(0)
+        model = nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8, affine=False), nn.Conv2d(8, 4, 3, padding=1)
+        ).eval()
+        model[1].running_mean.uniform_(-1, 1)
+        return model
+
+    x = torch.randn(1, 3, 8, 8)
+    keep = torch.tensor([0, 2, 4, 6])
+    direct = build()
+    DependencyGraph(direct, x).get_pruning_group(direct[0], keep).prune()
+
+    model = build()
+    group = DependencyGraph(model, x).get_pruning_group(model[0], keep)
+    with pytest.raises(NotImplementedError, match=r"'1'.*affine=False"):
+        group.mask()
+    group.prune()
+    assert torch.allclose(model(x), direct(x))
+
+
+class _MovedSkip(nn.Module):
+    """A residual whose skip branch moves channels around before the add:
+    built with `torch.cat`, or split off a wider conv with `torch.chunk`."""
+
+    def __init__(self, chunk: bool):
+        super().__init__()
+        self.chunk = chunk
+        self.main = nn.Conv2d(3, 6, 1)
+        self.a, self.b = nn.Conv2d(3, 2, 1), nn.Conv2d(3, 4, 1)
+        self.wide = nn.Conv2d(3, 12, 1)
+        self.head = nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        skip = torch.chunk(self.wide(x), 2, 1)[0] if self.chunk else torch.cat([self.a(x), self.b(x)], 1)
+        return self.head(self.main(x) + skip)
+
+
+@pytest.mark.parametrize("chunk, op", [(False, "cat"), (True, "getitem")])
+def test_skip_branch_that_moves_channels_is_refused_at_that_op(chunk, op):
+    """The walk back to a skip branch's producer stepped through any
+    function call as if channel indices carried over unchanged. Through a
+    `cat` it pinned `main`'s indices on the last conv concatenated, then
+    failed with a misleading "two branches disagree". It now refuses at the
+    op that moves the channels."""
+    model = _MovedSkip(chunk).eval()
+    dep = DependencyGraph(model, torch.randn(1, 3, 4, 4))
+    with pytest.raises(NotImplementedError, match=f"skip connection back through '{op}'"):
+        dep.get_pruning_group("main", torch.tensor([0, 1, 2, 3]))
+
+
 class TinyAttentionBlock(nn.Module):
     """Not a realistic attention computation -- just four Linears wired
     together the way `surgery.prune_attention_heads` expects (Q/K/V output

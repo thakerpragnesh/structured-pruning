@@ -26,7 +26,7 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (113 tests,
+compress once at the end — cleanly and with a real test suite (126 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
@@ -216,6 +216,7 @@ register_quantization_method("log2", my_log2_round_trip)   # quantize_model_(mod
 class Conv1dRule(ModuleRule):                  # teach DependencyGraph a new layer type
     def role(self, conv): return ChannelRole.MIXING
     def rebuild(self, conv, prune_out, prune_in): ...
+    # mask(self, conv, prune_out) is optional: the default zeroes dim 0 of weight and bias
 register_module_rule(nn.Conv1d, Conv1dRule())  # or DependencyGraph(..., module_rules={...}) for one graph
 
 register_op_propagator(torch.sub, propagate_add)  # a residual merged with `-` couples like `+`
@@ -363,7 +364,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          113 tests, each naming the defect or behavior it guards against
+tests/          126 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

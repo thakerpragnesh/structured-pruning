@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels, surviving_channels
-from .selection import Selector, prune_count, select_prune_indices_by_method
+from .selection import Selector, prune_count, select_prune_indices_among, select_prune_indices_by_method
 from .surgery import prune_conv_bn, slice_linear
 
 
@@ -105,7 +105,7 @@ def mask_vgg_layer(
     not already masked.
 
     Restricting the score-based selection to `surviving_channels` (not all
-    channels) matters: without it, an already-masked channel's weight is
+    channels, via `selection.select_prune_indices_among`) matters: without it, an already-masked channel's weight is
     zero, which is the lowest possible score under every criterion here, so
     it would keep winning re-selection on every later iteration. Two or
     three of the `prune_amount` slots each iteration would then be "spent"
@@ -140,9 +140,7 @@ def mask_vgg_layer(
 
     # Select among survivors only. `conv.weight` is the masked weight here,
     # so indexing it by survivors gives exactly their (unmasked) values.
-    survivor_weight = conv.weight.detach().index_select(0, survivors)
-    newly_selected_positions = select_prune_indices_by_method(survivor_weight, prune_amount, method=method, **method_kwargs)
-    new_prune_idx = survivors[newly_selected_positions]
+    new_prune_idx = select_prune_indices_among(conv.weight, survivors, prune_amount, method=method, **method_kwargs)
 
     mask_channels(conv, new_prune_idx)
     return new_prune_idx.numel()

@@ -31,7 +31,13 @@ from .masking import (
     surviving_channels,
     zeroed_channels,
 )
-from .selection import SELECTION_METHODS, prune_count, register_selection_method, select_prune_indices_by_method
+from .selection import (
+    SELECTION_METHODS,
+    prune_count,
+    register_selection_method,
+    select_prune_indices_among,
+    select_prune_indices_by_method,
+)
 from .clustering import kmeans, kmeans_prune_indices  # also registers the "kmeans" selection rule
 from .module_rules import MODULE_RULES, ChannelRole, ModuleRule, find_module_rule, register_module_rule
 from .op_rules import OP_PROPAGATORS, propagate_add, propagate_cat, propagate_flatten, register_op_propagator
@@ -63,6 +69,7 @@ __all__ = [
     "random_saliency",
     "select_prune_indices",
     "select_prune_indices_by_method",
+    "select_prune_indices_among",
     "prune_count",
     "kmeans",
     "kmeans_prune_indices",

@@ -6,9 +6,10 @@ operation between layers (an elementwise add, a `torch.cat`, a flatten).
 
 A propagator is `(walk, source, node, idx) -> None`: a prune of channels
 `idx` of `source`'s output has reached `node`. It reads recorded shapes with
-`walk.shape`, records targets into `walk.group`, and continues the walk with
-`walk.forward` / `walk.find_producer` -- `graph.Propagation`'s small public
-interface, which is all it sees of the walk.
+`walk.shape`, records what must shrink with `walk.add_output_target` /
+`walk.add_input_target`, and continues the walk with `walk.forward` /
+`walk.find_producer` -- `graph.Propagation`'s small public interface, which
+is all it sees of the walk (not the graph, and not the group being filled).
 
 Built-in propagators cover `+`/`torch.add` (`propagate_add`), `torch.cat`
 along the channel dimension (`propagate_cat`), and a conv output flattened
@@ -52,7 +53,7 @@ def propagate_add(walk: Propagation, source: fx.Node, node: fx.Node, idx: torch.
             f"(expected exactly 1) is not supported"
         )
     producer = walk.find_producer(others[0], idx)
-    walk.group.add_output_target(producer.target, idx)
+    walk.add_output_target(producer.target, idx)
     walk.forward(producer, idx)
     walk.forward(node, idx)
 
