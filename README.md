@@ -26,13 +26,13 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (109 tests,
+compress once at the end — cleanly and with a real test suite (113 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
 
 **3. Architecture-agnostic pruning plus quantization.** `prunelib/graph.py`
-traces any `torch.fx`-traceable model and resolves which layers a prune
+(with `group.py`, `op_rules.py` and `oneshot.py`) traces any `torch.fx`-traceable model and resolves which layers a prune
 decision couples to (residual adds, `cat`, flatten-into-classifier,
 depthwise convs), so pruning isn't limited to VGG's flat `.features`.
 `prunelib/quantization.py` adds the thesis's three post-training
@@ -134,7 +134,7 @@ from prunelib import DependencyGraph
 
 dep = DependencyGraph(model, example_input)          # traced once, reused for as many prunes as you like
 group = dep.get_pruning_group(model.layer2[0].conv2, keep_idx)
-group.prune()                                         # mutates model in place -- see graph.py's docstring for why
+group.prune()                                         # mutates model in place -- see group.py's docstring for why
 ```
 
 It handles Conv2d/BatchNorm/Linear chains coupled by elementwise add,
@@ -252,7 +252,7 @@ and how much of the network is pruned, and will not be identical across runs.
 | `saliency.py` — Max-k/L1/L2/random, Conv2d and Linear weights | Unit-tested, 10/10 passing |
 | `surgery.py` — Conv/BN/FFN/attention-head structural surgery | Unit-tested, verified against a real HF BERT forward pass |
 | `masking.py` / `vgg.py` — two-phase mask-then-compress | Unit-tested, including a whole-VGG16 mask → compress run |
-| `graph.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), `prune_model`, two-phase `PruningGroup`, `special_handlers` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
+| `graph.py` / `group.py` / `op_rules.py` / `oneshot.py` — `torch.fx`-traced dependency resolution (add/cat/flatten/depthwise), two-phase `PruningGroup`, `special_handlers`, `prune_model` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage |
 | `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
 | `registry.py` / `selection.py` / `distance.py` / `module_rules.py` — public extension points (scorers, selection rules, metrics, quantization methods, prunable layer types, graph ops) | Unit-tested, including a custom Conv1d rule and a `torch.sub` residual driving `DependencyGraph` end to end; refactor verified bit-identical against the previous implementation on every pruning path |
@@ -338,9 +338,13 @@ prunelib/
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     module_rules.py  per-layer-type rules DependencyGraph prunes through (Conv2d,
                   Linear, BatchNorm built in; register more)
-    graph.py      torch.fx dependency resolution -- generic add/cat/flatten/depthwise
-                  surgery; prune_model, PruningGroup.mask()/.commit_and_compress(),
-                  special_handlers/LeafTracer (attention-block hook)
+    op_rules.py   how a prune passes through add/cat/flatten (register more ops)
+    graph.py      torch.fx dependency resolution: which layers one prune decision
+                  touches (add/cat/flatten/depthwise); special_handlers/LeafTracer
+                  (attention-block hook)
+    group.py      PruningGroup: applies that decision -- .prune(), or
+                  .mask() then .commit_and_compress()
+    oneshot.py    prune_model(): score, select and prune any traceable model in one call
     quantization.py  Float16 / linear INT8 / Fixed-Point32 post-training quantization
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
     scanners.py   pairwise distance matrix + co-activation scanning
@@ -359,7 +363,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          109 tests, each naming the defect or behavior it guards against
+tests/          113 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

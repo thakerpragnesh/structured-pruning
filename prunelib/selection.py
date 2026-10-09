@@ -1,7 +1,7 @@
 """
 Selection rules: given a layer's weight and a budget, which output channels
 to prune. This is the one abstraction every caller that *decides* what to
-prune depends on -- `vgg.py`, `graph.prune_model` -- so none of them knows
+prune depends on -- `vgg.py`, `oneshot.prune_model` -- so none of them knows
 which concrete rules exist.
 
 Two kinds of rule, behind one entry point (`select_prune_indices_by_method`):
@@ -21,6 +21,12 @@ Two kinds of rule, behind one entry point (`select_prune_indices_by_method`):
 
 A callable can be passed as `method=` directly too, with the selector
 signature above, for a one-off rule not worth registering.
+
+`prune_count` is the other half of "what to prune": how many channels a
+`prune_fraction` budget means. `oneshot.prune_model`, `vgg.prune_vgg_layer`
+and `vgg.mask_vgg_layer` used to each round and clamp that themselves, three
+slightly different ways -- and `prune_model`'s version could round a budget
+just under 1.0 up to every channel, leaving a zero-width layer.
 """
 from __future__ import annotations
 
@@ -35,6 +41,16 @@ Selector = Callable[..., torch.Tensor]  # (weight, prune_amount, **kwargs) -> pr
 
 SELECTION_METHODS: Registry[Selector] = Registry("selection method")
 register_selection_method = SELECTION_METHODS.register
+
+
+def prune_count(n: int, fraction: float, *, available: int | None = None, min_prune: int = 1, min_keep: int = 1) -> int:
+    """How many of `n` channels a `fraction` budget prunes: `round(n *
+    fraction)`, raised to at least `min_prune`, then capped so that at least
+    `min_keep` of the `available` candidates (default: all `n`) survive.
+    Never negative. Each caller states its own floor and cap through the
+    keywords; the rounding itself is the same for everyone."""
+    available = n if available is None else available
+    return max(0, min(max(min_prune, int(round(n * fraction))), available - min_keep))
 
 
 def available_methods() -> list[str]:

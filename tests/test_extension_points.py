@@ -215,6 +215,18 @@ def test_module_rule_teaches_dependency_graph_a_new_layer_type():
     assert nn.Conv1d not in MODULE_RULES  # scoped to that one graph, not leaked globally
 
 
+def test_per_graph_overrides_are_layered_over_the_live_global_registry(temporarily_register):
+    """A graph built with *any* `module_rules=` override used to snapshot the
+    global table, so a rule registered globally afterwards reached graphs
+    built without overrides but not this one. Both now see it."""
+    x = torch.randn(2, 3, 10)
+    dep = DependencyGraph(_conv1d_net(), x, module_rules={nn.Conv2d: MODULE_RULES.get(nn.Conv2d)})
+    temporarily_register(MODULE_RULES, nn.Conv1d, _Conv1dRule())
+
+    group = dep.get_pruning_group("0", torch.tensor([0, 2, 3, 6, 7]))
+    assert set(group.output_targets) == {"0", "1"} and set(group.input_targets) == {"3"}
+
+
 class _SubResidual(nn.Module):
     """A residual block merged with subtraction, which DependencyGraph has no
     built-in propagator for. `method=True` writes it as `.sub()` (an fx

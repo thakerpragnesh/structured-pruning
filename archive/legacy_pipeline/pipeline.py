@@ -35,6 +35,7 @@ import csv
 from pathlib import Path
 
 from prunelib import compress_masked_vgg, count_params, mask_vgg_layer
+from prunelib.selection import available_methods
 from prunelib.vgg import vgg_conv_bn_positions
 
 from .config import PruningConfig
@@ -139,7 +140,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", default="max_k", choices=["max_k", "l1", "l2", "random"])
+    parser.add_argument("--method", default="max_k", choices=available_methods())
     parser.add_argument("--dataset", default="CIFAR10", choices=["CIFAR10", "ImageFolder", "FakeData"])
     parser.add_argument("--dataset-dir", default="./data")
     parser.add_argument("--prune-step", type=float, default=0.05)

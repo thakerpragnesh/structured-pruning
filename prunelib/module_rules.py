@@ -1,6 +1,6 @@
 """
 Per-module-type pruning rules: everything `graph.DependencyGraph` and
-`graph.PruningGroup` need to know about a layer type, behind one small
+`group.PruningGroup` need to know about a layer type, behind one small
 interface.
 
 `graph.py` used to hard-code Conv2d/Linear/BatchNorm as three separate

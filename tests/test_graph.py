@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from prunelib.graph import DependencyGraph, LeafTracer, prune_model
+from prunelib import DependencyGraph, LeafTracer, prune_count, prune_model
 from prunelib.surgery import prune_attention_heads, prune_conv_bn
 
 
@@ -315,6 +315,24 @@ def test_prune_model_rejects_out_of_range_fraction():
         prune_model(model, x, model[0], prune_fraction=1.0)
 
 
+def test_prune_model_always_keeps_at_least_one_channel():
+    """A budget just under 1 used to round up to every channel, leaving a
+    zero-width Linear that still ran -- the next layer just saw no input."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+    prune_model(model, torch.randn(2, 4), model[0], prune_fraction=0.95)
+    assert model[0].out_features == 1 and model[2].in_features == 1
+
+
+def test_prune_count_rounds_one_way_and_each_caller_sets_its_bounds():
+    assert prune_count(8, 0.95, min_prune=0) == 7  # prune_model: may prune none, always keeps one
+    assert prune_count(8, 0.0, min_prune=0) == 0
+    assert prune_count(8, 0.01) == 1  # prune_vgg_layer: always prunes one...
+    assert prune_count(8, 1.0) == 7  # ...and always keeps one
+    assert prune_count(64, 0.1, available=3, min_keep=0) == 3  # mask_vgg_layer: budget from the original width, capped by survivors
+    assert prune_count(1, 0.5) == 0  # nothing prunable is 0, never negative
+
+
 def test_mask_then_commit_and_compress_matches_direct_prune():
     """`PruningGroup.mask()` + `.commit_and_compress()` must produce exactly
     what calling `.prune()` directly would -- mirrors
@@ -416,6 +434,26 @@ def test_special_handler_prunes_attention_block_via_prune_attention_heads():
     assert model.attn.out.in_features == 6
     out = model(x)
     assert out.shape == (2, 8)  # hidden size at the block's boundary is unchanged by head pruning
+
+
+def test_special_handler_group_refuses_to_mask():
+    """A handler rebuilds its block in one step, so `.mask()` used to skip
+    it silently: the caller fine-tuned believing the pruned heads were
+    masked when nothing had happened to them."""
+    model = AttentionWrapper(hidden=8, num_heads=4)
+    x = torch.randn(2, 8)
+    dep = DependencyGraph(
+        model, x,
+        tracer=LeafTracer([TinyAttentionBlock]),
+        special_handlers={TinyAttentionBlock: _prune_tiny_attention_block},
+    )
+    group = dep.get_pruning_group(model.attn, torch.tensor([0, 1, 3]))
+
+    with pytest.raises(NotImplementedError, match="special handler"):
+        group.mask()
+    assert not hasattr(model.attn.query, "weight_orig")  # nothing was half-masked
+    group.prune()  # the one-step path still works
+    assert model.attn.num_heads == 3
 
 
 class TinyAttentionBlockSubclass(TinyAttentionBlock):

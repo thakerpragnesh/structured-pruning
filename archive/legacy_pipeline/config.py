@@ -37,7 +37,7 @@ class PruningConfig:
     accuracy_drop_threshold: float = 0.01
     max_iterations: int = 15
     fine_tune_epochs_per_iteration: int = 1
-    method: str = "max_k"                   # "max_k" | "l1" | "l2" | "random"
+    method: str = "max_k"                   # any name in prunelib.selection.available_methods()
 
     # Output
     output_dir: Path = Path("./runs")

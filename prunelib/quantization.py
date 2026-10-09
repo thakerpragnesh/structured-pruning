@@ -32,7 +32,7 @@ get back to float32 for computation.
 
 Every function here operates on a `torch.Tensor` and returns a *new* one
 (or a new struct), matching the rest of `prunelib`'s convention of never
-mutating what's passed in (`surgery.py`, `graph.py`). `quantize_model_` is
+mutating what's passed in (`surgery.py`). `quantize_model_` is
 the one deliberate, name-flagged exception -- there's no "new, smaller
 module" to construct and return here the way surgery has one, since
 quantization doesn't change any tensor's shape, only its precision -- see

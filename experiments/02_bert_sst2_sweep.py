@@ -19,9 +19,8 @@ def _score_ffn_neurons(fc1_weight: torch.Tensor, method: str = "max_k") -> torch
     kernel. `compute_score` takes a Linear weight `[out, in]` natively (see
     `prunelib/saliency.py`), so this used to reshape to a fake `[out, in, 1, 1]`
     conv weight before calling it; that workaround is gone now that scoring
-    handles both shapes itself."""
-    kwargs = {"k": 3} if method == "max_k" else {}
-    return compute_score(fc1_weight, method=method, **kwargs)
+    handles both shapes itself. (Max-k uses its default k=3.)"""
+    return compute_score(fc1_weight, method=method)
 
 
 def run_smoke(prune_fraction=0.3, seed=0):

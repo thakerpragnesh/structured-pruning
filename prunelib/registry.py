@@ -3,7 +3,7 @@ Name -> implementation registries: the one extension mechanism every
 pluggable part of `prunelib` shares -- saliency scorers (`saliency.py`),
 selection rules (`selection.py`), distance metrics (`distance.py`),
 quantization methods (`quantization.py`), per-layer-type pruning rules
-(`module_rules.py`) and the ops a prune passes through (`graph.py`). The
+(`module_rules.py`) and the ops a prune passes through (`op_rules.py`). The
 last two are keyed by class (or fx op target) instead of by name, and looked
 up through the MRO with `resolve_by_type` below.
 
@@ -76,8 +76,8 @@ class Registry(Generic[T]):
 
     def entries(self) -> Mapping[Hashable, T]:
         """A read-only, live view of every entry -- what `resolve_by_type`
-        searches, and what per-call overrides merge over (`{**registry.
-        entries(), **overrides}`)."""
+        searches, and what per-call overrides are layered over
+        (`ChainMap(overrides, registry.entries())`)."""
         return MappingProxyType(self._entries)
 
     def __contains__(self, name: object) -> bool:

@@ -16,7 +16,7 @@ channel is pruned depends on which other channels it clusters with, so it
 can't be expressed as `compute_score(...) -> select_prune_indices(...)`.
 `kmeans_prune_indices` is registered as the `"kmeans"` rule in
 `selection.SELECTION_METHODS`, so `selection.select_prune_indices_by_method`
--- the one dispatcher `vgg.py` and `graph.prune_model` call -- accepts
+-- the one dispatcher `vgg.py` and `oneshot.prune_model` call -- accepts
 `method="kmeans"` alongside `"max_k"`/`"l1"`/`"l2"`/`"random"` without
 knowing this module exists.
 

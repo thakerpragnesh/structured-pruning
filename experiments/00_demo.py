@@ -40,8 +40,7 @@ def main():
 
     print(f"{'method':<8} {'lowest-score channel':>22} {'top-3 sum':>12}")
     for method in ("max_k", "l1", "l2", "random"):
-        kwargs = {"k": 3} if method == "max_k" else {}
-        scores = compute_score(model.conv1.weight, method=method, **kwargs)
+        scores = compute_score(model.conv1.weight, method=method)  # max_k's default is k=3
         weakest = select_prune_indices(scores, 1).item()
         print(f"{method:<8} {weakest:>22} {scores[weakest].item():>12.4f}")
 

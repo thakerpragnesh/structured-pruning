@@ -29,7 +29,7 @@ Scorers live in `SALIENCY_METHODS` (a `registry.Registry`), so a new
 criterion is added from the caller's own code -- `@register_saliency_method(
 "taylor")` on a `(weight, **kwargs) -> Tensor[out]` function -- and is then
 accepted by `compute_score`, `selection.select_prune_indices_by_method`,
-`graph.prune_model` and `vgg.py` without editing any of them.
+`oneshot.prune_model` and `vgg.py` without editing any of them.
 """
 from __future__ import annotations
 

@@ -135,18 +135,20 @@ smaller model.
 - **K-Means clustering-based selection** (Paper 2's Manhattan/Euclidean/
   Cosine comparison) now exists in `prunelib.clustering` (2026-09-30) and
   works with `prunelib.prune_vgg_layer`/`mask_vgg_layer` via
-  `method="kmeans"`. It is still not wired into `archive/legacy_pipeline`'s
-  config, since that package is frozen. See `KT.md` section 4.
+  `method="kmeans"`. `archive/legacy_pipeline` takes it too, with default
+  arguments, because its `--method` choices come from
+  `prunelib.selection.available_methods()`; nothing else in that frozen
+  package was added for it. See `KT.md` section 4.
 - **Distance/similarity-based channel selection** for VGG specifically
   (the corrected replacement for `channel_pruning_distance.py` /
   `vgg_channel_pruning_dist.py`) isn't wired into `archive/legacy_pipeline` — only
-  `method="max_k"|"l1"|"l2"|"random"` (saliency-style, one score per
-  channel) are. `prunelib.pairwise_distance_matrix` has the metric. Since
+  the registered rules are (`method="max_k"|"l1"|"l2"|"random"`, one score
+  per channel, plus `"kmeans"`). `prunelib.pairwise_distance_matrix` has the metric. Since
   the 2026-10-02 registry refactor, a similarity-based rule (pick one
   channel from each close pair to drop) no longer needs its own
   `mask_vgg_layer`-equivalent: write it as a selector `(weight,
   prune_amount) -> prune_idx`, register it with
   `prunelib.register_selection_method`, and `mask_vgg_layer` /
   `prune_vgg_layer` / `prune_model` accept it as `method=` — the way
-  `"kmeans"` is wired. `archive/legacy_pipeline` still wouldn't expose it,
-  since that package is frozen.
+  `"kmeans"` is wired. `archive/legacy_pipeline`'s `--method` would then
+  list it too, with no edit to that frozen package.

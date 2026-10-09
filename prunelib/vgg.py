@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels, surviving_channels
-from .selection import Selector, select_prune_indices_by_method
+from .selection import Selector, prune_count, select_prune_indices_by_method
 from .surgery import prune_conv_bn, slice_linear
 
 
@@ -40,7 +40,7 @@ def _shrink_classifier_input(linear: nn.Linear, keep_idx: torch.Tensor, n_channe
     `C * 49` features, channel-major, so channel `c` owns input columns
     `[c * spatial, (c + 1) * spatial)` of `classifier[0]`. Pruning channel
     `c` therefore means dropping that whole block of columns -- the same
-    expansion `graph.propagate_flatten` does for an arbitrary
+    expansion `op_rules.propagate_flatten` does for an arbitrary
     model, specialised here to VGG's fixed layout.
     """
     if linear.in_features % n_channels:
@@ -134,8 +134,9 @@ def mask_vgg_layer(
     if survivors.numel() == 0:
         return 0  # nothing left to prune in this layer
 
-    prune_amount = max(1, int(round(n_out_original * prune_fraction)))
-    prune_amount = min(prune_amount, survivors.numel())
+    # min_keep=0: a layer may be masked down to nothing across iterations
+    # (see test_mask_vgg_layer_stops_gracefully_when_fully_masked).
+    prune_amount = prune_count(n_out_original, prune_fraction, available=survivors.numel(), min_keep=0)
 
     # Select among survivors only. `conv.weight` is the masked weight here,
     # so indexing it by survivors gives exactly their (unmasked) values.
@@ -195,7 +196,7 @@ def prune_vgg_layer(
     conv = model.features[_layer_indices(model, layer_position)[0]]
 
     n_out = conv.out_channels
-    prune_amount = min(max(1, int(round(n_out * prune_fraction))), n_out - 1)
+    prune_amount = prune_count(n_out, prune_fraction)
     prune_idx = select_prune_indices_by_method(conv.weight, prune_amount, method=method, **method_kwargs)
     keep = complement_indices(n_out, prune_idx)
 
