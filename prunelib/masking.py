@@ -39,6 +39,7 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 
+from .indices import as_index, on_device_of
 from .surgery import prune_conv_bn
 
 
@@ -48,7 +49,7 @@ def build_channel_mask(weight: torch.Tensor, prune_idx: torch.Tensor) -> torch.T
     channel/row listed in `prune_idx` and keeps everything else at 1."""
     mask = torch.ones_like(weight)
     if prune_idx.numel() > 0:
-        mask[prune_idx.to(torch.long)] = 0
+        mask[on_device_of(prune_idx, mask)] = 0
     return mask
 
 
@@ -92,13 +93,13 @@ def zeroed_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Indices of output channels that are entirely zero. Meaningful once a
     mask has been committed (see `commit_mask`) -- everything *not* in this
     list is an "unmasked" survivor."""
-    return _zero_channel_mask(weight, atol).nonzero(as_tuple=True)[0]
+    return as_index(_zero_channel_mask(weight, atol).nonzero(as_tuple=True)[0])
 
 
 def surviving_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Complement of `zeroed_channels`: the "unmasked" channels to copy
     across during compression."""
-    return (~_zero_channel_mask(weight, atol)).nonzero(as_tuple=True)[0]
+    return as_index((~_zero_channel_mask(weight, atol)).nonzero(as_tuple=True)[0])
 
 
 def compress_masked_conv_bn(

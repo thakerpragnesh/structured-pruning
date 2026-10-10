@@ -26,15 +26,16 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (146 tests,
+compress once at the end — cleanly and with a real test suite (177 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
 
 **3. Architecture-agnostic pruning plus quantization.** `prunelib/graph.py`
-(with `group.py`, `op_rules.py` and `oneshot.py`) traces any `torch.fx`-traceable model and resolves which layers a prune
+(with `propagation.py`, `group.py`, `op_rules.py` and `oneshot.py`) traces any `torch.fx`-traceable model and resolves which layers a prune
 decision couples to (residual adds, squeeze-and-excitation gates, `cat`,
-flatten-into-classifier, depthwise convs), so pruning isn't limited to VGG's flat `.features`.
+flatten-into-classifier, depthwise convs; channels on dim 1 of a conv's output or the last dim of a Linear's),
+so pruning isn't limited to VGG's flat `.features`.
 `prunelib/quantization.py` adds the thesis's three post-training
 quantization methods (Float16, linear INT8, Fixed-Point32) as a separate
 stage applied after pruning. Both are covered below.
@@ -218,7 +219,9 @@ class Conv1dRule(ModuleRule):                  # teach DependencyGraph a new lay
     def role(self, conv): return ChannelRole.MIXING
     def rebuild(self, conv, prune_out, prune_in): ...
     # optional, for a type whose output channels aren't dim 0 of its weight (ConvTranspose2d):
-    # output_weight(self, conv) -> weight as [out, ...]; mask(self, conv, prune_out); commit_mask(self, conv)
+    # output_weight(self, conv) -> weight as [out, in, ...]; mask(self, conv, prune_out); commit_mask(self, conv)
+    # optional, for a type whose tensors keep channels last rather than on dim 1 (as Linear's do):
+    # channel_dim(self, module) -> -1
 register_module_rule(nn.Conv1d, Conv1dRule())  # or DependencyGraph(..., module_rules={...}) for one graph
                                                # prune_model then scores and prunes Conv1d too
 
@@ -230,7 +233,10 @@ register_op_propagator(torch.maximum, propagate_elementwise)  # a residual merge
 Every `method=` argument also takes the implementation itself, for a
 one-off not worth registering: a selector `(weight, prune_amount) ->
 prune_idx` for `prune_model` / `prune_vgg_layer` / `mask_vgg_layer`, a
-scorer for `compute_score`, a same-shape round-trip for `quantize_model_`. Every pruned module is rebuilt by
+scorer for `compute_score`, a same-shape round-trip for `quantize_model_`.
+Whatever answers is held to its contract -- one score per output channel,
+exactly `prune_amount` distinct channels, the parameter's own shape -- and
+a plugin that breaks it raises, naming itself. Every pruned module is rebuilt by
 `surgery.py`'s `slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` /
 `slice_batchnorm`, each of which returns a copy of the original with only
 its channels resized: same class (a `Conv2d` subclass stays that
@@ -310,8 +316,9 @@ compression stage, applied *after* pruning:
 ```python
 from prunelib import quantize_model_, quantize_int8_linear, dequantize_int8_linear, estimate_size_bytes
 
-# Float16 or Fixed-Point32: in-place, round-trips every Linear/Conv2d/BatchNorm
-# weight and bias through the target precision, cast back to float32.
+# Float16 or Fixed-Point32: in-place, round-trips every floating-point
+# parameter through the target precision, cast back to float32
+# (module_types=prunelib.quantization.QUANTIZABLE_MODULE_TYPES for the thesis's Linear/Conv2d/BatchNorm scope).
 quantize_model_(pruned_model, method="float16")
 quantize_model_(pruned_model, method="fixed_point32", integer_bits=3, fractional_bits=28)
 
@@ -340,18 +347,21 @@ prunelib/
     selection.py  weight + budget -> indices to prune, by any registered rule
     clustering.py K-Means channel selection: prune lowest-L1 within each cluster
     distance.py   Manhattan/Euclidean/Cosine metrics (+ matching K-Means centroids)
-    indices.py    index-set helpers: complement, expand channel -> block of columns
-    surgery.py    slice_* primitives; conv/BN/FFN/attention-head structural surgery
+    indices.py    index-set helpers: complement, expand channel -> block of columns;
+                  index sets live on the CPU, moved to the data's device to index it
+    surgery.py    slice_* primitives; conv/BN/FFN/attention-head structural surgery;
+                  live_tensor (a masked weight as of now, not of the last forward pass)
     masking.py    two-phase mask-then-compress workflow (torch.nn.utils.prune)
     module_rules.py  per-layer-type rules DependencyGraph prunes through (Conv2d,
-                  Linear, BatchNorm built in; register more)
+                  Linear, every BatchNorm/InstanceNorm built in; register more)
     op_rules.py   how a prune passes through + - * /, functional activations,
                   cat, flatten (register more ops)
-    graph.py      torch.fx dependency resolution: which layers one prune decision
-                  touches (merges/cat/flatten/depthwise); special_handlers/LeafTracer
-                  (attention-block hook)
+    graph.py      torch.fx dependency resolution: the trace (one or several inputs)
+                  and get_pruning_group; special_handlers/LeafTracer (attention-block hook)
+    propagation.py  one prune decision's walk: which layers it touches
+                  (merges/cat/flatten/depthwise), on whichever dim holds the channels
     group.py      PruningGroup: applies that decision -- .prune(), or
-                  .mask() then .commit_and_compress()
+                  .mask() then .commit_and_compress(); refuses once the model has changed
     oneshot.py    prune_model(): score, select and prune any traceable model in one call
     quantization.py  Float16 / linear INT8 / Fixed-Point32 post-training quantization
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
@@ -371,7 +381,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          146 tests, each naming the defect or behavior it guards against
+tests/          177 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

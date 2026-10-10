@@ -60,53 +60,61 @@ prunelib/
     registry.py   (98 lines)   Registry (name or type -> implementation) + resolve_by_type
                                (class -> entry, via the MRO): the shared extension
                                mechanism every pluggable part below uses
-    saliency.py   (161 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
-                               any [out, in, *kernel] weight (Linear, Conv1d/2d/3d);
-                               SALIENCY_METHODS registry
-    selection.py  (106 lines)  select_prune_indices_by_method: weight + budget ->
-                               prune indices, by any scorer or registered selector;
+    saliency.py   (177 lines)  Max-k / L1 / L2 / random scoring, single dispatch,
+                               any [out, in, *kernel] weight (Linear, Conv1d/2d/3d),
+                               a scorer's answer checked (one score per output
+                               channel); SALIENCY_METHODS registry
+    selection.py  (137 lines)  select_prune_indices_by_method: weight + budget ->
+                               prune indices, by any scorer or registered selector,
+                               the answer checked against the selector contract;
                                select_prune_indices_among: the same, restricted to
                                candidate (unmasked) channels; prune_count: how many
                                channels a fraction means
-    clustering.py (189 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
+    clustering.py (194 lines)  K-Means (Manhattan/Euclidean/Cosine) channel selection:
                                prune the lowest-L1 channels within each cluster;
                                registers itself as the "kmeans" selection rule
     distance.py   (66 lines)   DistanceMetric (pairwise distance + matching K-Means
                                centroid); DISTANCE_METRICS registry
-    indices.py    (35 lines)   complement_indices, expand_blocks
-    surgery.py    (292 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
+    indices.py    (52 lines)   complement_indices, expand_blocks; index sets are CPU
+                               long tensors, moved to the data's device to index it
+    surgery.py    (315 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
                                slice_batchnorm primitives (each a resized copy of the
                                original: same class, mode, requires_grad);
-                               Conv/BN/FFN/attention-head surgery built on them
-    masking.py    (127 lines)  two-phase mask-then-compress workflow (torch.nn.utils.prune)
-    module_rules.py (180 lines) ModuleRule / ChannelRole: how each layer type takes
+                               Conv/BN/FFN/attention-head surgery built on them;
+                               live_tensor (a masked tensor as of now)
+    masking.py    (128 lines)  two-phase mask-then-compress workflow (torch.nn.utils.prune)
+    module_rules.py (227 lines) ModuleRule / ChannelRole: how each layer type takes
                                part in DependencyGraph pruning (role, rebuild, where
-                               its output channels are, how to mask it); MODULE_RULES
-                               registry
-    op_rules.py   (196 lines)  how a prune passes through ops that own no weights --
+                               its output channels are in its weight and in its
+                               tensors, how to mask it); MODULE_RULES registry
+    op_rules.py   (215 lines)  how a prune passes through ops that own no weights --
                                + - * / (squeeze-and-excitation gates too), functional
                                activations/pooling, cat, flatten, shape queries;
                                OP_PROPAGATORS registry
-    graph.py      (474 lines)  torch.fx dependency resolution -- finds every layer one
-                               prune decision touches (merges/cat/flatten/depthwise), no
-                               seam passed by hand; DependencyGraph (the trace,
-                               refreshed after a prune resizes something) +
-                               Propagation (one walk), special_handlers/LeafTracer
-                               (attention-block hook)
-    group.py      (194 lines)  PruningGroup: applies what graph.py found -- .prune(),
+    graph.py      (333 lines)  torch.fx dependency resolution -- DependencyGraph: the
+                               trace (refreshed after a prune resizes something; one
+                               or several inputs) and get_pruning_group;
+                               special_handlers/LeafTracer (attention-block hook)
+    propagation.py (354 lines) Propagation: one prune's walk through the trace -- finds
+                               every layer it touches (merges/cat/flatten/depthwise),
+                               following the channels on whichever dimension holds
+                               them; refuses shared modules and weighted modules
+                               with no rule
+    group.py      (262 lines)  PruningGroup: applies what the walk found -- .prune()
+                               (all replacements built before any is swapped in),
                                or .mask()/.commit_and_compress() (two-phase workflow
-                               for a whole dependency group)
-    oneshot.py    (81 lines)   prune_model(): score, select and prune any traceable
+                               for a whole dependency group); refuses once stale
+    oneshot.py    (86 lines)   prune_model(): score, select and prune any traceable
                                model in one call
-    quantization.py (203 lines) Post-training Float16 / linear INT8 / Fixed-Point32
+    quantization.py (222 lines) Post-training Float16 / linear INT8 / Fixed-Point32
                                quantization (thesis Ch. 6.6) -- separate compression
                                stage from pruning, applied after it;
                                QUANTIZATION_METHODS registry
-    vgg.py        (202 lines)  VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
+    vgg.py        (207 lines)  VGG wiring: build_vgg16, prune_vgg_layer, mask_vgg_layer, compress_masked_vgg
                                (every conv layer, including the last -> classifier[0];
                                only build_vgg16 needs torchvision)
     scanners.py   (67 lines)   Pairwise distance matrix + co-activation scanning
-    evaluate.py   (72 lines)   Parameter counts, measured latency, estimated size at a bit-width
+    evaluate.py   (87 lines)   Parameter counts, measured latency, estimated size at a bit-width
 experiments/
     00_demo.py                 (73 lines)  full pipeline, seconds, no dependencies beyond torch
     01_vgg_cifar10_sweep.py   (183 lines)  VGG16/CIFAR-10 — three run modes, see section 4 (experiments/)
@@ -123,10 +131,11 @@ archive/
         pipeline.py         kept here as a tested mask-then-compress example,
                              not a live alternative. Moved under archive/
                              2026-09-21. See LEGACY_PIPELINE_MIGRATION.md.
-tests/          146 tests across 11 files, one per historical defect or behavior
+tests/          177 tests across 11 files, one per historical defect or behavior
+                (one needs a CUDA device and is skipped without one)
 ```
 
-Total: ~6,300 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
+Total: ~7,300 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
 
 ## 3. Design decisions, and the defect each one prevents
 
@@ -160,6 +169,18 @@ If you're refactoring `prunelib`, read this table first.
 | An activation, dropout, pooling or resize written as a function or tensor method passes a prune through when it is registered as channel-wise (`propagate_channelwise`, built in for the common ones); a module passes by its shape. An unregistered function still raises, naming the fix | Functions had no pass-through at all: `nn.ReLU()` and `nn.MaxPool2d` carried a prune on while `F.relu(x)`, `x.relu()` and `F.max_pool2d(x, 2)` raised, so whether a model could be pruned depended on how its activations were spelled (Liskov, 2026-10-10). Functions don't get the modules' shape-based pass-through because a function's shape says too little: `torch.flip(x, [1])` keeps every channel and reorders them | `op_rules.py::propagate_channelwise` |
 | `+ - * /` share one propagator (`propagate_elementwise`), which couples the other operand's producer only when that operand carries the same channels; a scalar or a channel-broadcast operand is passed by | Only `+` was registered (`propagate_add`), and it took every merge to be two same-shape branches: `x + 1` was refused, the 1-channel conv behind a `[N, 1, H, W]` spatial gate was told to lose channels it doesn't have, and `*` had no propagator, so no squeeze-and-excitation block (MobileNetV3, EfficientNet) could be pruned through (2026-10-10) | `op_rules.py::propagate_elementwise`; `test_mobilenet_v3_prunes_through_its_squeeze_excitation_blocks` |
 | A flatten is carried only when it really is `[N, C, H, W]` → `[N, C·H·W]`; reading a tensor's shape (`x.size(0)`, `x.shape`) carries nothing on | Every view/reshape/flatten of a 4D tensor had its indices expanded, so after `x.flatten(2)` the walk failed later at the next layer, naming it instead of the reshape; and `x.view(x.size(0), -1)`, the usual classifier flatten, was refused at the `size` call (2026-10-10) | `op_rules.py::propagate_flatten`, `_shape_query` |
+| A module with no rule is passed through by its shape only if it owns no parameters or buffers; one that does raises, naming `register_module_rule` / `register_op_propagator`. One BatchNorm rule covers every `_BatchNorm` and `_InstanceNorm` | A module that kept its channel count was passed through whatever it was (Liskov, 2026-10-11): a `GroupNorm`, a `PReLU(C)`, a `ConvTranspose2d(C, C)` — which mixes channels — and `SyncBatchNorm` (what DDP's `convert_sync_batchnorm` leaves; a sibling of `BatchNorm2d`, so the rule registered for `BatchNorm1d`/`2d` missed it) kept their old width while everything around them shrank, and the model failed on its next forward pass. `vgg_conv_bn_positions` missed `SyncBatchNorm` the same way | `propagation.py::Propagation._visit_module`, `module_rules.py` registrations, `vgg.py::vgg_conv_bn_positions` |
+| A module called more than once in `forward()` can't be pruned: the walk refuses to record a target on it | The graph kept one node per module — the last call — so only that call's consumers were walked; the other call's consumers (and its own input) kept the old width | `propagation.py::Propagation._check_single_call` |
+| A layer's rule says which dimension of its tensors holds its channels (`ModuleRule.channel_dim`: 1 by default, -1 for a Linear), and the walk follows them there, counted from the end so they line up across broadcasting; a layer reading another dimension raises | Channels were dim 1 everywhere (open/closed, 2026-10-11). For a Linear over `[N, T, features]` that's `T`: a `[N, T, 1]` gate looked like it carried the pruned features (its 1-output Linear was told to lose them), a per-feature `[features]` parameter looked like it carried none (kept its width while the Linear shrank), and a Linear over a conv output's *width* had its inputs pruned by the conv's channel indices | `module_rules.py::ModuleRule.channel_dim`, `propagation.py::Propagation.channel_dim`, every propagator in `op_rules.py` |
+| Each pruned input of a `cat` is one *part* of what its output loses (`Propagation.forward_part`); the walk carries all parts on together once nothing else can add one, and counts every place a tensor appears | Each branch called `forward` on the `cat`, and the walk skips a node it has already left: with two pruned branches (`cat([y, relu(y)])`, GhostNet's `cat([x, cheap(x)])`) only the first one's channels left the layer after the `cat`, and `cat([y, y])` lost the second copy's | `op_rules.py::propagate_cat`, `propagation.py::Propagation.forward_part` / `_run` |
+| `PruningGroup.prune()` builds every replacement before swapping any in, and every `PruningGroup` method refuses once the model has been resized since the group was computed (`group.tensor_layout`, which reads masking as no change); the target maps are read-only views | A refused rebuild (a weight-normed conv) left the layers rebuilt before it swapped in — a half-pruned model. `.prune()` twice pruned the same positions again (8 channels down to 4 for a group that keeps 6), and two groups computed up front for two `cat` branches removed the wrong input of the layer after the `cat` with the second one — both silently. Writing into `group.output_targets` skipped the disagreement check | `group.py::PruningGroup` |
+| A masked layer's tensors are read as `weight_orig * weight_mask` now (`surgery.live_tensor`), wherever pruning reads a weight: the slicing primitives, `ModuleRule.output_weight`, `vgg.mask_vgg_layer` / `prune_vgg_layer` | `torch.nn.utils.prune` recomputes `weight` only in a forward pre-hook, so after an optimizer step it is one step stale. `.prune()` on a masked group rebuilt the layer as it was before the last step, and `prune_model` and the next `mask_vgg_layer` iteration scored those stale values | `surgery.py::live_tensor` |
+| A scorer's answer must be one score per output channel, a selector's exactly `prune_amount` distinct in-range channels, a quantization method's the parameter's own shape — checked where each is dispatched, naming the method | Plugins were trusted (Liskov, 2026-10-11): a scorer reducing over the wrong axis had its 4 per-input-channel scores ranked as 8 output channels', a selector returning a channel twice pruned under budget, and a quantization method returning `[out, 1]` was broadcast over every row — all silently | `saliency.py::compute_score`, `selection.py::_checked_selection`, `quantization.py::quantize_model_` |
+| `ModuleRule.mask`'s default refuses for a rule that overrides `output_weight` without overriding `mask` | The default zeroes dim 0 of the weight, so the `ConvTranspose2d` rule (weight `[in, out, kh, kw]`) had its *input* channels zeroed by `PruningGroup.mask()` | `module_rules.py::ModuleRule.mask` |
+| The walk back along a skip branch follows an elementwise merge through whichever operands carry the pruned channels | It followed a merge only if every operand had the same channel count, so a skip branch gated by a `[N, 1, H, W]` map was refused | `propagation.py::Propagation.find_producer` |
+| `quantize_model_` quantizes every floating-point parameter by default, each once (`module_types=` narrows it; `QUANTIZABLE_MODULE_TYPES` is the thesis's scope) | The default was a closed type list, so a Conv1d, LayerNorm, Embedding or `SyncBatchNorm` stayed at full precision silently — the measured drift under-reported, and `estimate_size_bytes(model, 16)` counted them as 16-bit anyway. A weight tied between two listed modules was quantized twice | `quantization.py::quantize_model_` |
+| `get_pruning_group` refuses a `keep_idx` that keeps no channel; `prune_model` refuses a `dependency_graph` traced from another model; `example_input` may be a tuple (one per positional input) for `DependencyGraph`, `prune_model` and `measure_latency` | An empty `keep_idx` left a zero-width Linear that still ran; given a layer by name, `prune_model` scored it in `model` and pruned the graph's model with those scores; a model with two inputs couldn't be traced or timed | `graph.py::DependencyGraph`, `oneshot.py::prune_model`, `evaluate.py::measure_latency` |
+| Index sets are CPU `long` tensors wherever their weights are (`indices.as_index`); every indexing site moves them to the data's device (`indices.on_device_of`); K-Means runs on the CPU; `measure_latency` synchronizes a CUDA device before reading the clock | Indices landed on whichever device made them, so on a GPU the first `complement_indices` (a CPU mask indexed by CUDA indices) or `index_select` (CUDA weight, CPU indices) failed, and K-Means' CPU generator failed on CUDA weights. **Fixed by reasoning, not run**: no GPU on the development laptop; `test_a_cuda_model_prunes_with_every_selection_rule` is skipped without one | `indices.py`, every `slice_*`, `clustering.py`, `evaluate.py` |
 
 If you ever find yourself writing a loop that tracks a running max/min by
 hand, or a loop with a manually-incremented destination index into a
@@ -177,7 +198,9 @@ laid out `[out, in, *kernel]` — a Conv2d `[out,in,kh,kw]`, a Linear
 `[out,in]`, a Conv1d or Conv3d (`_channel_view` reshapes each to `(out, in,
 spatial)`; it used to accept 2D and 4D only, so a Conv1d taught to the graph
 by a module rule couldn't be scored by `prune_model`), routed through
-`compute_score(weight, method=...)`. `select_prune_indices`
+`compute_score(weight, method=...)`, which checks the answer is one score
+per output channel and raises naming the method otherwise (it used to rank
+whatever a registered scorer returned). `select_prune_indices`
 and `keep_indices` operate on the *score* tensor, not the weight — this
 separation is what makes D1 structurally impossible to reintroduce, since
 there's no code path where a caller has both a weight tensor and a stale
@@ -224,6 +247,15 @@ be resized and recomputed at its old size. `slice_conv2d` raises for a grouped c
 `groups=1` (which, for a depthwise conv, used to silently broadcast each
 single-channel filter across every input channel).
 
+A masked layer is sliced as it is *now*: `live_tensor(module, name)` works
+out `weight_orig * weight_mask` instead of reading the `weight` attribute,
+which `torch.nn.utils.prune` refreshes only in a forward pre-hook and which
+is therefore one optimizer step stale while you fine-tune with a mask.
+Everything in `prunelib` that reads a possibly-masked weight goes through it
+(`ModuleRule.output_weight`'s default, `vgg.py`). Indices may arrive on any
+device; each primitive moves them to the tensor it indexes (see
+`indices.py` under "Extension points").
+
 One deliberate design choice worth knowing: `prune_conv_bn` copies
 BatchNorm's running mean/var across to the new, smaller BN layer. The
 original code didn't do this at all — pruned models ran without error but
@@ -256,17 +288,20 @@ is the test to read if you're unsure this is equivalent to just calling
 `prune_conv_bn` directly — it proves the two paths produce numerically
 identical output.
 
-### `prunelib/graph.py` (with `op_rules.py`, `group.py`, `oneshot.py`)
+### `prunelib/graph.py` (with `propagation.py`, `op_rules.py`, `group.py`, `oneshot.py`)
 
-Split 2026-10-10 into four modules with one job each: `graph.py`
-*finds* what a prune decision touches, `op_rules.py` says how a prune
-passes through add/cat/flatten, `group.py` *applies* the result
+Split 2026-10-10 into four modules with one job each, and a fifth on
+2026-10-11: `graph.py` *traces* the model, `propagation.py` *follows* one
+prune decision through the trace (`Propagation`), `op_rules.py` says how a
+prune passes through add/cat/flatten, `group.py` *applies* the result
 (`PruningGroup`), and `oneshot.py` *decides* what to prune (`prune_model`).
-Before the split, `graph.py` was 671 lines and the dependency tracer
-imported the selection rules only `prune_model` needed. Everything below
-still holds; only the module each piece lives in changed. All four are
+Before the first split, `graph.py` was 671 lines and the dependency tracer
+imported the selection rules only `prune_model` needed; the walk moved out
+next because it changes far more often than the trace (six of the
+2026-10-11 fixes were to the walk, two to the trace). Everything below
+still holds; only the module each piece lives in changed. All five are
 re-exported from `prunelib`, so `from prunelib import DependencyGraph,
-PruningGroup, prune_model` is unchanged.
+PruningGroup, Propagation, prune_model` is unchanged.
 
 Added 2026-09-22 to close a gap every other module in `prunelib` leaves
 open: `prune_conv_bn` needs `next_conv=` passed in by hand, `vgg.py` only
@@ -282,11 +317,17 @@ branches' channel counts), the conv-output-flattened-into-Linear classifier
 boundary (channel indices expand by the spatial size), and depthwise convs
 (indices pass straight through, since input and output channel count are
 the same dimension there). Anything it doesn't recognize — a non-depthwise
-grouped conv, an attention block, an unrecognized module — raises
+grouped conv, an attention block, a module that owns weights but has no
+rule, a module called more than once — raises
 `NotImplementedError` rather than silently mis-wiring something; see the
 module's own docstring for the full list of what's deliberately out of
-scope (no automatic attention-block discovery; only one `cat` branch pruned
-at a time; a few other named limitations).
+scope (no automatic attention-block discovery; nothing that moves channels
+to another dimension, like a `permute`; a few other named limitations).
+Several pruned branches of one `cat` are carried on together: each is a
+*part* of what the `cat` loses (`Propagation.forward_part`), merged once
+nothing else in the walk can add one. Until 2026-10-11 only the first
+branch to reach the `cat` got through. `example_input` may be a tuple, one
+tensor per positional input of `forward`.
 
 Which layer types it understands lives in `module_rules.py`, not in
 `graph.py`: each type's `ModuleRule` answers `role(module)` — a
@@ -297,11 +338,19 @@ starting layer, or the far end of a skip connection); a
 passes the prune through — `rebuild(module, prune_out, prune_in)`, and
 three optional ones whose defaults assume output channels are dim 0 of
 `weight` (true of every built-in type, not of `ConvTranspose2d`'s `[in,
-out, kh, kw]`): `output_weight(module)` (the weight arranged `[out, ...]`,
-which a starting layer's channel count and `prune_model`'s scores are read
-from), `mask(module, prune_out)` (zero those output channels for
-`PruningGroup.mask()`) and `commit_mask(module)` (bake that in for
-`.commit_and_compress()`). The forward walk, the backward skip-connection walk,
+out, kh, kw]`): `output_weight(module)` (the weight arranged `[out, in,
+*kernel]`, which a starting layer's channel count and `prune_model`'s
+scores are read from), `mask(module, prune_out)` (zero those output
+channels for `PruningGroup.mask()`; the default refuses for a rule that
+overrides `output_weight` but not `mask`, since it would zero dim 0 anyway)
+and `commit_mask(module)` (bake that in for `.commit_and_compress()`). A
+fourth, `channel_dim(module)`, says which dimension of the tensors the
+layer reads and writes holds its channels — 1 by default, -1 for a Linear —
+and the walk follows the channels there, counted from the end
+(`Propagation.channel_dim(node)`) so they line up across broadcasting; a
+layer that reads its channels from a different dimension than the one
+they're on raises. Until 2026-10-11 it was dim 1 everywhere, which for a
+Linear over `[N, T, features]` is `T`. The forward walk, the backward skip-connection walk,
 `PruningGroup.prune()`/`.mask()`/`.commit_and_compress()` and
 `prune_model` depend only on those answers;
 `test_extension_points.py::test_module_rule_says_where_a_layers_output_channels_are`
@@ -318,13 +367,23 @@ as functions or tensor methods; a module form like `nn.ReLU` needs no entry),
 `propagate_cat`, `propagate_flatten` (only a true `[N, C, H, W]` →
 `[N, C·H·W]`, via `torch.flatten`, a tensor method or `nn.Flatten`), and a
 no-op for shape queries (`x.size(0)`) — each a function `(walk, source, node, idx)` that sees the
-walk only through `Propagation`'s five methods (`shape`,
-`add_output_target` / `add_input_target`, `forward`, `find_producer`). The
+walk only through `Propagation`'s seven methods (`shape`, `channel_dim`,
+`add_output_target` / `add_input_target`, `forward`, `forward_part`,
+`find_producer`). The
 graph and the `PruningGroup` being filled stay private; a propagator used to
 be handed both, and could call `group.prune()` halfway through a walk. The
 backward walk (`find_producer`) only passes through ops that keep channels
-one-to-one, so a skip branch built with `cat` or `chunk` raises at that op
-instead of pinning indices on the wrong conv. `DependencyGraph` holds what's
+one-to-one — a tensor-free module that keeps the channel count, a function
+registered with `propagate_channelwise`, or one registered with
+`propagate_elementwise`, through whichever operands carry the channels (so
+a skip branch gated by a `[N, 1, H, W]` map now leads back to the gated
+tensor's producer; it used to be refused) — so a skip branch built with
+`cat` or `chunk` raises at that op
+instead of pinning indices on the wrong conv. A module with no rule is
+passed through by its shape only if it owns no parameters or buffers: a
+`GroupNorm`, `PReLU(C)` or `ConvTranspose2d(C, C)` used to be passed through
+because it kept its channel count, and kept its old width while everything
+around it shrank. `DependencyGraph` holds what's
 fixed for the model as it currently is — the trace and every node's
 recorded shape — and re-traces before a walk when a prune (through it or
 any other route) has resized a parameter or buffer since; a layer passed as
@@ -337,12 +396,25 @@ ShapeProp's forward pass runs in eval mode without gradients (modes
 restored after), so tracing no longer nudges BatchNorm running statistics;
 the trace itself still sees the model's own mode.
 `Propagation` holds one `get_pruning_group` call's state (the group being
-filled, the nodes visited), which is why neither is threaded through every
-method any more. `PruningGroup.add_output_target`/`add_input_target` own the
-"two branches disagree about one layer" check. The starting layer must be
+filled, the nodes visited, where each tensor's channels are, the `cat`
+parts waiting), which is why none of it is threaded through every
+method. `PruningGroup.add_output_target`/`add_input_target` own the
+"two branches disagree about one layer" check; the target maps themselves
+are read-only views. The starting layer must be
 `MIXING`: starting from a depthwise conv used to be accepted and leave its
 producer's output wider than its new input (a model that failed on the next
-forward pass); it now raises `TypeError`.
+forward pass); it now raises `TypeError`. A `keep_idx` that keeps no channel
+raises `ValueError`, and a module called more than once in `forward()`
+(shared weights) can't be pruned at all.
+
+A `PruningGroup` is computed against the model as it is at that moment, so
+it refuses (`RuntimeError`) once a parameter or buffer has been resized
+since (`group.tensor_layout`, which reads masking as no change): apply a
+group before computing the next. `.prune()` used to be happy to run twice,
+and a group computed before another group's prune removed channels by
+their old numbers. `.prune()` also builds every replacement before swapping
+any in, so a layer whose rebuild refuses (a weight-normed conv) leaves the
+model as it was rather than half-pruned.
 
 One real deviation from the rest of this library, called out in
 `group.py`'s docstring: `PruningGroup.prune()` mutates the model in place
@@ -365,7 +437,8 @@ designed for, it falls out of the forward-walk naturally.
   (`oneshot.py`) — the `vgg.py::prune_vgg_layer` convenience (score →
   select → surgery, one call), generalized to any model `DependencyGraph`
   can trace instead of hardcoding VGG's flat `.features`. At least one
-  channel always survives (`selection.prune_count`).
+  channel always survives (`selection.prune_count`). A `dependency_graph=`
+  traced from a different model raises.
   `experiments/07_quantization.py` uses it as its pruning step;
   `test_graph.py::test_prune_model_scores_and_prunes_in_one_call` is the
   unit test.
@@ -417,11 +490,15 @@ integer/28-fractional bit format, thesis's own finding that it's markedly
 worse than Float16 since a fixed exponent can't adapt to a layer's actual
 weight distribution — kept for reproducing that comparison, not as a
 recommendation). `quantize_model_` applies Float16 or Fixed-Point32 to
-every floating-point parameter each listed module type owns directly
-(default types Linear/Conv2d/BatchNorm, i.e. their weight and bias; pass
-`module_types=` for others — it used to look up `weight`/`bias` by name, so
+every floating-point parameter in the model, each once (a weight tied
+between two modules isn't quantized twice), or — with `module_types=` — to
+those the listed types own directly (`QUANTIZABLE_MODULE_TYPES` is the
+thesis's Linear/Conv2d/BatchNorm scope). The default used to be that closed
+list, so a Conv1d, LayerNorm, Embedding or `SyncBatchNorm` stayed at full
+precision without a word; and it used to look up `weight`/`bias` by name, so
 `MultiheadAttention`'s `in_proj_weight` was silently skipped and `nn.LSTM`
-crashed), in place — the one
+crashed. A method's answer must keep the parameter's shape (it used to be
+broadcast back). It works in place — the one
 function in this module (besides `masking.commit_mask`, its precedent)
 that deviates from `prunelib`'s "never mutate what's passed in" convention,
 since quantization changes no tensor's shape, so there's no smaller module
@@ -454,7 +531,11 @@ specific version of `op_rules.propagate_flatten`). Both
 `selection.select_prune_indices_by_method` accepts, including `"kmeans"`
 or a selector callable. Only `build_vgg16` needs torchvision (imported
 inside it), so the surgery functions work on any torchvision-shaped VGG
-without the optional dependency installed.
+without the optional dependency installed. Any BatchNorm after a conv is
+pruned with it, `SyncBatchNorm` included (only `BatchNorm2d` was, so a VGG
+converted for DDP training was pruned without its BatchNorms), and a masked
+conv is scored by its live weights (`surgery.live_tensor`), not the ones
+the last forward pass left.
 
 ### `archive/legacy_pipeline/`
 
@@ -507,7 +588,9 @@ uses the centroid update that actually minimizes it: mean for Euclidean,
 **coordinate-wise median for Manhattan** (K-Medians; the mean minimizes
 squared L2, not L1), and normalized mean for Cosine (spherical K-Means).
 Empty clusters are re-seeded, so every cluster always has at least one
-member.
+member. It runs on the CPU whatever device the weights are on, so the same
+seed clusters the same way everywhere (on a CUDA weight it used to fail at
+its CPU generator).
 
 `kmeans_prune_indices(weight, prune_amount, n_clusters=None, metric=...)` is
 the paper's selection rule. It clusters output channels on their flattened
@@ -546,6 +629,10 @@ and `metric=` a `DistanceMetric`). The registries:
 - `saliency.SALIENCY_METHODS` — `(weight, **kw) -> Tensor[out]` scorers.
 - `selection.SELECTION_METHODS` — `(weight, prune_amount, **kw) -> prune_idx`
   selectors for rules that aren't a per-channel score (`"kmeans"`).
+
+  Both contracts are checked where they're dispatched: a scorer must return
+  shape `(out,)`, a selector exactly `prune_amount` (clamped to `[0, out]`)
+  distinct, in-range indices — anything else raises, naming the rule.
 - `distance.DISTANCE_METRICS` — `DistanceMetric(pairwise, centroid)`; the
   centroid is the K-Means update that minimizes that distance, kept in the
   same object so the two can't be registered inconsistently. `centroid=None`
@@ -554,8 +641,11 @@ and `metric=` a `DistanceMetric`). The registries:
   `quantize_model_` can apply. INT8 is deliberately absent: it returns an
   `Int8Tensor`, a different contract.
 - `module_rules.MODULE_RULES` — `ModuleRule`s (`role`, `rebuild`; optional
-  `output_weight`, `mask`, `commit_mask`), keyed by class, resolved through the MRO
+  `output_weight`, `mask`, `commit_mask`, `channel_dim`), keyed by class, resolved through the MRO
   (`registry.resolve_by_type`), so subclasses inherit their parent's rule.
+  The BatchNorm rule is registered on the private bases `_BatchNorm` and
+  `_InstanceNorm`, so `BatchNorm1d/2d/3d`, `SyncBatchNorm` and
+  `InstanceNorm1d/2d/3d` all resolve to it.
 - `op_rules.OP_PROPAGATORS` — keyed the way `torch.fx` records a node's target:
   the function for `call_function` (`torch.add`, `torch.cat`,
   `torch.flatten`), the method name for `call_method` (`"add"`, `"view"`),
@@ -571,15 +661,22 @@ graph was built still reaches it (section 3).
 `indices.py` holds the two index helpers that used to be re-derived inline
 in four or five places each: `complement_indices(n, idx)` ("which of `0..n-1`
 aren't in `idx`") and `expand_blocks(idx, block_size)` (channel → its block
-of flattened columns, head → its block of Q/K/V rows).
+of flattened columns, head → its block of Q/K/V rows). It also sets the
+device policy: an index set is a CPU `long` tensor (`as_index`) wherever the
+weights it indexes are, and every indexing site moves it to the tensor's
+device first (`on_device_of`). Indices used to stay on whichever device made
+them, which on a GPU failed at the first prune — fixed by reasoning, since
+the development laptop has no GPU (see section 6).
 
 ### `prunelib/evaluate.py`
 
 `count_params`, `count_encoder_params` (params under a named submodule, e.g.
 `.encoder` or a dotted `"bert.encoder"`, excluding embeddings; it raises if
 the submodule is missing, where it used to count the whole model), `measure_latency` (wall-clock,
-warmup + averaged iterations, CPU by default; every submodule's train/eval
-mode is restored afterwards), and `estimate_size_bytes`
+warmup + averaged iterations; every submodule's train/eval mode is restored
+afterwards; a tuple input is unpacked into positional arguments; a CUDA
+device is synchronized before each clock reading, since kernels run
+asynchronously), and `estimate_size_bytes`
 (`count_params * bits_per_param / 8` — a quick way to compare quantization
 precisions, not a substitute for measuring a saved checkpoint, which also
 carries INT8 scale/zero-point metadata). Nothing subtle here, but
@@ -634,7 +731,8 @@ defect-named test even if you refactor the code it guards, unless you're
 certain the refactor makes the bug class structurally impossible (as, e.g.,
 switching to `torch.topk` made D2 impossible to reintroduce even accidentally).
 
-Run everything: `PYTHONPATH=. pytest tests/ -v` (146 tests, ~40-45s total on
+Run everything: `PYTHONPATH=. pytest tests/ -v` (177 tests, one of which
+needs a CUDA device and is skipped without one; ~40-45s total on
 CPU; the pure-`prunelib` tests alone (including `test_graph.py`,
 `test_quantization.py`, and `test_evaluate.py`, none of which need
 `torchvision`/`transformers`) are still ~2-3s, the rest is the handful
@@ -712,10 +810,25 @@ correct public implementation. Current state, honestly:
   the flatten-into-classifier boundary, depthwise convs) — see its module
   walkthrough entry above and `graph.py`'s own docstring for what's still
   explicitly out of scope: non-depthwise grouped convs raise rather than
-  attempt, only one `cat` branch is safely pruned at a time within a single
-  `get_pruning_group` call, and channels are taken to be dim 1 (an NCHW conv
-  output), so a Linear over a `[N, T, features]` sequence is only handled
-  while nothing on the way needs to know where its features are.
+  attempt, a module called more than once (shared weights) raises, and
+  channels stay on the dimension their producer put them on — a Linear over
+  `[N, T, features]` is followed on its feature dimension since 2026-10-11,
+  but a `permute`/`transpose` into channels-last (ConvNeXt-style blocks)
+  raises, and there is no rule for `LayerNorm` (it normalizes across the
+  channels, so pruning some changes the others' outputs — not a
+  per-channel layer). ~~Only one `cat` branch is safely pruned at a time~~
+  **Fixed 2026-10-11.**
+- **The CUDA path has never run.** Nothing in `prunelib` had been run on a
+  GPU, and on 2026-10-11 reading the code showed it couldn't: index tensors
+  stayed on the device that produced them, so the first prune of a CUDA
+  model failed (a CPU mask indexed by CUDA indices), and so did K-Means.
+  Indices now live on the CPU and move to the data's device to index it,
+  K-Means runs on the CPU, and `measure_latency` synchronizes a CUDA
+  device — but that fix was made by reading the code, not by running it:
+  the development laptop has no GPU.
+  `test_graph.py::test_a_cuda_model_prunes_with_every_selection_rule` runs
+  where one exists; run it (and `experiments/01 --tiny-check` on a GPU)
+  before trusting a GPU run.
 - ~~**`DependencyGraph` isn't wired into the two-phase mask-then-compress
   workflow — only one-shot surgery.**~~ **Fixed 2026-09-23.**
   `PruningGroup.mask()` / `.commit_and_compress()` extend `masking.py`'s
@@ -787,12 +900,15 @@ correct public implementation. Current state, honestly:
   (also added 2026-09-23) already wire `DependencyGraph`-based pruning into
   the two-phase mask-then-compress workflow — that's no longer open either.
   To make `DependencyGraph` prune *through* a new layer type (Conv1d,
-  LayerNorm, GroupNorm, ...), don't edit `graph.py`: write a
+  GroupNorm, ...), don't edit `graph.py`: write a
   `module_rules.ModuleRule` (`role` + `rebuild`, plus `output_weight` and
-  `mask`/`commit_mask` if its output channels aren't dim 0 of its weight)
+  `mask`/`commit_mask` if its output channels aren't dim 0 of its weight —
+  the default `mask` refuses a rule that overrides `output_weight` alone —
+  and `channel_dim` if its tensors don't keep channels on dim 1)
   and register it with `register_module_rule`, or pass
   `module_rules={Type: rule}` to one graph; `prune_model` then scores and
-  prunes that type too.
+  prunes that type too. Until a type has a rule, a module of it that owns
+  any parameter or buffer stops the walk with a message naming both fixes.
   `tests/test_extension_points.py::test_module_rule_teaches_dependency_graph_a_new_layer_type`
   (Conv1d) and `test_module_rule_says_where_a_layers_output_channels_are`
   (ConvTranspose2d) are the worked examples. To make it propagate through a new *op* (a residual merged
@@ -801,7 +917,11 @@ correct public implementation. Current state, honestly:
   propagate_elementwise)` (and `"maximum"` for the tensor method), or
   `register_op_propagator(my_activation, propagate_channelwise)`, or
   `op_propagators={...}` on one graph; a genuinely new op gets its own
-  `(walk, source, node, idx)` function.
+  `(walk, source, node, idx)` function. Read where the channels are with
+  `walk.channel_dim(source)` (counted from the end), never dim 1; pass
+  `dim=` to `walk.forward` if the op moves them; and use
+  `walk.forward_part` instead of `walk.forward` if the op's output loses
+  channels from several inputs at once, as `propagate_cat` does.
   `test_extension_points.py::test_op_propagator_teaches_dependency_graph_a_new_op`
   and `test_channelwise_propagator_teaches_dependency_graph_a_functional_op`
   are the worked examples.
@@ -854,7 +974,7 @@ to add or fix a CNN pruning criterion, you probably want
 git clone https://github.com/thakerpragnesh/structured-pruning.git
 cd structured-pruning
 pip install -e ".[dev,vision-experiments,transformer-experiments]"
-pytest tests/ -v                        # 146 tests
+pytest tests/ -v                        # 177 tests
 python experiments/00_demo.py           # full pipeline, seconds
 python experiments/01_vgg_cifar10_sweep.py --smoke
 python experiments/06_generic_pruning.py --smoke

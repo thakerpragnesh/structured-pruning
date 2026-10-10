@@ -19,17 +19,21 @@ import torch.nn as nn
 from .indices import complement_indices, expand_blocks
 from .masking import commit_mask, mask_channels, surviving_channels
 from .selection import Selector, prune_count, select_prune_indices_among, select_prune_indices_by_method
-from .surgery import prune_conv_bn, slice_linear
+from .surgery import live_tensor, prune_conv_bn, slice_linear
 
 
 def vgg_conv_bn_positions(features: nn.Sequential) -> list[tuple[int, int | None]]:
     """List of (conv_idx, bn_idx_or_None) for every Conv2d in a torchvision
-    VGG `.features` Sequential, in forward order."""
+    VGG `.features` Sequential, in forward order. Any BatchNorm counts,
+    `SyncBatchNorm` included: only `BatchNorm2d` used to, so in a VGG
+    converted for DDP training (`SyncBatchNorm.convert_sync_batchnorm`)
+    every layer was pruned without its BatchNorm, and the model failed on
+    its next forward pass."""
     pairs = []
     for i, layer in enumerate(features):
         if isinstance(layer, nn.Conv2d):
-            bn_idx = i + 1 if i + 1 < len(features) and isinstance(features[i + 1], nn.BatchNorm2d) else None
-            pairs.append((i, bn_idx))
+            has_bn = i + 1 < len(features) and isinstance(features[i + 1], nn.modules.batchnorm._BatchNorm)
+            pairs.append((i, i + 1 if has_bn else None))
     return pairs
 
 
@@ -128,9 +132,10 @@ def mask_vgg_layer(
     survivors left to prune).
     """
     conv = model.features[_layer_indices(model, layer_position)[0]]
-    n_out_original = conv.weight.shape[0]
+    weight = live_tensor(conv, "weight")  # the masked weight as of now, not of the last forward pass
+    n_out_original = weight.shape[0]
 
-    survivors = surviving_channels(conv.weight)
+    survivors = surviving_channels(weight)
     if survivors.numel() == 0:
         return 0  # nothing left to prune in this layer
 
@@ -138,9 +143,9 @@ def mask_vgg_layer(
     # (see test_mask_vgg_layer_stops_gracefully_when_fully_masked).
     prune_amount = prune_count(n_out_original, prune_fraction, available=survivors.numel(), min_keep=0)
 
-    # Select among survivors only. `conv.weight` is the masked weight here,
+    # Select among survivors only. `weight` is the masked weight here,
     # so indexing it by survivors gives exactly their (unmasked) values.
-    new_prune_idx = select_prune_indices_among(conv.weight, survivors, prune_amount, method=method, **method_kwargs)
+    new_prune_idx = select_prune_indices_among(weight, survivors, prune_amount, method=method, **method_kwargs)
 
     mask_channels(conv, new_prune_idx)
     return new_prune_idx.numel()
@@ -195,7 +200,7 @@ def prune_vgg_layer(
 
     n_out = conv.out_channels
     prune_amount = prune_count(n_out, prune_fraction)
-    prune_idx = select_prune_indices_by_method(conv.weight, prune_amount, method=method, **method_kwargs)
+    prune_idx = select_prune_indices_by_method(live_tensor(conv, "weight"), prune_amount, method=method, **method_kwargs)
     keep = complement_indices(n_out, prune_idx)
 
     _apply_vgg_surgery(model, layer_position, keep)

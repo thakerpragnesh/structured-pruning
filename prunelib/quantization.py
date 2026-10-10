@@ -49,6 +49,9 @@ import torch.nn as nn
 
 from .registry import Registry
 
+# The layer types thesis Ch. 6.6 quantized in VGG16 -- pass it as
+# `quantize_model_(..., module_types=QUANTIZABLE_MODULE_TYPES)` to reproduce
+# that scope exactly. The default is every parameter in the model.
 QUANTIZABLE_MODULE_TYPES = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.BatchNorm1d)
 
 # Same-shape round-trip methods `quantize_model_` can apply: `(tensor,
@@ -157,22 +160,34 @@ def quantize_fixed_point32(tensor: torch.Tensor, integer_bits: int = 3, fraction
 def quantize_model_(
     model: nn.Module,
     method: str | Callable[..., torch.Tensor] = "float16",
-    module_types: tuple[type, ...] = QUANTIZABLE_MODULE_TYPES,
+    module_types: tuple[type, ...] | None = None,
     **kwargs,
 ) -> nn.Module:
     """Apply `method`'s quantization error to every floating-point parameter
-    each `module_types` module in `model` owns directly (default types:
-    Linear/Conv2d/BatchNorm, i.e. their weight and bias), **in place**, then
-    cast the result back to that parameter's original dtype. A child
-    module's parameters are quantized when the child's own type is listed
-    (`nn.MultiheadAttention` owns `in_proj_weight`; its `out_proj` is a
-    `Linear`). It used to look up `weight` and `bias` by name, so a listed
-    type that names its parameters otherwise was silently left untouched
-    (`MultiheadAttention`), or crashed when `bias` was a flag (`nn.LSTM`).
+    of `model`, **in place**, then cast the result back to that parameter's
+    original dtype -- each parameter once, even one shared by two modules
+    (tied weights), so a method that isn't idempotent isn't applied twice.
+
+    `module_types` narrows it to the parameters those module types own
+    directly (`QUANTIZABLE_MODULE_TYPES` is thesis Ch. 6.6's Linear/Conv2d/
+    BatchNorm scope). A child module's parameters are quantized when the
+    child's own type is listed (`nn.MultiheadAttention` owns
+    `in_proj_weight`; its `out_proj` is a `Linear`). It used to look up
+    `weight` and `bias` by name, so a listed type that names its parameters
+    otherwise was silently left untouched (`MultiheadAttention`), or crashed
+    when `bias` was a flag (`nn.LSTM`). And the default *was* that closed
+    list: a Conv1d, a LayerNorm, an Embedding, a `SyncBatchNorm` stayed at
+    full precision without a word, so the output drift this measures
+    under-reported -- and `evaluate.estimate_size_bytes(model, 16)` counted
+    those parameters as 16-bit anyway.
 
     `method` is a name in `QUANTIZATION_METHODS` ("float16",
     "fixed_point32", or one registered later) or a same-shape `(tensor,
-    **kwargs) -> tensor` function itself; `kwargs` are forwarded to it.
+    **kwargs) -> tensor` function itself; `kwargs` are forwarded to it. Its
+    answer must have the parameter's own shape, or this raises naming the
+    method: it used to be copied back with broadcasting, so a method that
+    returned one value per row (`keepdim=True`) overwrote every row with a
+    constant, silently.
     INT8 isn't included here because
     `quantize_int8_linear` returns a separate `Int8Tensor` struct, not a
     same-shape, same-dtype replacement this function's uniform copy-back
@@ -194,10 +209,14 @@ def quantize_model_(
     """
     fn = QUANTIZATION_METHODS.resolve(method)
 
-    for module in model.modules():
-        if not isinstance(module, module_types):
-            continue
-        for param in module.parameters(recurse=False):
-            if param.is_floating_point():
-                param.copy_(fn(param, **kwargs).to(param.dtype))
+    owners = model.modules() if module_types is None else (m for m in model.modules() if isinstance(m, module_types))
+    params = {id(p): p for m in owners for p in m.parameters(recurse=False) if p.is_floating_point()}
+    for param in params.values():
+        quantized = fn(param, **kwargs)
+        if tuple(quantized.shape) != tuple(param.shape):
+            raise ValueError(
+                f"quantization method {getattr(method, '__name__', method)!r} turned a {tuple(param.shape)} "
+                f"parameter into {tuple(quantized.shape)}; a method returns a tensor of its input's shape"
+            )
+        param.copy_(quantized.to(param.dtype))
     return model

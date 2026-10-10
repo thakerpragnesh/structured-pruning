@@ -85,6 +85,11 @@ def kmeans(
 
     `metric` is a name in `distance.DISTANCE_METRICS` or a
     `distance.DistanceMetric`; it must define a `centroid` rule.
+
+    Runs on the CPU, wherever `vectors` is: its seeding generator is a CPU
+    one, so the same seed clusters the same way on any device. (It ran on
+    `vectors`' device with that CPU generator, so `method="kmeans"` on a
+    CUDA model failed at the first `torch.multinomial`.)
     """
     metric_name = metric
     metric = DISTANCE_METRICS.resolve(metric)
@@ -96,7 +101,7 @@ def kmeans(
     if not 1 <= n_clusters <= n:
         raise ValueError(f"n_clusters must be in [1, {n}], got {n_clusters}")
 
-    x = vectors.detach().to(torch.float32)
+    x = vectors.detach().to(device="cpu", dtype=torch.float32)
     generator = torch.Generator().manual_seed(seed)
     centroids = _kmeans_plus_plus_init(x, n_clusters, metric, generator)
     labels = torch.full((n,), -1, dtype=torch.long)
@@ -173,9 +178,9 @@ def kmeans_prune_indices(
             f"per cluster with n_clusters={n_clusters} (at most {n_out - n_clusters} are prunable)"
         )
 
-    vectors = weight.detach().reshape(n_out, -1)
+    vectors = weight.detach().reshape(n_out, -1).to(device="cpu", dtype=torch.float32)
     labels, _ = kmeans(vectors, n_clusters, metric=metric, max_iter=max_iter, seed=seed)
-    l1 = vectors.abs().sum(dim=1).to(torch.float32)
+    l1 = vectors.abs().sum(dim=1)
 
     # The representative of each cluster is its highest-L1 member; it's
     # never a pruning candidate. Everyone else competes on L1 alone.

@@ -46,3 +46,14 @@ def test_count_encoder_params_counts_the_named_submodule_or_raises():
     assert count_encoder_params(model["bert"]) == 20
     with pytest.raises(AttributeError, match="encoder"):
         count_encoder_params(model)
+
+
+def test_measure_latency_accepts_several_inputs():
+    """Open/closed: like `DependencyGraph`, it took one tensor, so a model
+    whose `forward` takes two couldn't be timed. A tuple is unpacked."""
+
+    class Two(nn.Module):
+        def forward(self, x, y):
+            return x + y
+
+    assert measure_latency(Two(), (torch.randn(2), torch.randn(2)), n_warmup=1, n_iters=2) > 0

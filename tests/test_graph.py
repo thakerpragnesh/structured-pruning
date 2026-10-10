@@ -756,3 +756,393 @@ def test_depthwise_conv_cannot_be_the_starting_layer():
     dep = DependencyGraph(model, torch.randn(1, 3, 8, 8))
     with pytest.raises(TypeError, match="start from the layer that feeds it"):
         dep.get_pruning_group(model.dw, torch.tensor([0, 1, 3, 5]))
+
+
+def _conv_norm_conv(norm: nn.Module) -> nn.Sequential:
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), norm, nn.ReLU(), nn.Conv2d(8, 4, 1)).eval()
+
+
+@pytest.mark.parametrize(
+    "middle", [nn.GroupNorm(2, 8), nn.PReLU(8), nn.ConvTranspose2d(8, 8, 3, padding=1)], ids=["groupnorm", "prelu", "convtranspose"]
+)
+def test_a_module_with_weights_and_no_rule_is_refused_not_passed_through(middle):
+    """Liskov: a module with no rule was passed through whenever its output
+    kept its input's channel count -- right for a ReLU, wrong for anything
+    that owns weights. A GroupNorm or PReLU(8) kept 8 channels while the conv
+    before it shrank, and a ConvTranspose2d(8, 8), which mixes channels, had
+    the prune carried straight through it to the conv after; each group
+    pruned fine and left a model that failed on its next forward pass. Such
+    a module is now refused when the group is computed, naming the fix."""
+    model = _conv_norm_conv(middle)
+    x = torch.randn(1, 3, 6, 6)
+    with pytest.raises(NotImplementedError, match=r"'1' \(\w+\) owns weights or buffers but has no module rule"):
+        DependencyGraph(model, x).get_pruning_group("0", torch.tensor([0, 2, 3, 5, 6]))
+    assert model[0].out_channels == 8 and model(x).shape == (1, 4, 6, 6)
+
+
+@pytest.mark.parametrize("norm", [nn.SyncBatchNorm(8), nn.InstanceNorm2d(8, affine=True)], ids=["syncbn", "instancenorm"])
+def test_every_batchnorm_and_instancenorm_is_pruned_with_its_conv(norm):
+    """Open/closed: the BatchNorm rule was registered for `BatchNorm1d` and
+    `BatchNorm2d`, so `SyncBatchNorm` (what `convert_sync_batchnorm` leaves
+    in a model trained with DDP -- a sibling of those, not a subclass) and an
+    affine `InstanceNorm2d` had no rule. They were passed through unpruned,
+    and the model failed on its next forward pass. One rule now covers every
+    `_BatchNorm` and `_InstanceNorm`."""
+    model = _conv_norm_conv(norm)
+    with torch.no_grad():
+        model[1].weight.uniform_(0.5, 1.5)
+    weight = model[1].weight.detach().clone()
+    keep = torch.tensor([0, 2, 3, 5, 6])
+    x = torch.randn(2, 3, 6, 6)
+
+    group = DependencyGraph(model, x).get_pruning_group("0", keep)
+    assert set(group.output_targets) == {"0", "1"} and set(group.input_targets) == {"3"}
+    group.prune()
+    assert type(model[1]) is type(norm) and model[1].num_features == 5
+    assert torch.equal(model[1].weight, weight[keep]) and model(x).shape == (2, 4, 6, 6)
+
+
+def test_masking_a_batchnorm_without_affine_or_running_stats_is_a_no_op():
+    """A `BatchNorm2d(affine=False)` that tracks running statistics can't be
+    masked (its running mean turns a zeroed channel into a constant), and
+    the rule refused every `affine=False` BatchNorm for that reason. One
+    that normalizes with the batch's own statistics has nothing to mask --
+    a zeroed channel already comes out zero -- so it no longer refuses."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(3, 8, 1), nn.BatchNorm2d(8, affine=False, track_running_stats=False), nn.Conv2d(8, 2, 1))
+    reference = copy.deepcopy(model)
+    x = torch.randn(4, 3, 4, 4)
+    keep = torch.tensor([0, 1, 4, 5])
+    DependencyGraph(reference, x).get_pruning_group("0", keep).prune()
+
+    group = DependencyGraph(model, x).get_pruning_group("0", keep)
+    group.mask()
+    masked = model(x)
+    group.commit_and_compress()
+    assert torch.allclose(model(x), reference(x), atol=1e-5) and torch.allclose(masked, reference(x), atol=1e-5)
+
+
+class _CalledTwice(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem, self.conv = nn.Conv2d(3, 6, 1), nn.Conv2d(6, 6, 3, padding=1)
+        self.head_a, self.head_b = nn.Conv2d(6, 2, 1), nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        y1 = self.conv(self.stem(x))
+        y2 = self.conv(torch.relu(y1))  # the same conv, its weights shared by both calls
+        return self.head_a(y1) + self.head_b(y2)
+
+
+def test_a_module_called_twice_is_refused():
+    """A module called twice has one set of weights for both calls, but the
+    graph kept one node per module -- the last call -- and walked only that
+    call's consumers. `head_b` shrank, `head_a` and the second call's own
+    input didn't, and the pruned model failed on its next forward pass."""
+    model = _CalledTwice().eval()
+    x = torch.randn(1, 3, 6, 6)
+    with pytest.raises(NotImplementedError, match="'conv' is called 2 times"):
+        DependencyGraph(model, x).get_pruning_group("conv", torch.tensor([0, 1, 2, 3]))
+    assert model.conv.out_channels == 6
+
+
+class _CatOfOneTensor(nn.Module):
+    def __init__(self, second):
+        super().__init__()
+        self.second = second
+        self.a, self.after = nn.Conv2d(3, 4, 1), nn.Conv2d(8, 2, 1)
+
+    def forward(self, x):
+        y = self.a(x)
+        return self.after(torch.cat([y, torch.relu(y) if self.second == "relu" else y], 1))
+
+
+@pytest.mark.parametrize("second", ["relu", "same"])
+def test_cat_of_two_pruned_branches_carries_both_on(second):
+    """Each pruned branch of a `cat` used to `forward` from it, and the walk
+    skips a node it has already left: with `cat([y, relu(y)])` only the
+    first branch to arrive took its columns out of `after`, and with
+    `cat([y, y])` only the first copy did -- `after` kept 6 inputs for a
+    `cat` that now produced 4. Every branch is now one part of what the
+    `cat` loses, carried on together."""
+    torch.manual_seed(0)
+    model = _CatOfOneTensor(second).eval()
+    x = torch.randn(1, 3, 5, 5)
+    reference = copy.deepcopy(model)
+    with torch.no_grad():
+        reference.after.weight[:, [1, 3, 5, 7]] = 0
+
+    group = DependencyGraph(model, x).get_pruning_group("a", torch.tensor([0, 2]))
+    assert group.input_targets["after"].tolist() == [1, 3, 5, 7]
+    group.prune()
+    assert torch.allclose(model(x), reference(x), atol=1e-6)
+
+
+def test_a_refused_rebuild_leaves_the_model_as_it_was():
+    """`.prune()` swapped each module in as soon as it was rebuilt, so when
+    the conv after a pruned layer refused (its weight is computed by weight
+    norm), the pruned conv and BatchNorm were already in: a half-pruned
+    model that failed on its next forward pass. Every replacement is now
+    built before any is swapped in."""
+    from torch.nn.utils.parametrizations import weight_norm
+
+    model = _conv_norm_conv(nn.BatchNorm2d(8))
+    model[3] = weight_norm(model[3])
+    x = torch.randn(1, 3, 6, 6)
+    before = model(x)
+    group = DependencyGraph(model, x).get_pruning_group("0", torch.tensor([0, 1, 2, 3]))
+    with pytest.raises(NotImplementedError, match="computed from other tensors"):
+        group.prune()
+    assert model[0].out_channels == 8 and model[1].num_features == 8
+    assert torch.equal(model(x), before)
+
+
+def test_a_group_refuses_to_act_on_a_model_resized_since_it_was_computed():
+    """A group's indices name channels as they were when it was computed.
+    `.prune()` twice on one group pruned the same positions again -- 8
+    channels down to 4 for a group that keeps 6 -- and two groups computed
+    up front for the two branches of a `cat` removed the wrong input of
+    `after` with the second one (offset by the first branch's old width).
+    Both silently. A group now refuses once the model has been resized."""
+    model = _conv_norm_conv(nn.BatchNorm2d(8))
+    x = torch.randn(1, 3, 6, 6)
+    group = DependencyGraph(model, x).get_pruning_group("0", torch.tensor([2, 3, 4, 5, 6, 7]))
+    group.prune()
+    with pytest.raises(RuntimeError, match="resized since this pruning group was computed"):
+        group.prune()
+    assert model[0].out_channels == 6
+
+    model = ConcatBranches()
+    dep = DependencyGraph(model, torch.randn(1, 3, 8, 8))
+    first = dep.get_pruning_group("branch_a", torch.tensor([0, 1]))
+    second = dep.get_pruning_group("branch_b", torch.tensor([1, 2, 3, 4, 5]))
+    first.prune()
+    for act in (second.prune, second.mask, second.commit_and_compress):
+        with pytest.raises(RuntimeError, match="resized since"):
+            act()
+    dep.get_pruning_group("branch_b", torch.tensor([1, 2, 3, 4, 5])).prune()  # recomputed: fine
+    assert model.after.in_channels == 2 + 5
+
+
+def test_masking_does_not_make_a_group_stale():
+    """Masking renames `weight` to `weight_orig` but resizes nothing, so it
+    mustn't trip the check above: two groups masked in turn, then each
+    committed, as long as neither resizes what the other was computed on."""
+    model = ConcatBranches()
+    x = torch.randn(1, 3, 8, 8)
+    dep = DependencyGraph(model, x)
+    group = dep.get_pruning_group("branch_a", torch.tensor([0, 1, 3]))
+    group.mask()
+    group.mask()  # masking again changes no shape either
+    group.commit_and_compress()
+    assert model.branch_a.out_channels == 3 and model.after.in_channels == 9
+
+
+def test_prune_rebuilds_a_masked_layer_from_its_current_weights():
+    """`torch.nn.utils.prune` recomputes a masked layer's `weight` only in a
+    forward pre-hook, so after an optimizer step it is one step stale.
+    `.prune()` on a masked group sliced that stale attribute -- the layer
+    came back as it was before the last step of fine-tuning, silently. It
+    now reads `weight_orig * weight_mask` as it is."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.Conv2d(8, 4, 1))
+    x = torch.randn(2, 3, 6, 6)
+    group = DependencyGraph(model, x).get_pruning_group("0", torch.tensor([0, 1, 2, 3, 4, 5]))
+    group.mask()
+    model(x).sum().backward()
+    torch.optim.SGD(model.parameters(), lr=1.0).step()
+    live = (model[0].weight_orig * model[0].weight_mask).detach().clone()
+
+    group.prune()
+    assert torch.equal(model[0].weight, live[:6])
+
+
+def test_prune_model_scores_a_masked_layer_by_its_current_weights():
+    """The same staleness reached scoring: `prune_model` ranked a masked
+    layer's channels by the `weight` the last forward pass left, so after
+    fine-tuning it pruned the channels that *were* weakest (unless it traced
+    a new graph first, whose forward pass happened to refresh it)."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.Conv2d(8, 4, 1))
+    x = torch.randn(1, 3, 6, 6)
+    dep = DependencyGraph(model, x)
+    dep.get_pruning_group("0", torch.tensor([0, 1, 2, 3, 4, 5, 6])).mask()  # channel 7; the hook computes `weight`
+    with torch.no_grad():  # an "optimizer step" that reverses the channels' L1 order
+        model[0].weight_orig.mul_(torch.logspace(2, -2, 8).view(8, 1, 1, 1) / model[0].weight_orig.abs().sum((1, 2, 3), keepdim=True))
+    prune_model(model, x, "0", prune_fraction=3 / 8, method="l1", dependency_graph=dep)
+    assert model[0].out_channels == 5
+    # live L1 is decreasing in the channel index (7 is masked to 0): 7, 6, 5 go; 0..4 stay
+    assert torch.allclose(model[0].weight.abs().sum((1, 2, 3)), torch.logspace(2, -2, 8)[:5], rtol=1e-4)
+
+
+def test_get_pruning_group_refuses_to_remove_every_channel():
+    """`prune_model` always keeps a channel, but `get_pruning_group` took an
+    empty `keep_idx` and removed them all -- a zero-width Linear that still
+    ran and fed the next layer nothing, so the model just output its bias."""
+    model = nn.Sequential(nn.Linear(3, 4), nn.ReLU(), nn.Linear(4, 2))
+    with pytest.raises(ValueError, match="keeps none of the 4 output channels of '0'"):
+        DependencyGraph(model, torch.randn(2, 3)).get_pruning_group("0", torch.tensor([], dtype=torch.long))
+    assert model[0].out_features == 4
+
+
+class _TwoInputs(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a, self.b, self.head = nn.Conv2d(3, 4, 1), nn.Conv2d(2, 4, 1), nn.Conv2d(4, 2, 1)
+
+    def forward(self, x, y):
+        return self.head(self.a(x) + self.b(y))
+
+
+def test_a_model_with_several_inputs_is_traced_and_pruned():
+    """Open/closed: `example_input` was one tensor, so a model whose
+    `forward` takes two could not be traced at all. A tuple is now unpacked
+    into positional arguments, by `DependencyGraph` and `prune_model`
+    alike."""
+    torch.manual_seed(0)
+    model = _TwoInputs().eval()
+    inputs = (torch.randn(1, 3, 4, 4), torch.randn(1, 2, 4, 4))
+    group = prune_model(model, inputs, "a", prune_fraction=0.5)
+    assert set(group.output_targets) == {"a", "b"} and set(group.input_targets) == {"head"}
+    assert model(*inputs).shape == (1, 2, 4, 4)
+
+
+class _TokenMLP(nn.Module):
+    """A Linear block over a `[N, T, features]` sequence, its hidden
+    features gated per token by a `[N, T, 1]` map."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1, self.gate, self.fc2 = nn.Linear(6, 8), nn.Linear(6, 1), nn.Linear(8, 6)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)) * torch.sigmoid(self.gate(x)))
+
+
+def test_a_linear_over_a_sequence_is_pruned_on_its_feature_dimension():
+    """Open/closed: channels were dim 1 everywhere, which for a `[N, T,
+    features]` Linear output is `T`. The `[N, T, 1]` gate looked like it
+    carried the pruned channels (it has `T` of them), so the 1-output gate
+    Linear was told to lose `fc1`'s features. A layer's rule now says where
+    its channels are (`ModuleRule.channel_dim`, the last dim for a Linear)
+    and the walk follows them there: the gate is broadcast across the
+    features and shares none."""
+    torch.manual_seed(0)
+    model = _TokenMLP().eval()
+    x = torch.randn(2, 5, 6)
+    reference = copy.deepcopy(model)
+    with torch.no_grad():
+        reference.fc2.weight[:, [1, 4, 6]] = 0
+
+    group = DependencyGraph(model, x).get_pruning_group("fc1", torch.tensor([0, 2, 3, 5, 7]))
+    assert set(group.output_targets) == {"fc1"} and set(group.input_targets) == {"fc2"}
+    group.prune()
+    assert model.gate.out_features == 1 and torch.allclose(model(x), reference(x), atol=1e-6)
+
+
+class _ScaledFeatures(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1, self.fc2 = nn.Linear(6, 6), nn.Linear(6, 3)
+        self.scale = nn.Parameter(torch.ones(6))  # one per feature, as in LayerScale
+
+    def forward(self, x):
+        return self.fc2(self.fc1(x) * self.scale)
+
+
+class _LinearOverWidth(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv, self.fc = nn.Conv2d(3, 4, 1), nn.Linear(8, 3)  # fc maps the last (width) dim
+
+    def forward(self, x):
+        return self.fc(self.conv(x))
+
+
+@pytest.mark.parametrize(
+    "model, x, layer, match",
+    [
+        (_ScaledFeatures(), torch.randn(2, 5, 6), "fc1", "'scale', a parameter or buffer used directly"),
+        (_LinearOverWidth(), torch.randn(1, 3, 2, 8), "conv", r"'fc' \(Linear\) keeps its channels on dim 3"),
+    ],
+    ids=["per-feature-parameter", "linear-over-another-dim"],
+)
+def test_channels_on_another_dimension_are_refused_not_misread(model, x, layer, match):
+    """With channels read from dim 1, a `[features]` parameter multiplying
+    a `[N, T, features]` output was too short to reach dim 1, so it "shared
+    no channels" and kept all 6 while `fc1` lost 2; and a Linear over a
+    conv output's *width* had its inputs pruned by the conv's channel
+    indices. Both pruned and broke the model's next forward pass. Both are
+    now refused when the group is computed."""
+    with pytest.raises(NotImplementedError, match=match):
+        DependencyGraph(model, x).get_pruning_group(layer, torch.tensor([0, 1]))
+
+
+class _GatedSkip(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a, self.gate, self.main, self.head = nn.Conv2d(3, 6, 1), nn.Conv2d(3, 1, 1), nn.Conv2d(3, 6, 1), nn.Conv2d(6, 2, 1)
+
+    def forward(self, x):
+        return self.head(self.main(x) + self.a(x) * torch.sigmoid(self.gate(x)))
+
+
+def test_a_gated_skip_branch_leads_back_to_the_gated_tensor():
+    """The walk back along a skip branch followed a merge only if every
+    operand had the pruned channel count, so a branch gated by a `[N, 1, H,
+    W]` map was refused at the `*`. It now follows the operands that carry
+    the channels, as the forward walk already did, and finds `a`."""
+    torch.manual_seed(0)
+    model = _GatedSkip().eval()
+    x = torch.randn(1, 3, 4, 4)
+    reference = copy.deepcopy(model)
+    with torch.no_grad():
+        reference.head.weight[:, [4, 5]] = 0
+
+    group = DependencyGraph(model, x).get_pruning_group("main", torch.tensor([0, 1, 2, 3]))
+    assert set(group.output_targets) == {"main", "a"} and model.gate.out_channels == 1
+    group.prune()
+    assert torch.allclose(model(x), reference(x), atol=1e-6)
+
+
+def test_prune_model_refuses_a_graph_traced_from_another_model():
+    """Dependency inversion: `prune_model` took the model twice -- `model`
+    and `dependency_graph.model` -- and, given a layer by name, scored it in
+    one and pruned the other with those scores, silently."""
+    torch.manual_seed(0)
+    a = nn.Sequential(nn.Conv2d(3, 8, 1), nn.ReLU(), nn.Conv2d(8, 2, 1))
+    b = copy.deepcopy(a)
+    x = torch.randn(1, 3, 4, 4)
+    with pytest.raises(ValueError, match="traced from a different model"):
+        prune_model(b, x, "0", prune_fraction=0.5, dependency_graph=DependencyGraph(a, x))
+    assert a[0].out_channels == b[0].out_channels == 8
+
+
+def test_pruning_group_targets_are_read_only():
+    """Interface segregation: the target maps were the group's own dicts,
+    so a caller writing into them skipped the check that two paths agree on
+    a shared layer. They are read-only views; targets go through
+    `add_output_target` / `add_input_target`."""
+    model = _conv_norm_conv(nn.BatchNorm2d(8))
+    group = DependencyGraph(model, torch.randn(1, 3, 6, 6)).get_pruning_group("0", torch.tensor([0, 1, 2]))
+    for targets in (group.output_targets, group.input_targets, group.special_targets):
+        with pytest.raises(TypeError):
+            targets["3"] = torch.tensor([0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_a_cuda_model_prunes_with_every_selection_rule():
+    """Dependency inversion: index tensors landed on whichever device made
+    them -- a CUDA weight's scores gave CUDA indices -- while
+    `complement_indices` built its mask on the CPU and the slicing
+    primitives indexed CUDA weights with CPU indices, so pruning a model on
+    a GPU failed at the first prune (and K-Means at its CPU generator).
+    Indices now live on the CPU and move to the data's device to index it."""
+    for method in ("max_k", "l1", "random", "kmeans"):
+        torch.manual_seed(0)
+        model = _conv_norm_conv(nn.BatchNorm2d(8)).cuda()
+        x = torch.randn(1, 3, 6, 6, device="cuda")
+        group = prune_model(model, x, "0", prune_fraction=0.25, method=method)
+        assert all(idx.device.type == "cpu" for idx in group.output_targets.values()), method
+        assert model[0].weight.device.type == "cuda" and model(x).shape == (1, 4, 6, 6), method

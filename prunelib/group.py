@@ -26,17 +26,47 @@ This used to be the top half of `graph.py`. It is its own module because
 changing how a decision is applied (a new rebuild path, masking) and
 changing how one is found (tracing, propagation) are different reasons to
 edit the code.
+
+A group is computed against the model as it was at that moment, so it
+refuses to act once the model has been resized since (`tensor_layout`):
+channel `i` of a layer is not the same channel after another prune has
+renumbered it. Two groups computed up front for two branches of a `cat`,
+then applied one after the other, used to remove the wrong input channels
+of the layer after the `cat` with the second one; and `.prune()` called
+twice on one group pruned the same positions again, silently.
 """
 from __future__ import annotations
 
+import itertools
+from types import MappingProxyType
 from typing import Callable, Mapping
 
 import torch
 import torch.nn as nn
+import torch.nn.utils.prune as torch_prune
 
 from .module_rules import ModuleRule, find_module_rule
 
 SpecialHandler = Callable[[nn.Module, torch.Tensor], nn.Module]
+
+
+def tensor_layout(model: nn.Module) -> dict[str, torch.Size]:
+    """Every parameter's and buffer's qualified name and shape: what a prune
+    changes, however it was done. `torch.nn.utils.prune`'s masking is read
+    through -- `weight_orig` stands for `weight`, its `weight_mask` buffer
+    isn't listed -- since masking changes no shape. `DependencyGraph`
+    re-traces when this changes; a `PruningGroup` refuses to act."""
+    layout = {}
+    for prefix, module in model.named_modules():
+        masked = {h._tensor_name for h in module._forward_pre_hooks.values() if isinstance(h, torch_prune.BasePruningMethod)}
+        tensors = itertools.chain(module.named_parameters(recurse=False), module.named_buffers(recurse=False))
+        for name, t in tensors:
+            if name.endswith("_mask") and name[: -len("_mask")] in masked:
+                continue
+            if name.endswith("_orig") and name[: -len("_orig")] in masked:
+                name = name[: -len("_orig")]
+            layout[f"{prefix}.{name}" if prefix else name] = t.shape
+    return layout
 
 
 def _set_submodule(root: nn.Module, qualified_name: str, new_module: nn.Module) -> None:
@@ -90,45 +120,80 @@ class PruningGroup:
     detect two paths disagreeing about the same module, and
     `add_special_target`; `module_rules` (default: the global
     `module_rules.MODULE_RULES`) decides how each targeted module is
-    rebuilt."""
+    rebuilt. The three target maps are read-only views: a caller writing
+    into them directly used to bypass that disagreement check.
+
+    Apply a group before computing the next one. `.prune()`, `.mask()` and
+    `.commit_and_compress()` raise `RuntimeError` once the model has been
+    resized since the group was computed (see the module docstring)."""
 
     def __init__(self, model: nn.Module, module_rules: Mapping[type, ModuleRule] | None = None):
         self.model = model
-        self.output_targets: dict[str, torch.Tensor] = {}
-        self.input_targets: dict[str, torch.Tensor] = {}
-        self.special_targets: dict[str, tuple[SpecialHandler, torch.Tensor]] = {}
+        self._output_targets: dict[str, torch.Tensor] = {}
+        self._input_targets: dict[str, torch.Tensor] = {}
+        self._special_targets: dict[str, tuple[SpecialHandler, torch.Tensor]] = {}
         self.module_rules = module_rules
+        self._layout = tensor_layout(model)
+
+    @property
+    def output_targets(self) -> Mapping[str, torch.Tensor]:
+        return MappingProxyType(self._output_targets)
+
+    @property
+    def input_targets(self) -> Mapping[str, torch.Tensor]:
+        return MappingProxyType(self._input_targets)
+
+    @property
+    def special_targets(self) -> Mapping[str, tuple[SpecialHandler, torch.Tensor]]:
+        return MappingProxyType(self._special_targets)
 
     def add_output_target(self, name: str, idx: torch.Tensor) -> bool:
         """Remove output channels `idx` of module `name`. Returns False if
         this exact target was already recorded; raises `ValueError` if a
         *different* one was."""
-        return _record_target(self.output_targets, name, idx)
+        return _record_target(self._output_targets, name, idx)
 
     def add_input_target(self, name: str, idx: torch.Tensor) -> bool:
         """Remove input channels `idx` of module `name` (see
         `add_output_target`)."""
-        return _record_target(self.input_targets, name, idx)
+        return _record_target(self._input_targets, name, idx)
 
     def add_special_target(self, name: str, handler: SpecialHandler, keep_idx: torch.Tensor) -> None:
         """Rebuild module `name` as `handler(module, keep_idx)` on `.prune()`,
         instead of through its module rule."""
-        self.special_targets[name] = (handler, keep_idx)
+        self._special_targets[name] = (handler, keep_idx)
+
+    def _check_current(self) -> None:
+        if tensor_layout(self.model) != self._layout:
+            raise RuntimeError(
+                "the model has been resized since this pruning group was computed (by this group's own .prune(), "
+                "or another group's), so its channel indices may no longer name the channels they did -- call "
+                "DependencyGraph.get_pruning_group again for a group that matches the model as it is now"
+            )
 
     def prune(self) -> nn.Module:
         """Rebuild every targeted module with the recorded indices removed,
         and write each one back onto `self.model` in place. Returns the
-        (mutated) model for convenience."""
-        for name in dict.fromkeys([*self.output_targets, *self.input_targets]):
-            module = self.model.get_submodule(name)
-            new_module = self._rule(name, module).rebuild(module, self.output_targets.get(name), self.input_targets.get(name))
-            _set_submodule(self.model, name, new_module)
+        (mutated) model for convenience.
 
-        for name, (handler, keep_idx) in self.special_targets.items():
+        Every replacement is built before any is swapped in, so a rule or
+        handler that refuses (a weight computed by weight norm, say) leaves
+        the model as it was. Each used to be swapped in as soon as it was
+        built, so a refusal halfway through left a half-pruned model that
+        failed on its next forward pass. (A handler that mutates its module
+        in place before refusing is its own business.)"""
+        self._check_current()
+        replacements = {}
+        for name in dict.fromkeys([*self._output_targets, *self._input_targets]):
             module = self.model.get_submodule(name)
-            new_module = handler(module, keep_idx)
-            _set_submodule(self.model, name, new_module)
+            replacements[name] = self._rule(name, module).rebuild(
+                module, self._output_targets.get(name), self._input_targets.get(name)
+            )
+        for name, (handler, keep_idx) in self._special_targets.items():
+            replacements[name] = handler(self.model.get_submodule(name), keep_idx)
 
+        for name, new_module in replacements.items():
+            _set_submodule(self.model, name, new_module)
         return self.model
 
     def _rule(self, name: str, module: nn.Module) -> ModuleRule:
@@ -158,16 +223,18 @@ class PruningGroup:
         for a group with `special_targets`: a handler rebuilds its module in
         one step, with nothing to reparametrize, so masking would leave that
         module unmasked while fine-tuning -- call `.prune()` instead. A
-        module rule can refuse too (a `BatchNorm` with `affine=False`); any
+        module rule can refuse too (a `BatchNorm` with running statistics
+        but `affine=False`); any
         modules masked before the refusal are still rebuilt correctly by
         `.prune()`, which only reads their kept channels.
         """
-        if self.special_targets:
+        self._check_current()
+        if self._special_targets:
             raise NotImplementedError(
-                f"{sorted(self.special_targets)} are rebuilt by a special handler, which can't be "
+                f"{sorted(self._special_targets)} are rebuilt by a special handler, which can't be "
                 f"masked first -- call .prune() on this group instead"
             )
-        for name, idx in self.output_targets.items():
+        for name, idx in self._output_targets.items():
             if idx.numel() == 0:
                 continue
             module = self.model.get_submodule(name)
@@ -188,7 +255,8 @@ class PruningGroup:
         and this call. `commit_mask` is a no-op for a module that was never
         masked, so this is also safe to call on a group `.mask()` was never
         called on (identical to plain `.prune()` in that case)."""
-        for name in self.output_targets:
+        self._check_current()
+        for name in self._output_targets:
             module = self.model.get_submodule(name)
             self._rule(name, module).commit_mask(module)
         return self.prune()

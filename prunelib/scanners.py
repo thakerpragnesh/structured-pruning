@@ -53,7 +53,7 @@ class CoActivationScanner:
         rate = self.firing_rate(activation_mask)
         keep = (rate <= self.firing_rate_ceiling).nonzero(as_tuple=True)[0]
 
-        sim = torch.zeros(n_units, n_units)
+        sim = torch.zeros(n_units, n_units, device=activation_mask.device)  # not the CPU: `sim[keep...] = jac` below
         if keep.numel() < 2:
             return sim
 

@@ -24,7 +24,7 @@ from .selection import Selector, prune_count, select_prune_indices_by_method
 
 def prune_model(
     model: nn.Module,
-    example_input: torch.Tensor,
+    example_input: torch.Tensor | tuple[torch.Tensor, ...],
     layer: nn.Module | str,
     prune_fraction: float,
     method: Union[str, Selector] = "max_k",
@@ -47,7 +47,10 @@ def prune_model(
     pass the same one back in across several `prune_model` calls on the same
     model (the graph's topology doesn't change between prunes, only channel
     counts do, same as a `DependencyGraph` used directly). Otherwise a new
-    one is traced from `example_input`.
+    one is traced from `example_input` (a tensor, or a tuple of them for a
+    model with several inputs). A graph traced from another model raises
+    `ValueError`: `layer` named by string used to be scored in `model` and
+    pruned, with those scores, in the graph's model.
 
     `method` is anything `selection.select_prune_indices_by_method` accepts:
     a saliency scorer (`"max_k"`, `"l1"`, `"l2"`, `"random"`), `"kmeans"`
@@ -64,6 +67,8 @@ def prune_model(
     """
     if not 0.0 <= prune_fraction < 1.0:
         raise ValueError(f"prune_fraction must be in [0, 1), got {prune_fraction}")
+    if dependency_graph is not None and dependency_graph.model is not model:
+        raise ValueError("dependency_graph was traced from a different model than the one passed in")
 
     module = model.get_submodule(layer) if isinstance(layer, str) else layer
     rule = find_module_rule(module, None if dependency_graph is None else dependency_graph.module_rules)

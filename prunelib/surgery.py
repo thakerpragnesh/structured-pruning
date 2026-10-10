@@ -42,6 +42,12 @@ were still constructed as a fresh `nn.Conv2d` / `nn.Linear`: a subclass
 (a weight-standardized conv, say) silently became the plain base class and
 computed something else, a frozen layer came back trainable, and a layer
 of a model in eval mode came back in training mode.
+
+A masked module's tensors are read with `live_tensor` -- what its next
+forward pass computes from `weight_orig * weight_mask` -- never from the
+`weight` attribute `torch.nn.utils.prune` leaves behind, which is only
+refreshed by a forward pass and so is one optimizer step stale while
+fine-tuning with a mask (see `live_tensor`).
 """
 from __future__ import annotations
 
@@ -51,7 +57,25 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.prune as torch_prune
 
-from .indices import expand_blocks
+from .indices import as_index, expand_blocks, on_device_of
+
+
+def live_tensor(module: nn.Module, name: str = "weight") -> torch.Tensor | None:
+    """`module.<name>` as `module`'s next forward pass will compute it.
+
+    For a tensor masked through `torch.nn.utils.prune` (`masking.
+    mask_channels`), that is `<name>_orig * <name>_mask`, worked out now.
+    The `module.<name>` attribute itself is only recomputed by a forward
+    pre-hook, so after an optimizer step it still holds the values from the
+    forward pass before the step. `PruningGroup.prune()` on a masked group,
+    `prune_model` scoring a masked layer and `vgg.mask_vgg_layer`'s next
+    selection all read that attribute, so after fine-tuning with a mask they
+    rebuilt and scored the layer as it was one step earlier, silently. An
+    unmasked tensor is returned as it is."""
+    for hook in module._forward_pre_hooks.values():
+        if isinstance(hook, torch_prune.BasePruningMethod) and hook._tensor_name == name:
+            return hook.apply_mask(module)
+    return getattr(module, name)
 
 
 def _resized_copy(module: nn.Module, tensors: dict[str, torch.Tensor | None], **attrs) -> nn.Module:
@@ -62,14 +86,14 @@ def _resized_copy(module: nn.Module, tensors: dict[str, torch.Tensor | None], **
 
     A masked module (`masking.mask_channels`, i.e. `torch.nn.utils.prune`'s
     reparametrization) comes back unmasked, its masked values baked in: the
-    caller sliced `module.weight`, which already has the mask applied. A
-    tensor that is computed from others -- weight norm, spectral norm, a
-    `torch.nn.utils.parametrize` parametrization -- raises rather than be
-    resized here and silently recomputed at its old size."""
+    caller sliced `live_tensor(module, "weight")`, which has the mask
+    applied. A tensor that is computed from others -- weight norm, spectral
+    norm, a `torch.nn.utils.parametrize` parametrization -- raises rather
+    than be resized here and silently recomputed at its old size."""
     pruning_hooks = {k: h for k, h in module._forward_pre_hooks.items() if isinstance(h, torch_prune.BasePruningMethod)}
     masked = {h._tensor_name for h in pruning_hooks.values()}
     # A masked tensor the caller didn't resize keeps its (masked) value.
-    tensors = {**tensors, **{name: getattr(module, name) for name in sorted(masked) if name not in tensors}}
+    tensors = {**tensors, **{name: live_tensor(module, name) for name in sorted(masked) if name not in tensors}}
     for name in tensors:
         if name not in module._parameters and name not in module._buffers and name not in masked:
             raise NotImplementedError(
@@ -101,16 +125,17 @@ def _resized_copy(module: nn.Module, tensors: dict[str, torch.Tensor | None], **
     return new
 
 
-def _take(weight: torch.Tensor, bias: torch.Tensor | None, keep_out, keep_in):
-    """Index `weight`'s output rows (dim 0, and `bias` with them) and input
-    columns (dim 1). `None` keeps that whole dimension."""
+def _take(module: nn.Module, keep_out, keep_in):
+    """`module`'s live weight with only output rows `keep_out` (dim 0, and
+    the bias with them) and input columns `keep_in` (dim 1). `None` keeps
+    that whole dimension."""
+    weight, bias = live_tensor(module, "weight"), live_tensor(module, "bias")
     if keep_out is not None:
-        keep_out = keep_out.to(torch.long)
-        weight = weight.index_select(0, keep_out)
+        weight = weight.index_select(0, on_device_of(keep_out, weight))
         if bias is not None:
-            bias = bias.index_select(0, keep_out)
+            bias = bias.index_select(0, on_device_of(keep_out, bias))
     if keep_in is not None:
-        weight = weight.index_select(1, keep_in.to(torch.long))
+        weight = weight.index_select(1, on_device_of(keep_in, weight))
     return weight, bias
 
 
@@ -142,7 +167,7 @@ def slice_conv2d(
             f"slice_conv2d handles ungrouped convs (groups=1) only, got groups={conv.groups}"
             + ("; use slice_depthwise_conv2d for a depthwise conv" if is_depthwise_conv(conv) else "")
         )
-    weight, bias = _take(conv.weight, conv.bias, keep_out, keep_in)
+    weight, bias = _take(conv, keep_out, keep_in)
     return _resized_copy(conv, {"weight": weight, "bias": bias}, in_channels=weight.shape[1], out_channels=weight.shape[0])
 
 
@@ -153,7 +178,7 @@ def slice_depthwise_conv2d(conv: nn.Conv2d, keep: torch.Tensor) -> nn.Conv2d:
     `groups` shrinks to match."""
     if not is_depthwise_conv(conv):
         raise ValueError(f"expected a depthwise conv (groups == in == out > 1), got {conv}")
-    weight, bias = _take(conv.weight, conv.bias, keep, None)
+    weight, bias = _take(conv, keep, None)
     n = weight.shape[0]
     return _resized_copy(conv, {"weight": weight, "bias": bias}, in_channels=n, out_channels=n, groups=n)
 
@@ -165,25 +190,23 @@ def slice_linear(
     """New Linear keeping output features `keep_out` (rows of weight and
     bias) and input features `keep_in` (columns of weight) of `linear`
     (`None` keeps all of that dimension)."""
-    weight, bias = _take(linear.weight, linear.bias, keep_out, keep_in)
+    weight, bias = _take(linear, keep_out, keep_in)
     return _resized_copy(linear, {"weight": weight, "bias": bias}, in_features=weight.shape[1], out_features=weight.shape[0])
 
 
 @torch.no_grad()
-def slice_batchnorm(bn: nn.modules.batchnorm._BatchNorm, keep: torch.Tensor) -> nn.modules.batchnorm._BatchNorm:
-    """New BatchNorm of the same type keeping channels `keep`.
+def slice_batchnorm(bn: nn.modules.batchnorm._NormBase, keep: torch.Tensor) -> nn.modules.batchnorm._NormBase:
+    """New BatchNorm (or InstanceNorm) of the same type keeping channels `keep`.
 
     Carrying running statistics across is a deliberate choice: the original
     omitted this, so the forward pass still ran but produced silently wrong
     activations after pruning (no error, just bad numbers). Copying them
     keeps the pruned model numerically sane before any fine-tuning happens.
     """
-    keep = keep.to(torch.long)
-    tensors = {}
-    if bn.affine:
-        tensors.update(weight=bn.weight.index_select(0, keep), bias=bn.bias.index_select(0, keep))
-    if bn.track_running_stats:
-        tensors.update(running_mean=bn.running_mean.index_select(0, keep), running_var=bn.running_var.index_select(0, keep))
+    keep = as_index(keep)
+    names = (["weight", "bias"] if bn.affine else []) + (["running_mean", "running_var"] if bn.track_running_stats else [])
+    tensors = {name: live_tensor(bn, name) for name in names}
+    tensors = {name: t.index_select(0, on_device_of(keep, t)) for name, t in tensors.items()}
     return _resized_copy(bn, tensors, num_features=keep.numel())  # num_batches_tracked is copied as-is
 
 
@@ -253,7 +276,7 @@ def prune_attention_heads(
             f"output projection expects {output.in_features}"
         )
 
-    keep_heads = keep_heads.to(torch.long)
+    keep_heads = as_index(keep_heads)
     out_of_range = keep_heads[(keep_heads < 0) | (keep_heads >= num_heads)]
     if out_of_range.numel():
         raise ValueError(

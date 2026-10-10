@@ -33,24 +33,39 @@ def count_encoder_params(module: nn.Module, encoder_attr: str = "encoder") -> in
 @torch.no_grad()
 def measure_latency(
     module: nn.Module,
-    example_input: torch.Tensor,
+    example_input: torch.Tensor | tuple[torch.Tensor, ...],
     n_warmup: int = 10,
     n_iters: int = 50,
 ) -> float:
-    """Mean forward-pass latency in milliseconds, CPU wall-clock, measured
+    """Mean forward-pass latency in milliseconds, wall-clock, measured
     in eval mode. Every submodule's own train/eval mode is restored
     afterwards, mixed modes included (a frozen BatchNorm kept in eval inside
     a training model). It used to be left in eval mode, so a model timed
     mid-training quietly stopped using dropout and updating BatchNorm
-    statistics."""
+    statistics.
+
+    A tuple `example_input` is unpacked into positional arguments, as in
+    `DependencyGraph` (only one tensor used to be accepted). On a CUDA
+    input the GPU is synchronized before each clock reading: kernels run
+    asynchronously, so without it the timing measured how fast they were
+    queued."""
+    inputs = example_input if isinstance(example_input, tuple) else (example_input,)
+    cuda = [t.device for t in inputs if isinstance(t, torch.Tensor) and t.is_cuda]
+
+    def sync():
+        for device in dict.fromkeys(cuda):
+            torch.cuda.synchronize(device)
+
     modes = [(m, m.training) for m in module.modules()]
     module.eval()
     try:
         for _ in range(n_warmup):
-            module(example_input)
+            module(*inputs)
+        sync()
         start = time.perf_counter()
         for _ in range(n_iters):
-            module(example_input)
+            module(*inputs)
+        sync()
         elapsed = time.perf_counter() - start
     finally:
         for m, training in modes:

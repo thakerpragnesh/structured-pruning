@@ -220,3 +220,45 @@ def test_vgg_surgery_does_not_need_torchvision():
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def _small_vgg(sync_bn=False):
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.features = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),
+        torch.nn.Conv2d(8, 6, 3, padding=1), torch.nn.BatchNorm2d(6), torch.nn.ReLU(), torch.nn.AdaptiveAvgPool2d(2),
+    )
+    model.classifier = torch.nn.Sequential(torch.nn.Linear(6 * 4, 3))
+    if sync_bn:
+        model.features = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model.features)
+    model.forward = lambda x: model.classifier(torch.flatten(model.features(x), 1))
+    return model.eval()
+
+
+def test_vgg_wiring_pairs_each_conv_with_a_sync_batchnorm_too():
+    """`vgg_conv_bn_positions` only recognized `BatchNorm2d`, so in a VGG
+    converted for DDP training (`SyncBatchNorm.convert_sync_batchnorm`)
+    every conv was pruned without its BatchNorm, and the model failed on its
+    next forward pass."""
+    model = _small_vgg(sync_bn=True)
+    assert vgg_conv_bn_positions(model.features) == [(0, 1), (3, 4)]
+    assert prune_vgg_layer(model, 0, 0.25) == 6
+    assert model.features[1].num_features == 6 and model(torch.randn(1, 3, 8, 8)).shape == (1, 3)
+
+
+def test_mask_vgg_layer_selects_by_the_current_masked_weights():
+    """The next masking iteration scored `conv.weight` -- what the mask's
+    forward pre-hook computed on the last forward pass -- so after an
+    optimizer step it chose channels by the weights of one step earlier.
+    It now scores `weight_orig * weight_mask` as it is."""
+    model = _small_vgg()
+    conv = model.features[0]
+    assert mask_vgg_layer(model, 0, 0.25, method="l1") == 2
+    survivors = surviving_channels(conv.weight_orig * conv.weight_mask)
+    with torch.no_grad():  # an "optimizer step" that makes the last survivors the weakest
+        norms = conv.weight_orig.abs().sum((1, 2, 3), keepdim=True)
+        conv.weight_orig.mul_(torch.logspace(2, -2, 8).view(8, 1, 1, 1) / norms)
+    mask_vgg_layer(model, 0, 0.25, method="l1")
+    newly = set(survivors.tolist()) - set(surviving_channels(conv.weight_orig * conv.weight_mask).tolist())
+    assert newly == set(survivors[-2:].tolist())

@@ -40,7 +40,7 @@ from typing import Callable
 
 import torch
 
-from .indices import complement_indices
+from .indices import as_index, complement_indices
 from .registry import Registry
 
 SALIENCY_METHODS: Registry = Registry("method")
@@ -123,11 +123,11 @@ def l2_saliency(weight: torch.Tensor) -> torch.Tensor:
 
 @register_saliency_method("random")
 def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-    """Random baseline score, one draw per output channel/neuron. Seed via `generator`."""
+    """Random baseline score, one draw per output channel/neuron. Seed via
+    `generator` (a CPU generator: the same seed gives the same draw on any
+    device), returned on `weight`'s device like every other scorer's."""
     out_ch = _channel_view(weight).shape[0]
-    if generator is not None:
-        return torch.rand(out_ch, generator=generator)
-    return torch.rand(out_ch)
+    return torch.rand(out_ch, generator=generator).to(weight.device)
 
 
 def compute_score(weight: torch.Tensor, method: str | Callable[..., torch.Tensor] = "max_k", **kwargs) -> torch.Tensor:
@@ -138,12 +138,28 @@ def compute_score(weight: torch.Tensor, method: str | Callable[..., torch.Tensor
     how D1 happened in the original codebase). `method` is any name in
     `SALIENCY_METHODS`, or a scorer itself (`(weight, **kwargs) ->
     Tensor[out]`); `kwargs` are forwarded to that scorer.
+
+    The scorer's answer is checked against that contract -- one score per
+    output channel, shape `(weight.shape[0],)` -- and anything else raises,
+    naming the method. A registered scorer used to be trusted: one that
+    reduced over the wrong axis (one score per *input* channel, say) had its
+    scores ranked anyway, and a channel was pruned for a score that wasn't
+    its own, silently.
     """
-    return SALIENCY_METHODS.resolve(method)(weight, **kwargs)
+    scores = SALIENCY_METHODS.resolve(method)(weight, **kwargs)
+    expected = (weight.shape[0],)
+    if not isinstance(scores, torch.Tensor) or tuple(scores.shape) != expected:
+        got = tuple(scores.shape) if isinstance(scores, torch.Tensor) else type(scores).__name__
+        raise ValueError(
+            f"saliency method {getattr(method, '__name__', method)!r} returned {got} for a weight of shape "
+            f"{tuple(weight.shape)}; a scorer returns one score per output channel, shape {expected}"
+        )
+    return scores
 
 
 def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
-    """Indices of the `prune_amount` lowest-scoring channels, ascending order.
+    """Indices of the `prune_amount` lowest-scoring channels, ascending order
+    (a CPU tensor, wherever `scores` is -- see `indices.py`).
 
     Takes a *score tensor*, not a weight tensor — the caller must have already
     produced it via `compute_score`, so there is no separate "recompute the
@@ -153,7 +169,7 @@ def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tenso
     if prune_amount == 0:
         return torch.empty(0, dtype=torch.long)
     idx = torch.topk(scores, prune_amount, largest=False).indices
-    return idx.sort().values
+    return as_index(idx).sort().values
 
 
 def keep_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:

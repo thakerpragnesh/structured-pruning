@@ -144,3 +144,54 @@ def test_quantize_model_reaches_every_parameter_a_listed_type_owns():
             assert torch.equal(p, before[name]), name
         else:
             assert torch.equal(p, quantize_fixed_point32(before[name], integer_bits=1, fractional_bits=2)), name
+
+
+def test_quantize_model_reaches_every_parameter_by_default():
+    """Open/closed: the default was a closed list of types (Linear, Conv2d,
+    BatchNorm1d/2d), so an Embedding, a LayerNorm or a Conv1d stayed at full
+    precision without a word -- the measured output drift under-reported,
+    and `estimate_size_bytes(model, 16)` counted them as 16-bit anyway.
+    Every floating-point parameter is quantized now; `module_types=`
+    narrows it, `QUANTIZABLE_MODULE_TYPES` being the thesis's scope."""
+    from prunelib.quantization import QUANTIZABLE_MODULE_TYPES
+
+    torch.manual_seed(0)
+    model = nn.ModuleDict({"emb": nn.Embedding(10, 6), "norm": nn.LayerNorm(6), "conv": nn.Conv1d(6, 4, 3), "fc": nn.Linear(4, 2)})
+    with torch.no_grad():
+        model["norm"].weight.uniform_(0.5, 1.5), model["norm"].bias.uniform_(-1, 1)
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+
+    quantize_model_(model, method="float16")
+    for name, p in model.named_parameters():
+        assert torch.equal(p, before[name].half().float()), name
+
+    model.load_state_dict(before)
+    quantize_model_(model, method="float16", module_types=QUANTIZABLE_MODULE_TYPES)
+    assert {n for n, p in model.named_parameters() if not torch.equal(p, before[n])} == {"fc.weight", "fc.bias"}
+
+
+def test_quantize_model_quantizes_a_shared_parameter_once():
+    """A parameter shared by two modules (tied weights) was quantized once
+    per owner, so a method that isn't idempotent (stochastic rounding, say)
+    was applied to it twice."""
+    a, b = nn.Linear(4, 4), nn.Linear(4, 4)
+    b.weight = a.weight
+    calls = []
+
+    def counting(t):
+        calls.append(t.data_ptr())
+        return t
+
+    quantize_model_(nn.Sequential(a, b), method=counting)
+    assert len(calls) == len(set(calls)) == 3  # the shared weight, a.bias, b.bias
+
+
+def test_quantize_model_refuses_a_method_that_changes_the_shape():
+    """Liskov: a method's answer was copied back with broadcasting, so one
+    returning a value per row (`keepdim=True`) overwrote every row with a
+    constant, silently. It now has to return its input's shape."""
+    lin = nn.Linear(4, 3)
+    before = lin.weight.detach().clone()
+    with pytest.raises(ValueError, match=r"turned a \(3, 4\) parameter into \(3, 1\)"):
+        quantize_model_(lin, method=lambda t: t.abs().amax(dim=-1, keepdim=True))
+    assert torch.equal(lin.weight, before)

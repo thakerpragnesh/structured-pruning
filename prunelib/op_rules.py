@@ -6,10 +6,12 @@ operation between layers (an elementwise add, a `torch.cat`, a flatten).
 
 A propagator is `(walk, source, node, idx) -> None`: a prune of channels
 `idx` of `source`'s output has reached `node`. It reads recorded shapes with
-`walk.shape`, records what must shrink with `walk.add_output_target` /
-`walk.add_input_target`, and continues the walk with `walk.forward` /
-`walk.find_producer` -- `graph.Propagation`'s small public interface, which
-is all it sees of the walk (not the graph, and not the group being filled).
+`walk.shape` and where their channels are with `walk.channel_dim`, records
+what must shrink with `walk.add_output_target` / `walk.add_input_target`,
+and continues the walk with `walk.forward` / `walk.forward_part` /
+`walk.find_producer` -- `propagation.Propagation`'s small public interface,
+which is all it sees of the walk (not the graph, and not the group being
+filled).
 
 Built-in propagators cover elementwise `+ - * /` (`propagate_elementwise`),
 activations, dropout, pooling and resizing written as functions or tensor
@@ -18,8 +20,14 @@ methods (`propagate_channelwise`), `torch.cat` along the channel dimension
 (`propagate_flatten`), and reading a tensor's shape (`x.size(0)`), which
 carries no channels on. `register_op_propagator(torch.maximum,
 propagate_elementwise)` teaches every `DependencyGraph` a new op; pass
-`op_propagators={...}` to one graph to scope it to that graph. Channels are
-dim 1 here, as everywhere in `DependencyGraph`.
+`op_propagators={...}` to one graph to scope it to that graph.
+
+Channels are wherever the layer that produced them keeps them
+(`module_rules.ModuleRule.channel_dim`: dim 1 of a conv's `[N, C, H, W]`,
+the last dim of a Linear's `[N, T, features]`), and `walk.channel_dim(node)`
+says where that is, counted from the end so it lines up across
+broadcasting. (They used to read dim 1, whoever produced the channels --
+see `ModuleRule.channel_dim` for what that broke.)
 
 These used to live in `graph.py`, next to the walk that calls them. Adding
 an op and changing how the graph is walked are different changes, so they
@@ -38,22 +46,19 @@ import torch.nn.functional as F
 from .indices import expand_blocks
 from .registry import Registry
 
-if TYPE_CHECKING:  # only for annotations; graph.py imports this module
-    from .graph import Propagation
+if TYPE_CHECKING:  # only for annotations; propagation.py imports this module
+    from .propagation import Propagation
 
 OpPropagator = Callable[["Propagation", fx.Node, fx.Node, torch.Tensor], None]  # (walk, source, node, idx)
 
 
-def _channels_against(source_shape: torch.Size, other_shape: torch.Size) -> int | None:
-    """The size of `other`'s dimension that broadcasts against `source`'s
-    channel dimension (dim 1), or None if `other` has too few dimensions
-    to reach it (a scalar, a `[W]` vector)."""
-    offset = len(source_shape) - len(other_shape)
-    if offset < 0:
-        raise NotImplementedError(
-            f"an operand of shape {tuple(other_shape)} has more dimensions than the pruned {tuple(source_shape)}"
-        )
-    return None if offset > 1 else other_shape[1 - offset]
+def shares_channels(shape: torch.Size, dim: int) -> bool:
+    """Whether an operand of `shape`, broadcast against a tensor whose
+    channels are on `dim` (counted from the end), carries those channels:
+    it reaches that dimension and isn't broadcast along it. A scalar, a
+    `[W]` vector against `[N, C, H, W]`, or a `[N, 1, H, W]` spatial gate
+    doesn't."""
+    return len(shape) >= -dim and shape[dim] != 1
 
 
 def propagate_elementwise(walk: Propagation, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
@@ -72,18 +77,19 @@ def propagate_elementwise(walk: Propagation, source: fx.Node, node: fx.Node, idx
     1-channel conv behind a spatial gate was told to lose channels it
     doesn't have. `-`, `*` and `/` were refused outright, so no
     squeeze-and-excitation block could be pruned through."""
-    source_shape = walk.shape(source)
-    if walk.shape(node)[1] != source_shape[1]:
+    dim = walk.channel_dim(source)
+    source_shape, result_shape = walk.shape(source), walk.shape(node)
+    if len(result_shape) < -dim or result_shape[dim] != source_shape[dim]:
         raise NotImplementedError(
             f"{node.name}: the pruned operand {tuple(source_shape)} is broadcast up to "
-            f"{tuple(walk.shape(node))}, so its channels aren't the result's"
+            f"{tuple(result_shape)}, so its channels aren't the result's"
         )
     others = [n for n in node.all_input_nodes if n is not source]
     if len(others) > 1:
         raise NotImplementedError(
             f"{node.name}: elementwise op with {len(others)} other tensor operands (at most 1 is supported)"
         )
-    if others and _channels_against(source_shape, walk.shape(others[0])) not in (None, 1):
+    if others and shares_channels(walk.shape(others[0]), dim):
         producer = walk.find_producer(others[0], idx)
         walk.add_output_target(producer.target, idx)
         walk.forward(producer, idx)
@@ -100,8 +106,9 @@ def propagate_channelwise(walk: Propagation, source: fx.Node, node: fx.Node, idx
     pruned or raised depending on how its activations were written.
     Register it for a function of your own:
     `register_op_propagator(my_activation, propagate_channelwise)`."""
+    dim = walk.channel_dim(source)
     before, after = walk.shape(source), walk.shape(node)
-    if len(after) != len(before) or after[1] != before[1]:
+    if len(after) != len(before) or after[dim] != before[dim]:
         raise NotImplementedError(
             f"{node.name}: {tuple(before)} -> {tuple(after)} changes the channel dimension, "
             f"so it can't be passed through as a channel-wise op"
@@ -111,21 +118,32 @@ def propagate_channelwise(walk: Propagation, source: fx.Node, node: fx.Node, idx
 
 def propagate_cat(walk: Propagation, source: fx.Node, node: fx.Node, idx: torch.Tensor) -> None:
     """Channel concatenation: `source`'s channels land in the result shifted
-    by the widths of the inputs before it."""
+    by the widths of the inputs before it -- once for every place `source`
+    appears (`torch.cat([y, y])`). Each is one part of what the result
+    loses (`walk.forward_part`): when several of the concatenated tensors
+    lose channels in one prune, the walk carries all of them on together.
+
+    It used to `forward` from the result for the first branch to arrive
+    only -- the walk skips a node it has already left -- so with two pruned
+    branches (`cat([y, relu(y)])`, a GhostNet-style `cat([x, cheap(x)])`)
+    the layer after the `cat` kept the inputs the second branch no longer
+    produced, and `cat([y, y])` lost the second copy's."""
     cat_inputs = list(node.args[0])
-    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
-    try:
-        position = cat_inputs.index(source)
-    except ValueError:
-        raise NotImplementedError(f"{node.name}: pruned tensor not found among cat's inputs") from None
+    cat_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    positions = [i for i, n in enumerate(cat_inputs) if n is source]
+    if not positions:
+        raise NotImplementedError(f"{node.name}: pruned tensor not found among cat's inputs")
 
     ndim = len(walk.shape(source))
-    norm_dim = dim if dim >= 0 else dim + ndim
-    if norm_dim != 1:
-        raise NotImplementedError(f"{node.name}: cat along dim={dim} isn't the channel dimension, not supported")
-
-    offset = sum(int(walk.shape(cat_inputs[i])[norm_dim]) for i in range(position))
-    walk.forward(node, idx + offset)
+    from_end = cat_dim - ndim if cat_dim >= 0 else cat_dim
+    if from_end != walk.channel_dim(source):
+        raise NotImplementedError(
+            f"{node.name}: cat along dim={cat_dim} isn't the channel dimension "
+            f"(dim {walk.channel_dim(source) + ndim} of {tuple(walk.shape(source))}), not supported"
+        )
+    widths = [int(walk.shape(n)[from_end]) for n in cat_inputs]
+    for position in positions:
+        walk.forward_part(node, idx + sum(widths[:position]))
 
 
 _SHAPE_ATTRIBUTES = frozenset({"shape", "dtype", "device", "ndim"})
@@ -152,12 +170,13 @@ def propagate_flatten(walk: Propagation, source: fx.Node, node: fx.Node, idx: to
     `x.flatten(2)` the next layer was handed indices up to `C * H * W` and
     failed at rebuild, far from the cause."""
     shape, out = walk.shape(source), walk.shape(node)
-    if len(shape) != 4 or tuple(out) != (shape[0], shape[1] * shape[2] * shape[3]):
+    nchw = len(shape) == 4 and walk.channel_dim(source) == -3
+    if not nchw or tuple(out) != (shape[0], shape[1] * shape[2] * shape[3]):
         raise NotImplementedError(
             f"{node.name}: reshaping {tuple(shape)} to {tuple(out)} isn't the conv-output-into-classifier-head "
-            f"flatten DependencyGraph handles (only [N, C, H, W] -> [N, C*H*W] is)"
+            f"flatten DependencyGraph handles (only [N, C, H, W] -> [N, C*H*W], channels on dim 1, is)"
         )
-    walk.forward(node, expand_blocks(idx, int(shape[2]) * int(shape[3])))
+    walk.forward(node, expand_blocks(idx, int(shape[2]) * int(shape[3])), dim=-1)
 
 
 # Keyed the way fx records a node's target: the function itself for

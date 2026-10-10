@@ -12,6 +12,7 @@ from .saliency import (
 from .indices import complement_indices, expand_blocks
 from .surgery import (
     is_depthwise_conv,
+    live_tensor,
     prune_attention_heads,
     prune_conv_bn,
     prune_ffn_block,
@@ -49,7 +50,8 @@ from .op_rules import (
     register_op_propagator,
 )
 from .group import PruningGroup
-from .graph import DependencyGraph, LeafTracer, Propagation
+from .propagation import Propagation
+from .graph import DependencyGraph, LeafTracer
 from .oneshot import prune_model
 from .quantization import (
     QUANTIZATION_METHODS,
@@ -89,6 +91,7 @@ __all__ = [
     "slice_linear",
     "slice_batchnorm",
     "is_depthwise_conv",
+    "live_tensor",
     "complement_indices",
     "expand_blocks",
     # redundancy scanning

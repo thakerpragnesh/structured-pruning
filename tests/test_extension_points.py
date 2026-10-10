@@ -411,7 +411,9 @@ def test_op_propagator_teaches_dependency_graph_a_new_op(temporarily_register):
 def test_op_propagator_sees_only_the_walk_interface():
     """Interface segregation: a propagator was handed the `PruningGroup`
     being filled and, through it, the whole `DependencyGraph`, so it could
-    call `group.prune()` halfway through a walk. It now sees five methods."""
+    call `group.prune()` halfway through a walk. It now sees seven methods:
+    shapes and where their channels are, the two targets, and three ways
+    to continue the walk."""
     seen = []
 
     def checking_maximum(walk, source, node, idx):
@@ -423,7 +425,8 @@ def test_op_propagator_sees_only_the_walk_interface():
     x = torch.randn(1, 3, 8, 8)
     DependencyGraph(model, x, op_propagators={torch.maximum: checking_maximum}).get_pruning_group("b", torch.tensor([0, 1, 3, 5])).prune()
 
-    assert seen and all(s == {"shape", "add_output_target", "add_input_target", "forward", "find_producer"} for s in seen)
+    interface = {"shape", "channel_dim", "add_output_target", "add_input_target", "forward", "forward_part", "find_producer"}
+    assert seen and all(s == interface for s in seen)
     assert model(x).shape == (1, 2, 8, 8)
 
 
@@ -467,3 +470,51 @@ def test_every_method_argument_accepts_an_implementation(temporarily_register):
     quantize_model_(by_name, method="tenths")
     quantize_model_(by_fn, method=tenths)
     assert torch.equal(by_name.weight, by_fn.weight) and torch.equal(by_name.bias, by_fn.bias)
+
+
+def test_scorer_and_selector_answers_are_held_to_their_contract(temporarily_register):
+    """Liskov: a registered scorer or selector was trusted. One that
+    reduced over the wrong axis (a score per *input* channel) had its 4
+    scores ranked as if they were the 8 output channels', so only channels
+    0-3 could ever be pruned; one that returned a channel twice pruned fewer
+    channels than its budget. Both silently. The dispatchers now check the
+    answer and name the rule that broke the contract."""
+    w = torch.randn(8, 4, 3, 3)
+    temporarily_register(SALIENCY_METHODS, "per_input", lambda w: w.abs().sum(dim=(0, 2, 3)))
+    with pytest.raises(ValueError, match=r"'per_input' returned \(4,\) .* shape \(8,\)"):
+        select_prune_indices_by_method(w, 2, method="per_input")
+    with pytest.raises(ValueError, match="one score per output channel"):
+        compute_score(w, method=lambda w: w.abs().sum(dim=(1, 2, 3), keepdim=True))
+
+    def twice(w, n):
+        return torch.tensor([1, 1, 2])
+
+    def out_of_range(w, n):
+        return torch.tensor([3, 8, 9])
+
+    def too_few(w, n):
+        return torch.tensor([5])
+
+    def as_mask(w, n):
+        return torch.arange(8) < n
+
+    for selector, match in [(twice, "2 distinct channels"), (out_of_range, r"outside \[0, 8\)"), (too_few, "exactly 3"), (as_mask, "1-D tensor of channel indices")]:
+        with pytest.raises(ValueError, match=match):
+            select_prune_indices_by_method(w, 3, method=selector)
+    assert select_prune_indices_by_method(w, 3, method=lambda w, n: torch.tensor([6, 0, 2], dtype=torch.int32)).tolist() == [0, 2, 6]
+
+
+def test_default_mask_refuses_a_rule_that_moved_its_output_channels():
+    """Liskov: `ModuleRule.mask`'s default zeroes dim 0 of the weight, even
+    for a rule whose `output_weight` says the output channels are
+    elsewhere. The ConvTranspose2d rule above (weight `[in, out, kh, kw]`)
+    had its *input* channels zeroed by `PruningGroup.mask()` with no error.
+    The default now refuses for such a rule: it has to say how to mask."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.ConvTranspose2d(6, 6, 2, stride=2), nn.ReLU(), nn.Conv2d(6, 2, 1)).eval()
+    group = DependencyGraph(model, torch.randn(1, 6, 4, 4), module_rules={nn.ConvTranspose2d: _ConvTranspose2dRule()}).get_pruning_group(
+        "0", torch.tensor([0, 1, 2])
+    )
+    with pytest.raises(NotImplementedError, match="overrides output_weight .* override mask too"):
+        group.mask()
+    assert not hasattr(model[0], "weight_orig")
