@@ -14,6 +14,7 @@ since that needs real data and labels this experiment doesn't have.
 
     python experiments/07_quantization.py
 """
+import argparse
 import copy
 
 import torch
@@ -40,9 +41,14 @@ def _output_drift(reference: torch.Tensor, other: torch.Tensor) -> float:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
     torch.manual_seed(0)
-    model = ConvNet()
-    example_input = torch.randn(2, 3, 32, 32)
+    model = ConvNet().to(args.device)
+    example_input = torch.randn(2, 3, 32, 32).to(args.device)
+    print(f"device: {args.device}")
 
     params_before = count_params(model)
     prune_model(model, example_input, model.conv1, prune_fraction=0.5, method="max_k", k=3)

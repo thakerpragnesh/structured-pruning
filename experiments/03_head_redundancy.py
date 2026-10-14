@@ -56,7 +56,7 @@ def prune_redundant_heads(attention, n_prune: int, metric: str = "manhattan", se
     return pruned
 
 
-def run_smoke(seed=0):
+def run_smoke(seed=0, device="cpu"):
     torch.manual_seed(seed)
     try:
         from transformers import BertConfig, BertModel
@@ -64,8 +64,9 @@ def run_smoke(seed=0):
         raise SystemExit("pip install transformers to run this experiment") from exc
 
     config = BertConfig(hidden_size=32, num_hidden_layers=2, num_attention_heads=4, intermediate_size=64)
-    model = BertModel(config)
+    model = BertModel(config).to(device)
 
+    print(f"device: {device}")
     for layer_idx, layer in enumerate(model.encoder.layer):
         q_weight = layer.attention.self.query.weight
         vectors = _head_vectors(q_weight, config.num_attention_heads)
@@ -73,13 +74,13 @@ def run_smoke(seed=0):
         print(f"\nlayer {layer_idx}: {config.num_attention_heads} heads")
         for metric in ("manhattan", "euclidean", "cosine"):
             dist = pairwise_distance_matrix(vectors, metric=metric)
-            off_diag = dist + torch.eye(dist.shape[0]) * dist.max()
+            off_diag = dist + torch.eye(dist.shape[0], device=dist.device) * dist.max()
             min_val = off_diag.min().item()
             i, j = (off_diag == off_diag.min()).nonzero()[0].tolist()
             print(f"  {metric:<10} closest pair: heads ({i}, {j})  distance={min_val:.4f}")
 
     print("\npruning 1 head per layer (K-Means/Manhattan, lowest L1 within cluster):")
-    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    input_ids = torch.randint(0, config.vocab_size, (2, 8)).to(device)
     for layer_idx, layer in enumerate(model.encoder.layer):
         pruned = prune_redundant_heads(layer.attention, n_prune=1)
         print(f"  layer {layer_idx}: pruned heads {pruned.tolist()} -> {layer.attention.self.num_attention_heads} heads left")
@@ -104,5 +105,6 @@ def run_full():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    run_smoke() if args.smoke else run_full()
+    run_smoke(device=args.device) if args.smoke else run_full()

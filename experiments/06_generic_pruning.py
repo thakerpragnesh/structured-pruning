@@ -73,10 +73,11 @@ def _report(label, model, example_input, keep_idx, dep, target):
     print(f"  forward pass after surgery: output shape {tuple(out.shape)}")
 
 
-def run_smoke():
+def run_smoke(device="cpu"):
     torch.manual_seed(0)
-    model = TinyResidualNet(channels=8)
-    x = torch.randn(2, 3, 16, 16)
+    model = TinyResidualNet(channels=8).to(device)
+    x = torch.randn(2, 3, 16, 16).to(device)
+    print(f"device: {device}")
 
     dep = DependencyGraph(model, x)
     # Prune conv2's output -- must pull in bn2 and the shortcut conv/bn (the
@@ -91,7 +92,7 @@ def run_smoke():
     print("with no seam information passed in by hand.")
 
 
-def run_tiny_check():
+def run_tiny_check(device="cpu"):
     """Exercises the exact same DependencyGraph code path as run_smoke, but
     against a real torchvision.models.resnet18 -- proves the "handle skip
     connections automatically" requirement holds against a real
@@ -100,9 +101,10 @@ def run_tiny_check():
     import torchvision
 
     torch.manual_seed(0)
-    model = torchvision.models.resnet18(weights=None)
+    model = torchvision.models.resnet18(weights=None).to(device)
     model.eval()
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(1, 3, 64, 64).to(device)
+    print(f"device: {device}")
 
     dep = DependencyGraph(model, x)
     # layer2.0 is the first BasicBlock with a downsample/shortcut projection
@@ -122,9 +124,10 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--smoke", action="store_true", help="synthetic net with a residual add and a concat, no torchvision")
     group.add_argument("--tiny-check", action="store_true", help="real torchvision.models.resnet18, no downloads")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     if args.smoke:
-        run_smoke()
+        run_smoke(device=args.device)
     else:
-        run_tiny_check()
+        run_tiny_check(device=args.device)

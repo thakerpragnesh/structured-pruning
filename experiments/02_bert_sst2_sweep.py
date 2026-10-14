@@ -23,7 +23,7 @@ def _score_ffn_neurons(fc1_weight: torch.Tensor, method: str = "max_k") -> torch
     return compute_score(fc1_weight, method=method)
 
 
-def run_smoke(prune_fraction=0.3, seed=0):
+def run_smoke(prune_fraction=0.3, seed=0, device="cpu"):
     torch.manual_seed(seed)
     try:
         from transformers import BertConfig, BertForSequenceClassification
@@ -34,7 +34,7 @@ def run_smoke(prune_fraction=0.3, seed=0):
         hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
         intermediate_size=64, vocab_size=1000, num_labels=2,
     )
-    model = BertForSequenceClassification(config)
+    model = BertForSequenceClassification(config).to(device)
 
     layer = model.bert.encoder.layer[0]
     fc1, fc2 = layer.intermediate.dense, layer.output.dense
@@ -48,9 +48,10 @@ def run_smoke(prune_fraction=0.3, seed=0):
     layer.intermediate.dense, layer.output.dense = new_fc1, new_fc2
 
     params_after = count_params(model)
-    input_ids = torch.randint(0, config.vocab_size, (2, 16))
+    input_ids = torch.randint(0, config.vocab_size, (2, 16)).to(device)
     out = model(input_ids)  # must not raise -- proves the seam holds inside the real module
 
+    print(f"device: {device}")
     print(f"FFN intermediate size: {config.intermediate_size} -> {len(keep_idx)}")
     print(f"model params: {params_before:,} -> {params_after:,} ({(1 - params_after/params_before):.1%} reduction)")
     print(f"forward pass output shape: {tuple(out.logits.shape)} (no shape errors -> seam is real)")
@@ -70,5 +71,6 @@ def run_full():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    run_smoke() if args.smoke else run_full()
+    run_smoke(device=args.device) if args.smoke else run_full()

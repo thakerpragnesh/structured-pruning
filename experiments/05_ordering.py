@@ -25,12 +25,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--budget", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    conv1 = nn.Conv2d(3, 32, 3, padding=1)
-    bn1 = nn.BatchNorm2d(32)
-    conv2 = nn.Conv2d(32, 32, 3, padding=1)
+    conv1 = nn.Conv2d(3, 32, 3, padding=1).to(args.device)
+    bn1 = nn.BatchNorm2d(32).to(args.device)
+    conv2 = nn.Conv2d(32, 32, 3, padding=1).to(args.device)
+    print(f"device: {args.device}")
 
     prune_amount = int(32 * args.budget)
 

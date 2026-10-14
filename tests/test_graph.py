@@ -1146,3 +1146,24 @@ def test_a_cuda_model_prunes_with_every_selection_rule():
         group = prune_model(model, x, "0", prune_fraction=0.25, method=method)
         assert all(idx.device.type == "cpu" for idx in group.output_targets.values()), method
         assert model[0].weight.device.type == "cuda" and model(x).shape == (1, 4, 6, 6), method
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_cuda_as_the_default_device_still_keeps_index_sets_on_the_cpu():
+    """`torch.set_default_device("cuda")` / `with torch.device("cuda"):`
+    redirected every factory call that didn't name a device: index sets came
+    back on the GPU, `expand_blocks` added a CUDA `arange` to CPU indices,
+    and `"random"`/`"kmeans"` asked a CPU generator for a CUDA tensor. Those
+    calls now say `device="cpu"` themselves (`indices.py`)."""
+    with torch.device("cuda"):
+        for method in ("max_k", "l1", "random", "kmeans"):
+            model = _conv_norm_conv(nn.BatchNorm2d(8))
+            x = torch.randn(1, 3, 6, 6)
+            group = prune_model(model, x, "0", prune_fraction=0.25, method=method)
+            assert all(idx.device.type == "cpu" for idx in group.output_targets.values()), method
+            assert model[0].weight.device.type == "cuda" and model(x).shape == (1, 4, 6, 6), method
+
+        q, k, v, o = prune_attention_heads(
+            *(nn.Linear(8, 8) for _ in range(4)), keep_heads=torch.tensor([0, 2, 3]), num_heads=4
+        )
+        assert q.weight.shape == (6, 8) and o.weight.shape == (8, 6) and q.weight.device.type == "cuda"

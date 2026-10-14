@@ -32,11 +32,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prune-fraction", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    # Built on the CPU, then moved: the same seed gives the same weights and input on any device.
     torch.manual_seed(args.seed)
-    model = ConvBlock()
-    example_input = torch.randn(1, 3, 64, 64)
+    model = ConvBlock().to(args.device)
+    example_input = torch.randn(1, 3, 64, 64).to(args.device)
 
     print(f"{'method':<8} {'lowest-score channel':>22} {'top-3 sum':>12}")
     for method in ("max_k", "l1", "l2", "random"):
@@ -64,7 +66,8 @@ def main():
     out = pruned_model(example_input)
     assert out.shape == (1, model.conv2.out_channels, 64, 64)
 
-    print(f"\nprune fraction: {args.prune_fraction:.0%}  ({n_out} -> {len(keep_idx)} channels)")
+    print(f"\ndevice: {args.device}")
+    print(f"prune fraction: {args.prune_fraction:.0%}  ({n_out} -> {len(keep_idx)} channels)")
     print(f"params:  {params_before:,} -> {params_after:,}  ({(1 - params_after/params_before):.1%} reduction)")
     print(f"latency: {latency_before:.3f}ms -> {latency_after:.3f}ms  ({latency_before/latency_after:.2f}x)")
 

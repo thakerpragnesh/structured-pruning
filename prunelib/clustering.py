@@ -49,7 +49,7 @@ def _kmeans_plus_plus_init(
     avoids the degenerate all-seeds-in-one-cluster starts plain random
     sampling can produce."""
     n = x.shape[0]
-    first = torch.randint(n, (1,), generator=generator).item()
+    first = torch.randint(n, (1,), generator=generator, device="cpu").item()
     chosen = [first]
     nearest = metric.pairwise(x, x[first:first + 1]).squeeze(1)
     for _ in range(1, n_clusters):
@@ -59,7 +59,7 @@ def _kmeans_plus_plus_init(
             # duplicate channels); pick any not-yet-chosen index instead.
             taken = set(chosen)
             remaining = [i for i in range(n) if i not in taken]
-            nxt = remaining[torch.randint(len(remaining), (1,), generator=generator).item()]
+            nxt = remaining[torch.randint(len(remaining), (1,), generator=generator, device="cpu").item()]
         else:
             nxt = torch.multinomial(weights, 1, generator=generator).item()
         chosen.append(nxt)
@@ -104,7 +104,7 @@ def kmeans(
     x = vectors.detach().to(device="cpu", dtype=torch.float32)
     generator = torch.Generator().manual_seed(seed)
     centroids = _kmeans_plus_plus_init(x, n_clusters, metric, generator)
-    labels = torch.full((n,), -1, dtype=torch.long)
+    labels = torch.full((n,), -1, dtype=torch.long, device="cpu")
 
     for _ in range(max_iter):
         dist = metric.pairwise(x, centroids)
@@ -167,9 +167,9 @@ def kmeans_prune_indices(
     n_out = weight.shape[0]
     prune_amount = max(0, min(int(prune_amount), n_out))
     if prune_amount == 0:
-        return torch.empty(0, dtype=torch.long)
+        return torch.empty(0, dtype=torch.long, device="cpu")
     if prune_amount == n_out and n_clusters is None:
-        return torch.arange(n_out)
+        return torch.arange(n_out, device="cpu")
     if n_clusters is None:
         n_clusters = n_out - prune_amount
     if prune_amount > n_out - n_clusters:
@@ -184,7 +184,7 @@ def kmeans_prune_indices(
 
     # The representative of each cluster is its highest-L1 member; it's
     # never a pruning candidate. Everyone else competes on L1 alone.
-    protected = torch.zeros(n_out, dtype=torch.bool)
+    protected = torch.zeros(n_out, dtype=torch.bool, device="cpu")
     for c in range(n_clusters):
         members = (labels == c).nonzero(as_tuple=True)[0]
         protected[members[l1[members].argmax()]] = True

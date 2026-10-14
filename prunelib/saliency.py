@@ -127,7 +127,7 @@ def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = No
     `generator` (a CPU generator: the same seed gives the same draw on any
     device), returned on `weight`'s device like every other scorer's."""
     out_ch = _channel_view(weight).shape[0]
-    return torch.rand(out_ch, generator=generator).to(weight.device)
+    return torch.rand(out_ch, generator=generator, device="cpu").to(weight.device)
 
 
 def compute_score(weight: torch.Tensor, method: str | Callable[..., torch.Tensor] = "max_k", **kwargs) -> torch.Tensor:
@@ -167,7 +167,7 @@ def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tenso
     """
     prune_amount = max(0, min(prune_amount, scores.numel()))
     if prune_amount == 0:
-        return torch.empty(0, dtype=torch.long)
+        return torch.empty(0, dtype=torch.long, device="cpu")
     idx = torch.topk(scores, prune_amount, largest=False).indices
     return as_index(idx).sort().values
 

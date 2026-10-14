@@ -26,7 +26,7 @@ of work.)
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
 during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (177 tests,
+compress once at the end — cleanly and with a real test suite (178 tests,
 CI on every push). If you're implementing that pattern elsewhere
 (including in `pruning_framwork_v4`, which arrived at a similar design
 independently), this is a working, tested reference for it.
@@ -63,6 +63,19 @@ specifically (the Transformer experiments or `prunelib/masking.py`).
 ```bash
 pip install -e .
 ```
+
+On an NVIDIA GPU, install a CUDA build of PyTorch first, choosing the CUDA
+version your driver supports (`nvidia-smi`; see pytorch.org), then the package:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+pip install -e ".[dev,transformer-experiments,vision-experiments]"
+```
+
+Every experiment runs on the GPU when there is one and prints `device: cuda`
+(`--device cpu` forces the CPU). For Colab or Kaggle, open
+`notebooks/run_on_colab_kaggle.ipynb`. It clones the repo, runs the tests
+and smoke runs on the GPU, then runs a resumable VGG16 / CIFAR-10 sweep.
 
 ## Quickstart
 
@@ -265,6 +278,7 @@ and how much of the network is pruned, and will not be identical across runs.
 | `saliency.py` — Max-k/L1/L2/random, Conv2d and Linear weights | Unit-tested, 10/10 passing |
 | `surgery.py` — Conv/BN/FFN/attention-head structural surgery | Unit-tested, verified against a real HF BERT forward pass |
 | `masking.py` / `vgg.py` — two-phase mask-then-compress | Unit-tested, including a whole-VGG16 mask → compress run |
+| CUDA — every pruning path on a GPU | Both CUDA tests pass and the full suite passes on a GTX 1650 (2026-10-13); every experiment's `--device cuda` output matches its CPU run |
 | `graph.py` / `group.py` / `op_rules.py` / `oneshot.py` — `torch.fx`-traced dependency resolution (elementwise merges incl. squeeze-and-excitation, functional activations, cat/flatten/depthwise), two-phase `PruningGroup`, `special_handlers`, `prune_model` | Unit-tested; `experiments/06 --tiny-check` verified against a real `torchvision.models.resnet18`, including cascading through a whole residual stage; torchvision MobileNetV3-Small pruned through its squeeze-and-excitation blocks (`test_graph.py`) |
 | `quantization.py` — Float16/INT8/Fixed-Point32 post-training quantization | Unit-tested, including a brute-force formula check for INT8 and a clipping-not-wrapping check for Fixed-Point32; `experiments/07` runs the full pipeline on synthetic data, not yet against a real fine-tuned model |
 | `scanners.py` — distance metrics + co-activation | Unit-tested |
@@ -381,7 +395,7 @@ archive/
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          177 tests, each naming the defect or behavior it guards against
+tests/          178 tests, each naming the defect or behavior it guards against
 ```
 
 ## Citation

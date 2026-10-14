@@ -75,7 +75,7 @@ prunelib/
                                registers itself as the "kmeans" selection rule
     distance.py   (66 lines)   DistanceMetric (pairwise distance + matching K-Means
                                centroid); DISTANCE_METRICS registry
-    indices.py    (52 lines)   complement_indices, expand_blocks; index sets are CPU
+    indices.py    (60 lines)   complement_indices, expand_blocks; index sets are CPU
                                long tensors, moved to the data's device to index it
     surgery.py    (315 lines)  slice_conv2d / slice_depthwise_conv2d / slice_linear /
                                slice_batchnorm primitives (each a resized copy of the
@@ -131,11 +131,11 @@ archive/
         pipeline.py         kept here as a tested mask-then-compress example,
                              not a live alternative. Moved under archive/
                              2026-09-21. See LEGACY_PIPELINE_MIGRATION.md.
-tests/          177 tests across 11 files, one per historical defect or behavior
-                (one needs a CUDA device and is skipped without one)
+tests/          178 tests across 11 files, one per historical defect or behavior
+                (two need a CUDA device and are skipped without one)
 ```
 
-Total: ~7,300 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
+Total: ~7,400 lines across `prunelib/`, `experiments/` and `tests/` (excluding `archive/`). Small on purpose — every module does one thing.
 
 ## 3. Design decisions, and the defect each one prevents
 
@@ -180,7 +180,7 @@ If you're refactoring `prunelib`, read this table first.
 | The walk back along a skip branch follows an elementwise merge through whichever operands carry the pruned channels | It followed a merge only if every operand had the same channel count, so a skip branch gated by a `[N, 1, H, W]` map was refused | `propagation.py::Propagation.find_producer` |
 | `quantize_model_` quantizes every floating-point parameter by default, each once (`module_types=` narrows it; `QUANTIZABLE_MODULE_TYPES` is the thesis's scope) | The default was a closed type list, so a Conv1d, LayerNorm, Embedding or `SyncBatchNorm` stayed at full precision silently — the measured drift under-reported, and `estimate_size_bytes(model, 16)` counted them as 16-bit anyway. A weight tied between two listed modules was quantized twice | `quantization.py::quantize_model_` |
 | `get_pruning_group` refuses a `keep_idx` that keeps no channel; `prune_model` refuses a `dependency_graph` traced from another model; `example_input` may be a tuple (one per positional input) for `DependencyGraph`, `prune_model` and `measure_latency` | An empty `keep_idx` left a zero-width Linear that still ran; given a layer by name, `prune_model` scored it in `model` and pruned the graph's model with those scores; a model with two inputs couldn't be traced or timed | `graph.py::DependencyGraph`, `oneshot.py::prune_model`, `evaluate.py::measure_latency` |
-| Index sets are CPU `long` tensors wherever their weights are (`indices.as_index`); every indexing site moves them to the data's device (`indices.on_device_of`); K-Means runs on the CPU; `measure_latency` synchronizes a CUDA device before reading the clock | Indices landed on whichever device made them, so on a GPU the first `complement_indices` (a CPU mask indexed by CUDA indices) or `index_select` (CUDA weight, CPU indices) failed, and K-Means' CPU generator failed on CUDA weights. **Fixed by reasoning, not run**: no GPU on the development laptop; `test_a_cuda_model_prunes_with_every_selection_rule` is skipped without one | `indices.py`, every `slice_*`, `clustering.py`, `evaluate.py` |
+| Index sets are CPU `long` tensors wherever their weights are (`indices.as_index`); every indexing site moves them to the data's device (`indices.on_device_of`); K-Means runs on the CPU; `measure_latency` synchronizes a CUDA device before reading the clock | Indices landed on whichever device made them, so on a GPU the first `complement_indices` (a CPU mask indexed by CUDA indices) or `index_select` (CUDA weight, CPU indices) failed, and K-Means' CPU generator failed on CUDA weights. Fixed 2026-10-11 by reasoning, **verified on a GPU 2026-10-13** (GTX 1650, `venv-cuda/`): `test_a_cuda_model_prunes_with_every_selection_rule` passes. Every factory call that builds an index set, a mask over one, or a CPU-generator draw also says `device="cpu"` (2026-10-13): left implicit, they followed torch's default device, so under `with torch.device("cuda"):` index sets came back on the GPU and `random`/`kmeans` failed (`test_cuda_as_the_default_device_still_keeps_index_sets_on_the_cpu`) | `indices.py`, every `slice_*`, `clustering.py`, `saliency.py`, `evaluate.py` |
 
 If you ever find yourself writing a loop that tracks a running max/min by
 hand, or a loop with a manually-incremented destination index into a
@@ -665,8 +665,10 @@ of flattened columns, head → its block of Q/K/V rows). It also sets the
 device policy: an index set is a CPU `long` tensor (`as_index`) wherever the
 weights it indexes are, and every indexing site moves it to the tensor's
 device first (`on_device_of`). Indices used to stay on whichever device made
-them, which on a GPU failed at the first prune — fixed by reasoning, since
-the development laptop has no GPU (see section 6).
+them, which on a GPU failed at the first prune — fixed 2026-10-11, verified
+on a GPU 2026-10-13 (see section 6). Every factory call that builds an index
+set names `device="cpu"` itself, so the policy holds under
+`torch.set_default_device("cuda")` / `with torch.device("cuda"):` too.
 
 ### `prunelib/evaluate.py`
 
@@ -731,8 +733,8 @@ defect-named test even if you refactor the code it guards, unless you're
 certain the refactor makes the bug class structurally impossible (as, e.g.,
 switching to `torch.topk` made D2 impossible to reintroduce even accidentally).
 
-Run everything: `PYTHONPATH=. pytest tests/ -v` (177 tests, one of which
-needs a CUDA device and is skipped without one; ~40-45s total on
+Run everything: `PYTHONPATH=. pytest tests/ -v` (178 tests, two of which
+need a CUDA device and are skipped without one; ~40-45s total on
 CPU; the pure-`prunelib` tests alone (including `test_graph.py`,
 `test_quantization.py`, and `test_evaluate.py`, none of which need
 `torchvision`/`transformers`) are still ~2-3s, the rest is the handful
@@ -818,17 +820,22 @@ correct public implementation. Current state, honestly:
   channels, so pruning some changes the others' outputs — not a
   per-channel layer). ~~Only one `cat` branch is safely pruned at a time~~
   **Fixed 2026-10-11.**
-- **The CUDA path has never run.** Nothing in `prunelib` had been run on a
-  GPU, and on 2026-10-11 reading the code showed it couldn't: index tensors
-  stayed on the device that produced them, so the first prune of a CUDA
-  model failed (a CPU mask indexed by CUDA indices), and so did K-Means.
-  Indices now live on the CPU and move to the data's device to index it,
-  K-Means runs on the CPU, and `measure_latency` synchronizes a CUDA
-  device — but that fix was made by reading the code, not by running it:
-  the development laptop has no GPU.
-  `test_graph.py::test_a_cuda_model_prunes_with_every_selection_rule` runs
-  where one exists; run it (and `experiments/01 --tiny-check` on a GPU)
-  before trusting a GPU run.
+- ~~**The CUDA path has never run.**~~ **Verified 2026-10-13.** The
+  2026-10-11 device fix (indices live on the CPU and move to the data's
+  device to index it, K-Means runs on the CPU, `measure_latency`
+  synchronizes a CUDA device) was made by reading the code. The development
+  laptop was thought to have no GPU, but it has a GTX 1650 (4 GB, sm_75);
+  only `venv/`'s `torch` was a CPU build. `venv-cuda/` (torch
+  2.14.0+cu132, same versions otherwise) runs it. Both CUDA tests pass,
+  the whole suite passes there (178, none skipped), and every experiment
+  now takes `--device` (default `cuda` when available). Each prints the same
+  channel counts, params and scores on `cuda` as on `cpu`, except `04`'s
+  two-decimal firing rates, where float32 rounding flips an exact .5.
+  `01 --tiny-check` (real VGG16 + Adam, batch 8) fits in 4 GB and takes
+  ~21 s. Running every test with CUDA as torch's default device found one
+  more bug, fixed the same day: factory calls that didn't name a device
+  (section 3's index-set row). What's still unverified: real data on a GPU
+  (`experiments/01` full run), and any GPU other than this Turing card.
 - ~~**`DependencyGraph` isn't wired into the two-phase mask-then-compress
   workflow — only one-shot surgery.**~~ **Fixed 2026-09-23.**
   `PruningGroup.mask()` / `.commit_and_compress()` extend `masking.py`'s
@@ -974,12 +981,28 @@ to add or fix a CNN pruning criterion, you probably want
 git clone https://github.com/thakerpragnesh/structured-pruning.git
 cd structured-pruning
 pip install -e ".[dev,vision-experiments,transformer-experiments]"
-pytest tests/ -v                        # 177 tests
+pytest tests/ -v                        # 178 tests (2 skipped without a GPU)
 python experiments/00_demo.py           # full pipeline, seconds
 python experiments/01_vgg_cifar10_sweep.py --smoke
 python experiments/06_generic_pruning.py --smoke
 python experiments/07_quantization.py   # pruning + all three quantization methods
 ```
+
+On a GPU, install a CUDA build of `torch` before the package (match the
+CUDA version to what `nvidia-smi` reports). The development laptop's
+`venv-cuda/` was built this way:
+
+```bash
+python3 -m venv venv-cuda
+TMPDIR=~/.cache/pip-tmp venv-cuda/bin/pip install torch==2.14.0 torchvision==0.29.0 \
+    --index-url https://download.pytorch.org/whl/cu132
+venv-cuda/bin/pip install -e ".[dev,vision-experiments,transformer-experiments]"
+venv-cuda/bin/python experiments/00_demo.py   # prints "device: cuda"
+```
+
+`TMPDIR` matters on that laptop. `/tmp` is a 3.4 GB tmpfs, and pip unpacks
+the ~4 GB of CUDA wheels there, so without it the install fails with
+`Disk quota exceeded`. Colab and Kaggle: `notebooks/run_on_colab_kaggle.ipynb`.
 
 Read section 3 of this document before touching `prunelib/saliency.py`,
 `prunelib/surgery.py`, `prunelib/masking.py`, `prunelib/selection.py`, or

@@ -18,6 +18,14 @@ them to that tensor's device first (`on_device_of`). They used to land on
 whichever device produced them -- a CUDA weight's scores gave CUDA indices,
 `complement_indices` built a CPU mask -- so pruning a model on a GPU failed
 at the first `mask[cuda_idx]` or `cuda_weight.index_select(0, cpu_idx)`.
+
+Every factory call in `prunelib` that builds an index set, a mask over one,
+or a draw from a CPU generator says `device="cpu"` explicitly. Left implicit,
+they followed torch's default device, so under `torch.set_default_device(
+"cuda")` or `with torch.device("cuda"):` (common in LLM code)
+`complement_indices` returned CUDA indices, `expand_blocks` mixed devices,
+and `"random"`/`"kmeans"` selection failed (a CPU generator asked for a CUDA
+tensor).
 """
 from __future__ import annotations
 
@@ -37,7 +45,7 @@ def on_device_of(idx: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
 def complement_indices(n: int, idx: torch.Tensor | None) -> torch.Tensor:
     """Indices `0..n-1` not present in `idx`, ascending. `idx=None` means
     nothing is excluded (returns every index)."""
-    mask = torch.ones(n, dtype=torch.bool)
+    mask = torch.ones(n, dtype=torch.bool, device="cpu")
     if idx is not None:
         mask[as_index(idx)] = False
     return mask.nonzero(as_tuple=True)[0]
@@ -49,4 +57,4 @@ def expand_blocks(idx: torch.Tensor, block_size: int) -> torch.Tensor:
     the flat feature indices they own after an NCHW flatten
     (`block_size = H * W`), or head indices -> the Q/K/V rows they own
     (`block_size = head_dim`)."""
-    return (as_index(idx).unsqueeze(1) * block_size + torch.arange(block_size)).reshape(-1)
+    return (as_index(idx).unsqueeze(1) * block_size + torch.arange(block_size, device="cpu")).reshape(-1)
