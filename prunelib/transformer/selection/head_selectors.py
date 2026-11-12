@@ -144,8 +144,8 @@ def _query_similarity_and_strength(ctx: HeadContext):
 
 # `similarity=` name -> ctx -> (pairwise similarity, per-head strength). A
 # new redundancy signal is a new entry here, not a new branch in
-# RedundantHeadSelector (Open/Closed) -- the same convention as
-# head_analysis.LP_METRICS.
+# RedundantHeadSelector (Open/Closed) -- the same convention as the core
+# `prunelib.distance.DISTANCE_METRICS` registry head distances use.
 HEAD_SIMILARITIES = {
     "ov": _ov_similarity_and_strength,
     "query": _query_similarity_and_strength,

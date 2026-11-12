@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-import prunelib
 from prunelib import (
     available_methods,
     compute_score,
