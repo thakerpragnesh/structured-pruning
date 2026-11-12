@@ -16,11 +16,13 @@ below.
 `experiments/02` through `05` and the corresponding pieces of `prunelib/`
 apply Max-k-style saliency to BERT FFN neurons, and Manhattan/Euclidean/
 Cosine distance to attention heads — the CNN methods don't have a
-Transformer equivalent anywhere else on my account. (Newer, more actively
-developed Transformer work now lives in
-[`transformer_pruning`](https://github.com/thakerpragnesh/transformer_pruning);
-this repo's Transformer experiments are the earlier version of that line
-of work.)
+Transformer equivalent anywhere else on my account. The calibration-aware
+Transformer work from
+[`transformer_pruning`](https://github.com/thakerpragnesh/transformer_pruning)
+is now merged in as `prunelib.transformer` (see
+[Transformer techniques](#transformer-techniques-prunelibtransformer) below),
+so the earlier experiments `02`–`05` and the newer criteria share one
+package and one test suite.
 
 **2. A tested reference implementation of the mask-then-compress design.**
 `prunelib/masking.py` implements the two-phase workflow — mask channels
@@ -51,7 +53,9 @@ specifically (the Transformer experiments or `prunelib/masking.py`).
 ## Install
 
 ```bash
-pip install -e .
+pip install -e .                       # core: torch only
+pip install -e ".[analysis]"           # + pandas, for NetworkSaliencyScanner.scan()
+pip install -e ".[dev,transformer-experiments,vision-experiments]"   # everything CI runs
 ```
 
 ## Quickstart
@@ -110,6 +114,66 @@ dist = pairwise_distance_matrix(vectors, metric="manhattan")  # or "euclidean", 
 scanner = CoActivationScanner(firing_rate_ceiling=0.9)
 similarity = scanner.jaccard(activation_mask)
 ```
+
+## Transformer techniques (`prunelib.transformer`)
+
+Merged from `transformer_pruning`. Where the core API above is stateless
+tensor-in/tensor-out, this subpackage works on a whole model (any
+HuggingFace BERT/RoBERTa-layout encoder or task model, via
+`resolve_adapter`), and adds the pieces weight-only criteria can't see:
+
+| Area | What it adds |
+|---|---|
+| **Calibration** | `FFNCalibrator` (per-neuron activation moments), `HeadCalibrator` (per-head contribution moments + Michel et al. 2019 gradient importance), `ActivationRecorder` (per-token firing patterns). Padding is masked out everywhere. |
+| **FFN criteria** | `SaliencySelector` (any scorer: `TopKMagnitudeScorer`/Max-3, `LpNormScorer`, `CSDScorer`, or any core method via `RegisteredScorer`), `InOutNormSelector`, `ActivationAwareSelector`, `TwinRedundancySelector` (co-activation twins), `WeightClusterRedundancySelector` (K-means on `W_in` direction) |
+| **Head criteria** | `RedundantHeadSelector` (OV-circuit or query cosine), `OVNormHeadSelector`, `ActivationAwareHeadSelector`, `GradientHeadSelector` |
+| **Cheaper cuts** | Bias compensation (fold a removed neuron's/head's mean output into the bias: zero-ablation becomes mean-ablation) and merging (fold a redundant neuron's output column into its twin) |
+| **Model-wide budgets** | `allocation="uniform"` (every layer loses the same fraction) or `"global"` (every unit ranked against every other, with per-layer floors), or your own `AllocationStrategy` |
+
+```python
+from prunelib.transformer import (
+    ActivationAwareSelector, FFNCalibrator, GradientHeadSelector, HeadCalibrator,
+    prune_model_attention, prune_model_ffn,
+)
+
+# Heads first: the head cut changes every downstream FFN's input distribution.
+cal = HeadCalibrator(model)
+prune_model_attention(
+    model, GradientHeadSelector(prune_percent=25), allocation="global", normalize="l2",
+    stats_by_layer=cal.collect_many(batches),
+    gradient_importance_by_layer=cal.collect_gradient_importance(labelled_batches),
+    compensate_bias=True,
+)
+# Then calibrate the FFN on the head-pruned model and cut it.
+prune_model_ffn(
+    model, ActivationAwareSelector(prune_percent=40), allocation="global",
+    stats_by_layer=FFNCalibrator(model).collect_many(batches), compensate_bias=True,
+)
+```
+
+`python experiments/06_transformer_techniques.py --smoke` runs exactly this
+(plus a twin merge) on a random-init HF BERT in seconds.
+
+**Shared with core:** CSD is one implementation (`prunelib.compute_score(w,
+"csd")` and `CSDScorer` are the same function, so CSD now works for CNN
+channel masking too), and head distances use the core
+`pairwise_distance_matrix` registry. The dependency runs one way only:
+`prunelib.transformer` imports core, never the reverse
+(`tests/transformer/test_package_layout.py` enforces it, along with the
+subpackage layering).
+
+Two things share a name across the two layers on purpose. The core
+`prunelib.prune_attention_heads(q, k, v, o, keep_heads, num_heads)` is the
+tensor-level primitive and takes heads to **keep**. The model-level
+`prunelib.transformer.prune_attention_heads(model, layer, head_indices)`
+takes heads to **drop** and also updates the layer's head-count
+bookkeeping. Likewise, core `"max_k"` treats a Linear weight as a 1x1 conv,
+so on an FFN it equals L1, while `TopKMagnitudeScorer(k)` sums each
+neuron's k strongest incoming connections.
+
+The research numbers for these criteria have **not** been reproduced in
+this repo. The MRPC accuracy harness (`experiments/accuracy/` in
+`transformer_pruning`) was not ported.
 
 ## Results
 
@@ -179,6 +243,14 @@ prunelib/
     vgg.py        VGG wiring: build_vgg16, mask_vgg_layer, compress_masked_vgg
     scanners.py   distance metrics + co-activation scanning
     evaluate.py   parameter counts + measured latency
+    transformer/  model-level Transformer pruning (merged from transformer_pruning),
+                  layered lowest-first; each layer imports only those above it:
+        models/       adapters (BERT/RoBERTa layout, resolve_adapter), layer discovery
+        measurement/  hooks, FFN/head calibration, activation recording
+        analysis/     scorers, network scanner, OV-circuit math, twins, k-means
+        selection/    contexts, budgets, FFN and head selectors
+        surgery/      FFNSurgeon (merge + bias compensation), AttentionSurgeon
+        pipeline/     allocation strategies, prune_* entry points
 experiments/
     00_demo.py                  runs in seconds
     01_vgg_cifar10_sweep.py     Max3 vs L1 vs L2 vs random
@@ -186,12 +258,14 @@ experiments/
     03_head_redundancy.py       head similarity across layers
     04_coactivation.py          activation-based redundancy
     05_ordering.py              does the CNN ordering result transfer?
+    06_transformer_techniques.py  calibrated head + FFN pruning, twin merging
 archive/
     legacy_pipeline/            corrected replacement for the six original
         config.py, data.py, model.py,   driver scripts -- now redundant with
         train.py, pipeline.py           pruning_framwork_v4, see
                                          LEGACY_PIPELINE_MIGRATION.md
-tests/          49 tests, each naming the defect it guards against
+tests/          core tests, each naming the defect it guards against
+    transformer/  prunelib.transformer suite (BERT-shaped stub model, no HF needed)
 ```
 
 ## Citation

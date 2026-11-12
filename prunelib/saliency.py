@@ -102,6 +102,21 @@ def l2_saliency(weight: torch.Tensor) -> torch.Tensor:
     return _channel_view(weight.detach()).pow(2).sum(dim=(1, 2)).sqrt()
 
 
+def csd_saliency(weight: torch.Tensor) -> torch.Tensor:
+    """CSD saliency: L1 dispersion of each output unit's incoming weights
+    from their own mean, `sum(|w - mean(w)|)`.
+
+    Adapted from the "Custom Standard Deviation" in Thaker & Mohan,
+    "Enhancing Deep Compression of CNNs" (IEEE Access, 2024), which used it
+    as a training-time regularization target. As a one-shot scorer: a unit
+    whose incoming weights are nearly uniform emits a roughly constant
+    signal (indistinguishable from a bias), so low dispersion means low
+    informativeness. Accepts any weight whose dim 0 is the output axis.
+    """
+    flat = weight.detach().reshape(weight.shape[0], -1)
+    return (flat - flat.mean(dim=1, keepdim=True)).abs().sum(dim=1)
+
+
 def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
     """Random baseline score, one draw per output channel/neuron. Seed via `generator`."""
     out_ch = _channel_view(weight).shape[0]
@@ -145,6 +160,7 @@ def available_methods() -> list[str]:
 register_saliency("max_k", max_k_saliency)
 register_saliency("l1", l1_saliency)
 register_saliency("l2", l2_saliency)
+register_saliency("csd", csd_saliency)
 register_saliency("random", random_saliency)
 
 

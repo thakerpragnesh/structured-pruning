@@ -1,6 +1,7 @@
 from .saliency import (
     available_methods,
     compute_score,
+    csd_saliency,
     keep_indices,
     l1_saliency,
     l2_saliency,
@@ -28,6 +29,7 @@ from .masking import (
 __all__ = [
     "available_methods",
     "compute_score",
+    "csd_saliency",
     "keep_indices",
     "l1_saliency",
     "l2_saliency",
