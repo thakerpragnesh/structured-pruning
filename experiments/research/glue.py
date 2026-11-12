@@ -48,6 +48,26 @@ TASKS = {
 }
 
 
+WARMUP_FRACTION = 0.1  # linear LR warmup over the first 10% of training steps
+
+
+def _warmup_fraction(training_args_cls, fraction: float) -> dict:
+    """The `TrainingArguments` keyword for "warm up over this fraction of
+    training", for whichever transformers is installed.
+
+    transformers 4.x spells it `warmup_ratio`; 5.x removed that and lets
+    `warmup_steps` take a float in [0, 1) as a ratio instead. Passing the
+    float to 4.x's `warmup_steps` would instead mean "0.1 steps" -- effectively
+    no warmup -- so the two can't be swapped blindly: the same recipe has to
+    run on Kaggle/Colab images that still ship 4.x and on CI's latest."""
+    import inspect
+
+    params = inspect.signature(training_args_cls.__init__).parameters
+    if "warmup_ratio" in params:
+        return {"warmup_ratio": fraction}
+    return {"warmup_steps": fraction}
+
+
 def set_seeds(seed: int) -> None:
     """Seed every RNG the study touches: the random-saliency baseline, data
     shuffling during healing, and dropout all depend on it."""
@@ -95,11 +115,13 @@ class GlueHarness:
 
     def __init__(self, task: str, model_name: str, work_dir, seed: int, *, epochs: float = 3,
                  batch_size: int = 32, learning_rate: float = 2e-5, max_length: int = 128,
-                 train_limit: int | None = None, eval_limit: int | None = None, smoke: bool = False):
+                 train_limit: int | None = None, eval_limit: int | None = None, smoke: bool = False,
+                 tokenizer_name: str | None = None):
         if task not in TASKS:
             raise ValueError(f"unknown task {task!r}, expected one of {sorted(TASKS)}")
         self.task = TASKS[task]
         self.model_name = model_name
+        self.tokenizer_name = tokenizer_name or model_name
         self.work_dir = work_dir
         self.seed = seed
         self.epochs = epochs
@@ -116,7 +138,19 @@ class GlueHarness:
         from datasets import load_dataset
         from transformers import AutoTokenizer, DataCollatorWithPadding
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        except ValueError as exc:
+            # transformers 5 removed the slow tokenizer classes, so a checkpoint
+            # that ships only `vocab.txt` (no `tokenizer.json`) -- e.g. the
+            # prajjwal1/bert-tiny|mini|small family -- can no longer be loaded.
+            # Those use the bert-base-uncased vocabulary, so its tokenizer is a
+            # drop-in replacement with identical token ids.
+            raise RuntimeError(
+                f"could not load a tokenizer for {self.tokenizer_name!r} ({str(exc).splitlines()[0]}). "
+                "If this checkpoint ships only vocab.txt and uses BERT's uncased vocabulary (the "
+                "prajjwal1/bert-* models do), pass --tokenizer google-bert/bert-base-uncased."
+            ) from exc
         raw = load_dataset("nyu-mll/glue", self.task.name)
         keys = self.task.text_keys
 
@@ -192,8 +226,18 @@ class GlueHarness:
             config = BertConfig(hidden_size=64, num_hidden_layers=2, num_attention_heads=8,
                                 intermediate_size=128, vocab_size=256, num_labels=self.task.num_labels)
             return BertForSequenceClassification(config)
-        return AutoModelForSequenceClassification.from_pretrained(
-            self.model_name, num_labels=self.task.num_labels)
+        try:
+            return AutoModelForSequenceClassification.from_pretrained(
+                self.model_name, num_labels=self.task.num_labels)
+        except ValueError as exc:
+            # transformers 5 no longer guesses an architecture from the
+            # checkpoint name, so a config.json without `model_type` -- the
+            # prajjwal1/bert-tiny|mini|small family again -- is refused. Those
+            # are plain BERT checkpoints, so load them as BERT explicitly.
+            if "model_type" not in str(exc):
+                raise
+            return BertForSequenceClassification.from_pretrained(
+                self.model_name, num_labels=self.task.num_labels)
 
     def new_trainer(self, model, epochs: float | None = None, progress: bool = False,
                     train_examples: int | None = None):
@@ -209,7 +253,7 @@ class GlueHarness:
             per_device_eval_batch_size=self.batch_size * 2,
             num_train_epochs=self.epochs if epochs is None else epochs,
             weight_decay=0.01,
-            warmup_ratio=0.1,
+            **_warmup_fraction(TrainingArguments, WARMUP_FRACTION),
             eval_strategy="no",
             save_strategy="no",
             logging_strategy="steps",

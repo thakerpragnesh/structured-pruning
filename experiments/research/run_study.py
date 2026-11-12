@@ -51,6 +51,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tasks", nargs="+", default=["mrpc"])
     p.add_argument("--model", default="google-bert/bert-base-uncased")
+    p.add_argument("--tokenizer", default=None,
+                   help="tokenizer checkpoint if different from --model (needed on transformers 5 for "
+                        "models shipping only vocab.txt, e.g. prajjwal1/bert-*: use google-bert/bert-base-uncased)")
     p.add_argument("--seeds", nargs="+", type=int, default=[1])
     p.add_argument("--variants", nargs="+", default=["quick"], help="variant names and/or presets")
     p.add_argument("--percents", nargs="+", type=float, default=[40])
@@ -269,7 +272,8 @@ def main(argv=None):
             harness = GlueHarness(task, args.model, args.work_dir, seed, epochs=args.epochs,
                                   batch_size=args.batch_size, learning_rate=args.lr,
                                   max_length=args.max_length, train_limit=args.train_limit,
-                                  eval_limit=args.eval_limit, smoke=args.smoke)
+                                  eval_limit=args.eval_limit, smoke=args.smoke,
+                                  tokenizer_name=args.tokenizer)
             baseline, baseline_meta = get_baseline(harness, args, task, seed, set_seeds)
             current = (task, seed)
 
@@ -296,7 +300,8 @@ def main(argv=None):
 
         metric = TASKS[task].primary_metric
         row = {
-            "task": task, "model": args.model, "seed": seed, "variant": vname,
+            "task": task, "model": args.model, "tokenizer": args.tokenizer or args.model,
+            "seed": seed, "variant": vname,
             "group": V.VARIANTS[vname].group, "percent": pct, "heal_epochs": float(args.heal_epochs),
             "heal_examples": args.heal_examples,
             "primary_metric": metric,
