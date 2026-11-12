@@ -295,7 +295,7 @@ def main(argv=None):
                                        "percent": pct, "error": f"{type(exc).__name__}: {exc}",
                                        "time": time.strftime("%Y-%m-%d %H:%M:%S")})
             print(f"  ERROR {task} seed={seed} {vname} @{pct:g}%: {type(exc).__name__}: {exc}")
-            del model
+            model = None  # drop the reference; the next iteration builds a fresh copy
             continue
 
         metric = TASKS[task].primary_metric
