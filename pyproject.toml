@@ -19,6 +19,15 @@ transformer-experiments = ["transformers>=4.30"]
 vision-experiments = ["torchvision>=0.15"]
 # Only `prunelib.transformer.NetworkSaliencyScanner.scan()` (a DataFrame report) needs this.
 analysis = ["pandas>=1.5"]
+# experiments/research (the GLUE pruning study): data loading, Trainer, metrics, plots.
+research = [
+    "transformers>=4.41",   # TrainingArguments(eval_strategy=...)
+    "datasets>=2.19",
+    "accelerate>=0.30",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+]
 dev = ["pytest>=7.0", "pandas>=1.5"]
 
 [project.urls]

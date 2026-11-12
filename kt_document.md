@@ -81,6 +81,13 @@ experiments/
     05_ordering.py                does the CNN ordering result transfer?
     06_transformer_techniques.py  prunelib.transformer end to end: calibrated global
                                   head + FFN pruning with bias compensation, twin merge
+    research/                     the GLUE pruning study for the paper (section 4):
+        glue.py, variants.py,     data/metrics/Trainer, the 23 named conditions,
+        run_study.py, summarize.py  resumable runner, mean ± std tables + plots
+notebooks/
+    pruning_study_kaggle_colab.ipynb   runs research/ on Kaggle or Colab
+docs/
+    RUNNING_EXPERIMENTS.md        how to run the study and what to report
 archive/
     legacy_pipeline/        corrected rebuild of pruning_framwork_v4's original
         config.py, data.py, driver scripts. Superseded by direct fixes to that
@@ -359,8 +366,34 @@ pipeline on a random-init `BertForSequenceClassification`: global
 gradient-ranked head pruning, re-calibration, global activation-aware FFN
 pruning (both with bias compensation), then a twin merge. Random weights
 have no real twins, so it plants one exact duplicate neuron to exercise the
-merge path. It has no real-run mode yet. The MRPC accuracy harness
-(`experiments/accuracy/` in `transformer_pruning`) was not ported.
+merge path. It has no real-run mode; that is what `research/` is for.
+
+### `experiments/research/` — the study behind a paper
+
+Generalises `transformer_pruning`'s MRPC harness to GLUE × seeds ×
+criteria × budgets, for free interruptible GPUs. Read
+`docs/RUNNING_EXPERIMENTS.md` before running it. Four files, one job each:
+
+- `glue.py` — task specs (primary metric per task: accuracy for MRPC/QQP,
+  because majority-positive data makes F1 uninformative), tokenization,
+  sklearn/scipy metrics, and `new_trainer`, which **must** be called fresh
+  after every surgery (a reused Trainer's optimizer holds the replaced
+  parameters and silently trains nothing).
+- `variants.py` — the 23 conditions as `name -> apply(model, percent, ctx)`,
+  grouped into presets `rq1-ffn`, `rq1-heads`, `rq2-order`, `quick`. A new
+  condition is one dict entry.
+- `run_study.py` — one cached baseline per (task, model, seed). Appends
+  one JSON line per finished run; skips finished runs; `--resume-from`
+  merges a previous session; `--time-budget-hours` stops cleanly; pins one
+  GPU so Kaggle T4×2 doesn't change the effective batch size; records GPU,
+  versions and git commit on every row. Failed runs go to `errors.jsonl`
+  and are retried next time.
+- `summarize.py` — mean ± std over seeds with **paired** drops (each seed
+  against its own baseline), Markdown/CSV tables, and plots.
+
+`--smoke` runs all of it on a random-init tiny BERT with synthetic data in
+seconds (in CI). It has also been checked on real MRPC/RTE with
+`prajjwal1/bert-tiny`. Those numbers are mechanics only.
 
 ## 5. Testing conventions
 
@@ -440,11 +473,13 @@ correct public implementation. Current state, honestly:
   real HF activations through `ActivationRecorder`. The two overlap and
   haven't been consolidated.)
 - **No `prunelib.transformer` criterion has a reproduced accuracy number in
-  this repo.** The mechanics are tested (and the source repo reports a check
+  this repo yet** — the harness exists (`experiments/research/`), but it
+  hasn't been run at BERT-base scale. The mechanics are tested (and the source repo reports a check
   against a real transformers `BertForSequenceClassification` where pruned
-  logits matched zero-gating the same heads to 1e-8 -- not re-run here), but the MRPC accuracy scripts were
-  not ported and nothing here has been fine-tuned → pruned → healed end to
-  end. Don't cite a criterion comparison from this repo until that's done.
+  logits matched zero-gating the same heads to 1e-8 -- not re-run here),
+  but nothing here has been fine-tuned → pruned → healed at publishable
+  scale. Don't cite a criterion comparison from this repo until
+  `docs/RUNNING_EXPERIMENTS.md`'s staged plan has produced it.
 - **Two definitions of "Max-k on a Linear layer" coexist.** Core `"max_k"`
   treats a Linear weight as a 1x1 conv (top-k over each input's one-tap
   kernel), so on an FFN it equals L1. `prunelib.transformer.TopKMagnitudeScorer(k)`

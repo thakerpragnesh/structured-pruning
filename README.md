@@ -55,7 +55,8 @@ specifically (the Transformer experiments or `prunelib/masking.py`).
 ```bash
 pip install -e .                       # core: torch only
 pip install -e ".[analysis]"           # + pandas, for NetworkSaliencyScanner.scan()
-pip install -e ".[dev,transformer-experiments,vision-experiments]"   # everything CI runs
+pip install -e ".[research]"           # + datasets/accelerate/sklearn/matplotlib, for experiments/research
+pip install -e ".[dev,transformer-experiments,vision-experiments,research]"   # everything CI runs
 ```
 
 ## Quickstart
@@ -171,9 +172,12 @@ bookkeeping. Likewise, core `"max_k"` treats a Linear weight as a 1x1 conv,
 so on an FFN it equals L1, while `TopKMagnitudeScorer(k)` sums each
 neuron's k strongest incoming connections.
 
-The research numbers for these criteria have **not** been reproduced in
-this repo. The MRPC accuracy harness (`experiments/accuracy/` in
-`transformer_pruning`) was not ported.
+The research numbers for these criteria have **not** been produced yet.
+The harness that produces them is `experiments/research/`: GLUE tasks ×
+seeds × criteria × budgets, resumable on free Kaggle/Colab GPUs, with
+paired mean ± std tables and plots. See
+[`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md) and
+`notebooks/pruning_study_kaggle_colab.ipynb`.
 
 ## Results
 
@@ -259,6 +263,12 @@ experiments/
     04_coactivation.py          activation-based redundancy
     05_ordering.py              does the CNN ordering result transfer?
     06_transformer_techniques.py  calibrated head + FFN pruning, twin merging
+    research/                   the GLUE pruning study (run_study.py, summarize.py,
+                                variants.py, glue.py) -- see docs/RUNNING_EXPERIMENTS.md
+notebooks/
+    pruning_study_kaggle_colab.ipynb   one notebook for Kaggle and Colab
+docs/
+    RUNNING_EXPERIMENTS.md      step-by-step guide to producing publishable numbers
 archive/
     legacy_pipeline/            corrected replacement for the six original
         config.py, data.py, model.py,   driver scripts -- now redundant with

@@ -119,8 +119,8 @@ class HeadCalibrator:
                 if not rows.shape[0]:
                     return
                 ctx = rows.reshape(rows.shape[0], num_heads, -1)
-                batch_sum = ctx.sum(dim=0).double().cpu()
-                batch_second = torch.einsum("nhd,nhe->hde", ctx, ctx).double().cpu()
+                batch_sum = ctx.sum(dim=0).cpu().double()
+                batch_second = torch.einsum("nhd,nhe->hde", ctx, ctx).cpu().double()
                 if acc["sum"] is None:
                     acc["sum"], acc["second"] = batch_sum, batch_second
                 else:
@@ -141,7 +141,7 @@ class HeadCalibrator:
             output, num_heads = outputs[idx]
             mean = acc["sum"] / n                        # (H, d)
             second = acc["second"] / n                   # (H, d, d)
-            w = output.weight.detach().double().cpu()    # (hidden_out, H * d)
+            w = output.weight.detach().cpu().double()    # (hidden_out, H * d)
             w = w.reshape(w.shape[0], num_heads, -1).permute(1, 0, 2)   # (H, hidden_out, d)
             gram = torch.einsum("hod,hoe->hde", w, w)    # W_O[:, h]^T W_O[:, h]
             mean_square = (gram * second).sum(dim=(1, 2))
@@ -214,7 +214,7 @@ class HeadCalibrator:
             for idx, gate, grad in zip(layer_indices, gates, grads):
                 if grad is None:  # gate not on the loss path at all: importance 0
                     grad = torch.zeros_like(gate)
-                contribution = (grad.detach().abs() * batch_size).sum(dim=0).double().cpu()
+                contribution = (grad.detach().abs() * batch_size).sum(dim=0).cpu().double()
                 totals[idx] = contribution if totals[idx] is None else totals[idx] + contribution
             examples["n"] += batch_size
 

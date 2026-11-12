@@ -9,3 +9,9 @@ dist/
 .DS_Store
 results/*.csv
 !results/.gitkeep
+
+# experiments/research outputs (results, cached baselines, Trainer scratch)
+study_runs*/
+
+# Claude Code personal settings (permissions granted on this machine only)
+.claude/settings.local.json

@@ -138,7 +138,7 @@ class FFNCalibrator:
                     return
                 batch = (acts.sum(dim=0), acts.abs().sum(dim=0), acts.square().sum(dim=0))
                 for key, value in zip(("sum", "abs_sum", "sq_sum"), batch):
-                    value = value.double().cpu()
+                    value = value.cpu().double()
                     acc[key] = value if acc[key] is None else acc[key] + value
                 acc["tokens"] += acts.shape[0]
             return hook
@@ -196,7 +196,7 @@ class FFNCalibrator:
             if not acts.shape[0]:
                 return
             products = acts[:, left_idx.to(acts.device)] * acts[:, right_idx.to(acts.device)]
-            batch_sum = products.sum(dim=0).double().cpu()
+            batch_sum = products.sum(dim=0).cpu().double()
             totals["sum"] = batch_sum if totals["sum"] is None else totals["sum"] + batch_sum
             totals["tokens"] += acts.shape[0]
 
