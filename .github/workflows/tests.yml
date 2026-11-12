@@ -15,10 +15,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - name: Install
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,transformer-experiments,vision-experiments]"
+          pip install -e ".[dev,transformer-experiments,vision-experiments,research]"
       - name: Run tests
         run: pytest tests/ -v
       - name: Run smoke experiments
@@ -29,4 +31,8 @@ jobs:
           python experiments/03_head_redundancy.py --smoke
           python experiments/04_coactivation.py
           python experiments/05_ordering.py --budget 0.4
-          python experiments/06_transformer_techniques.py --smoke
+          python experiments/06_generic_pruning.py --smoke
+          python experiments/07_quantization.py
+          python experiments/08_transformer_techniques.py --smoke
+          python experiments/research/run_study.py --smoke --variants all --work-dir /tmp/study_smoke
+          python experiments/research/summarize.py /tmp/study_smoke/results.jsonl --include-smoke --plot

@@ -105,7 +105,7 @@ def _fake_data(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
             num_classes=cfg.num_classes, transform=transforms.ToTensor(),
         )
 
-    return split(32), split(16)
+    return split(cfg.fakedata_train_size), split(cfg.fakedata_test_size)
 
 
 def build_datasets(cfg: PruningConfig) -> tuple[Dataset, Dataset]:

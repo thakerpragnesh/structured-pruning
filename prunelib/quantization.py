@@ -1,0 +1,222 @@
+"""
+Post-training quantization: precision-reduction methods applied to a
+model's weights, as a separate compression stage from pruning. Reference
+implementation of thesis Ch. 6.6 (Pragnesh Thaker's Ph.D. thesis, "Pruning
+and Quantization Techniques for Deep Neural Network Acceleration", NITK
+Surathkal, July 2025 -- see KT.md section 10.2, which is where this gap was
+first written down). None of this existed anywhere in `prunelib` before
+this module; `prunelib` covered pruning only.
+
+Three methods, in the order the thesis found them best-to-worst by accuracy
+retention on a pruned VGG16 (thesis Ch. 6.6.4):
+
+- `quantize_float16` -- direct fp32->fp16 cast. Best tradeoff the thesis
+  measured (halves memory for a 1.34% accuracy drop); widely supported
+  natively by accelerators and mobile processors.
+- `quantize_int8_linear` / `dequantize_int8_linear` -- the standard affine
+  scale/zero-point mapping (thesis Eq. 6.7-6.10). The thesis includes this
+  as a reference technique rather than one it ran end-to-end.
+- `quantize_fixed_point32` -- a fixed 1-sign/3-integer/28-fractional bit
+  format. Thesis found this markedly worse (3.26% accuracy drop) than
+  Float16, because a fixed exponent can't adapt to each layer's actual
+  weight distribution the way floating point does. Kept here to reproduce
+  the thesis's own comparison, not as a recommended technique.
+
+Float16 and fixed-point both round-trip a tensor and hand back something the
+same shape, ready to keep computing with. INT8 is different -- realizing its
+actual 4x memory reduction means storing `int8` values plus a separate
+`scale`/`zero_point`, not a tensor you can substitute in place of the
+original and keep doing float arithmetic against -- so it returns a small
+`Int8Tensor` struct instead, with an explicit `dequantize_int8_linear` to
+get back to float32 for computation.
+
+Every function here operates on a `torch.Tensor` and returns a *new* one
+(or a new struct), matching the rest of `prunelib`'s convention of never
+mutating what's passed in (`surgery.py`). `quantize_model_` is
+the one deliberate, name-flagged exception -- there's no "new, smaller
+module" to construct and return here the way surgery has one, since
+quantization doesn't change any tensor's shape, only its precision -- see
+its own docstring, which follows the same precedent `masking.commit_mask`
+already set for an explicitly in-place operation in this library.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import torch
+import torch.nn as nn
+
+from .registry import Registry
+
+# The layer types thesis Ch. 6.6 quantized in VGG16 -- pass it as
+# `quantize_model_(..., module_types=QUANTIZABLE_MODULE_TYPES)` to reproduce
+# that scope exactly. The default is every parameter in the model.
+QUANTIZABLE_MODULE_TYPES = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.BatchNorm1d)
+
+# Same-shape round-trip methods `quantize_model_` can apply: `(tensor,
+# **kwargs) -> tensor` of the same shape, castable back to the input's dtype.
+# INT8 is deliberately *not* one of them -- `quantize_int8_linear` returns an
+# `Int8Tensor` struct, a different contract, so registering it here would
+# break `quantize_model_`'s uniform copy-back loop. Register new same-shape
+# methods (e.g. logarithmic quantization, KT.md section 10.2) with
+# `register_quantization_method`.
+QUANTIZATION_METHODS: Registry = Registry("method")
+register_quantization_method = QUANTIZATION_METHODS.register
+
+
+@register_quantization_method("float16")
+def quantize_float16(tensor: torch.Tensor) -> torch.Tensor:
+    """Direct fp32 (or any float dtype) -> fp16 cast."""
+    return tensor.to(torch.float16)
+
+
+def dequantize_float16(tensor: torch.Tensor) -> torch.Tensor:
+    """Cast a Float16 tensor back to float32."""
+    return tensor.to(torch.float32)
+
+
+@dataclass
+class Int8Tensor:
+    """The result of `quantize_int8_linear`: `values` (int8) plus the
+    `scale`/`zero_point` needed to recover approximate float32 values via
+    `dequantize_int8_linear`. `original_shape` is stored for convenience --
+    `values.shape` is already the same shape, but this makes the struct
+    self-documenting without needing the original tensor in scope."""
+
+    values: torch.Tensor
+    scale: float
+    zero_point: int
+    original_shape: torch.Size
+
+
+def quantize_int8_linear(tensor: torch.Tensor) -> Int8Tensor:
+    """Linear (affine) INT8 quantization -- thesis Eq. 6.7-6.9:
+
+        scale = (r_max - r_min) / (q_max - q_min)
+        zero_point = round(q_min - r_min / scale)
+        x_int8 = round(x_fp32 / scale) + zero_point
+
+    with `[q_min, q_max] = [-128, 127]` for signed INT8. Values are clamped
+    to that range after rounding (a tensor with outliers far from its bulk
+    would otherwise overflow `int8`, which silently wraps rather than
+    clips -- clamping first is what keeps this a lossy-but-bounded
+    approximation instead of a wildly wrong one for a few entries).
+
+    A constant tensor (`r_max == r_min`) would divide by zero in the general
+    formula above; handled separately by setting `scale` to the constant's
+    own magnitude (or `1.0` for an all-zero tensor) and `zero_point` to `0`
+    -- `x_int8` is then just its sign, and `scale * sign` reproduces the
+    original constant exactly regardless of magnitude, which the general
+    formula's fixed `[-128, 127]` grid can't generally do for an arbitrary
+    non-integer value.
+    """
+    r_min = tensor.min().item()
+    r_max = tensor.max().item()
+    q_min, q_max = -128, 127
+
+    if r_max == r_min:
+        scale = abs(r_min) if r_min != 0.0 else 1.0
+        zero_point = 0
+    else:
+        scale = (r_max - r_min) / (q_max - q_min)
+        zero_point = int(round(q_min - r_min / scale))
+        zero_point = max(q_min, min(q_max, zero_point))
+
+    x_int8 = torch.clamp(torch.round(tensor / scale) + zero_point, q_min, q_max).to(torch.int8)
+    return Int8Tensor(values=x_int8, scale=scale, zero_point=zero_point, original_shape=tensor.shape)
+
+
+def dequantize_int8_linear(quantized: Int8Tensor) -> torch.Tensor:
+    """Recover an approximate float32 tensor: `scale * (x_int8 - zero_point)`
+    (thesis Eq. 6.10)."""
+    return (quantized.values.to(torch.float32) - quantized.zero_point) * quantized.scale
+
+
+@register_quantization_method("fixed_point32")
+def quantize_fixed_point32(tensor: torch.Tensor, integer_bits: int = 3, fractional_bits: int = 28) -> torch.Tensor:
+    """Round-trip `tensor` through a signed fixed-point format (1 sign bit +
+    `integer_bits` + `fractional_bits`, thesis defaults 3/28 -- still 32
+    bits total, so this is a precision experiment, not a memory-saving one,
+    unlike Float16/INT8 above) and back to float32.
+
+    Values outside the representable range `[-2^(integer_bits+fractional_bits),
+    2^(integer_bits+fractional_bits) - 1]` are *clamped*, never wrapped --
+    the thesis's own finding (Ch. 6.6.2) is that a fixed exponent can't
+    rescale to fit a layer's actual weight distribution the way floating
+    point can, so values at the tails are either wasted precision or lost;
+    clamping is what "lost" means here, made explicit rather than silently
+    wrapping to a wildly wrong value.
+    """
+    scale = 2**fractional_bits
+    max_val = 2 ** (integer_bits + fractional_bits) - 1
+    min_val = -(2 ** (integer_bits + fractional_bits))
+    scaled = torch.round(tensor * scale)
+    clamped = torch.clamp(scaled, min_val, max_val)
+    return clamped / scale
+
+
+@torch.no_grad()
+def quantize_model_(
+    model: nn.Module,
+    method: str | Callable[..., torch.Tensor] = "float16",
+    module_types: tuple[type, ...] | None = None,
+    **kwargs,
+) -> nn.Module:
+    """Apply `method`'s quantization error to every floating-point parameter
+    of `model`, **in place**, then cast the result back to that parameter's
+    original dtype -- each parameter once, even one shared by two modules
+    (tied weights), so a method that isn't idempotent isn't applied twice.
+
+    `module_types` narrows it to the parameters those module types own
+    directly (`QUANTIZABLE_MODULE_TYPES` is thesis Ch. 6.6's Linear/Conv2d/
+    BatchNorm scope). A child module's parameters are quantized when the
+    child's own type is listed (`nn.MultiheadAttention` owns
+    `in_proj_weight`; its `out_proj` is a `Linear`). It used to look up
+    `weight` and `bias` by name, so a listed type that names its parameters
+    otherwise was silently left untouched (`MultiheadAttention`), or crashed
+    when `bias` was a flag (`nn.LSTM`). And the default *was* that closed
+    list: a Conv1d, a LayerNorm, an Embedding, a `SyncBatchNorm` stayed at
+    full precision without a word, so the output drift this measures
+    under-reported -- and `evaluate.estimate_size_bytes(model, 16)` counted
+    those parameters as 16-bit anyway.
+
+    `method` is a name in `QUANTIZATION_METHODS` ("float16",
+    "fixed_point32", or one registered later) or a same-shape `(tensor,
+    **kwargs) -> tensor` function itself; `kwargs` are forwarded to it. Its
+    answer must have the parameter's own shape, or this raises naming the
+    method: it used to be copied back with broadcasting, so a method that
+    returned one value per row (`keepdim=True`) overwrote every row with a
+    constant, silently.
+    INT8 isn't included here because
+    `quantize_int8_linear` returns a separate `Int8Tensor` struct, not a
+    same-shape, same-dtype replacement this function's uniform copy-back
+    loop can use; call `quantize_int8_linear`/`dequantize_int8_linear`
+    directly per-tensor if you need INT8's actual memory savings.
+
+    Casting back to float32 (rather than leaving the model in `float16`)
+    is deliberate: this function's job is to measure a precision option's
+    effect on the model's *output*, the same way the thesis evaluates
+    accuracy drop after quantization -- not to actually shrink the model's
+    storage. For real fp16 storage savings, call `model.half()` directly;
+    nothing here does that better than PyTorch's own built-in.
+
+    Mutates `model` in place and returns it for convenience -- unlike the
+    rest of `prunelib`, which never mutates what's passed in, because
+    there's no new, smaller module to construct and return instead (shapes
+    are unchanged; only numeric precision is). This follows the same
+    explicit, name-flagged exception `masking.commit_mask` already set.
+    """
+    fn = QUANTIZATION_METHODS.resolve(method)
+
+    owners = model.modules() if module_types is None else (m for m in model.modules() if isinstance(m, module_types))
+    params = {id(p): p for m in owners for p in m.parameters(recurse=False) if p.is_floating_point()}
+    for param in params.values():
+        quantized = fn(param, **kwargs)
+        if tuple(quantized.shape) != tuple(param.shape):
+            raise ValueError(
+                f"quantization method {getattr(method, '__name__', method)!r} turned a {tuple(param.shape)} "
+                f"parameter into {tuple(quantized.shape)}; a method returns a tensor of its input's shape"
+            )
+        param.copy_(quantized.to(param.dtype))
+    return model

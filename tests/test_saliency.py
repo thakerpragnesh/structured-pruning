@@ -135,10 +135,20 @@ def test_l1_l2_random_accept_2d_linear_weights():
         assert scores.shape == (7,)
 
 
-def test_unsupported_weight_rank_is_rejected():
-    with pytest.raises(ValueError, match="2D Linear weight"):
-        max_k_saliency(torch.randn(3, 4, 5))  # 3D: neither Linear nor Conv2d shaped
-    with pytest.raises(ValueError, match="2D Linear weight"):
+def test_any_out_in_kernel_weight_is_scored_and_lower_ranks_are_rejected():
+    """Open/closed: the scorers accepted 2D and 4D weights only, so a Conv1d
+    or Conv3d weight raised even once a module rule had taught the graph to
+    prune that type. Any `[out, in, *kernel]` weight is scored by flattening
+    its kernel, exactly as a Conv2d's is."""
+    torch.manual_seed(6)
+    conv3d = torch.randn(5, 3, 2, 3, 3)
+    as_conv2d = conv3d.reshape(5, 3, 2, 9)  # same per-kernel values, a 2x9 "kernel"
+    for weight in (torch.randn(5, 3, 4), conv3d):
+        for scorer in (max_k_saliency, l1_saliency, l2_saliency, random_saliency):
+            assert scorer(weight).shape == (5,)
+    assert torch.equal(max_k_saliency(conv3d, k=4), max_k_saliency(as_conv2d, k=4))
+
+    with pytest.raises(ValueError, match=r"\[out, in, \*kernel\]"):
         l1_saliency(torch.randn(3))
 
 

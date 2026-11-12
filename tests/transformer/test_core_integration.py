@@ -34,14 +34,14 @@ def test_registered_scorer_bridges_core_methods(model):
     assert kept == 8 and model.encoder.layer[0].output.dense.in_features == 8
 
 
-def test_registered_scorer_sees_user_registered_methods(monkeypatch, model):
-    from prunelib import saliency
-    monkeypatch.setattr(saliency, "_METHODS", dict(saliency._METHODS))
-    prunelib.register_saliency("row_max", lambda w: w.detach().abs().amax(dim=1))
-
-    layers = discover_layers(model, include_conv=False, include_linear=True, linear_name_filter="intermediate")
-    weakest = NetworkSaliencyScanner(layers, RegisteredScorer("row_max")).weakest_units(layers[0].name, n=2)
-    assert len(weakest) == 2
+def test_registered_scorer_sees_user_registered_methods(model):
+    prunelib.register_saliency_method("row_max", lambda w: w.detach().abs().amax(dim=1))
+    try:
+        layers = discover_layers(model, include_conv=False, include_linear=True, linear_name_filter="intermediate")
+        weakest = NetworkSaliencyScanner(layers, RegisteredScorer("row_max")).weakest_units(layers[0].name, n=2)
+        assert len(weakest) == 2
+    finally:
+        prunelib.SALIENCY_METHODS.unregister("row_max")
 
 
 def test_head_distance_accepts_core_metrics(model):

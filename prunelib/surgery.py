@@ -21,102 +21,193 @@ attention: `head_analysis`-style redundancy detection (`experiments/03`,
 in this module able to act on the result. See its docstring for why it
 touches four projections (Q/K/V rows + output columns) instead of the two
 `prune_ffn_block` needs.
+
+Everything here is built from four primitives -- `slice_conv2d`,
+`slice_depthwise_conv2d`, `slice_linear`, `slice_batchnorm` -- each "keep
+these output rows / input columns of one module, return a new module". They
+are the only code in `prunelib` that constructs a pruned replacement module:
+`graph.py`'s per-module-type rules (`module_rules.py`) and `vgg.py`'s
+classifier resize call them too, where each used to carry its own copy of
+the same index-and-copy logic (and of BatchNorm's running-statistics copy).
+
+A replacement must be a drop-in substitute for the module it replaces, so
+each primitive builds it as a *copy* of the original with resized tensors
+(`_resized_copy`): same class, kernel/stride/padding/dilation,
+`padding_mode`, device, dtype, train/eval mode and `requires_grad`. Two
+earlier versions each lost part of that. Before the primitives were
+consolidated, every rebuilt module was created on the CPU in float32 with
+`padding_mode='zeros'` -- pruning a CUDA model left CPU layers inside it,
+and a `'reflect'`-padded conv silently became zero-padded. After that, they
+were still constructed as a fresh `nn.Conv2d` / `nn.Linear`: a subclass
+(a weight-standardized conv, say) silently became the plain base class and
+computed something else, a frozen layer came back trainable, and a layer
+of a model in eval mode came back in training mode.
+
+A masked module's tensors are read with `live_tensor` -- what its next
+forward pass computes from `weight_orig * weight_mask` -- never from the
+`weight` attribute `torch.nn.utils.prune` leaves behind, which is only
+refreshed by a forward pass and so is one optimizer step stale while
+fine-tuning with a mask (see `live_tensor`).
 """
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
+import torch.nn.utils.prune as torch_prune
+
+from .indices import as_index, expand_blocks, on_device_of
 
 
-def _factory_kwargs(param: torch.Tensor) -> dict:
-    """Build replacement modules on the same device/dtype as the original,
-    so surgery on a GPU (or half-precision) model doesn't silently hand back
-    CPU float32 layers."""
-    return {"device": param.device, "dtype": param.dtype}
+def live_tensor(module: nn.Module, name: str = "weight") -> torch.Tensor | None:
+    """`module.<name>` as `module`'s next forward pass will compute it.
+
+    For a tensor masked through `torch.nn.utils.prune` (`masking.
+    mask_channels`), that is `<name>_orig * <name>_mask`, worked out now.
+    The `module.<name>` attribute itself is only recomputed by a forward
+    pre-hook, so after an optimizer step it still holds the values from the
+    forward pass before the step. `PruningGroup.prune()` on a masked group,
+    `prune_model` scoring a masked layer and `vgg.mask_vgg_layer`'s next
+    selection all read that attribute, so after fine-tuning with a mask they
+    rebuilt and scored the layer as it was one step earlier, silently. An
+    unmasked tensor is returned as it is."""
+    for hook in module._forward_pre_hooks.values():
+        if isinstance(hook, torch_prune.BasePruningMethod) and hook._tensor_name == name:
+            return hook.apply_mask(module)
+    return getattr(module, name)
 
 
-def _select(t: torch.Tensor, dim: int, idx: torch.Tensor | None) -> torch.Tensor:
-    return t if idx is None else t.index_select(dim, idx.to(t.device))
+def _resized_copy(module: nn.Module, tensors: dict[str, torch.Tensor | None], **attrs) -> nn.Module:
+    """A copy of `module` -- same class, configuration, train/eval mode and
+    `requires_grad` -- whose parameters/buffers named in `tensors` are the
+    given (resized) tensors, and whose attributes in `attrs` (its channel
+    counts) are updated. The original is left untouched.
 
+    A masked module (`masking.mask_channels`, i.e. `torch.nn.utils.prune`'s
+    reparametrization) comes back unmasked, its masked values baked in: the
+    caller sliced `live_tensor(module, "weight")`, which has the mask
+    applied. A tensor that is computed from others -- weight norm, spectral
+    norm, a `torch.nn.utils.parametrize` parametrization -- raises rather
+    than be resized here and silently recomputed at its old size."""
+    pruning_hooks = {k: h for k, h in module._forward_pre_hooks.items() if isinstance(h, torch_prune.BasePruningMethod)}
+    masked = {h._tensor_name for h in pruning_hooks.values()}
+    # A masked tensor the caller didn't resize keeps its (masked) value.
+    tensors = {**tensors, **{name: live_tensor(module, name) for name in sorted(masked) if name not in tensors}}
+    for name in tensors:
+        if name not in module._parameters and name not in module._buffers and name not in masked:
+            raise NotImplementedError(
+                f"{type(module).__name__}.{name} is computed from other tensors (weight norm, spectral norm or a "
+                f"parametrization), not stored, so it can't be resized here -- remove that reparametrization first"
+            )
 
-def _slice_conv(
-    conv: nn.Conv2d,
-    keep_out: torch.Tensor | None = None,
-    keep_in: torch.Tensor | None = None,
-) -> nn.Conv2d:
-    """New Conv2d keeping output channels `keep_out` and input channels
-    `keep_in` (None = keep all along that axis). Bias follows the output
-    axis only."""
-    if conv.groups != 1:
-        raise ValueError(
-            f"grouped/depthwise convolutions (groups={conv.groups}) are not supported -- "
-            "slicing channels independently would break the group partition"
-        )
-    out_ch = conv.out_channels if keep_out is None else keep_out.numel()
-    in_ch = conv.in_channels if keep_in is None else keep_in.numel()
-    new = nn.Conv2d(
-        in_ch,
-        out_ch,
-        kernel_size=conv.kernel_size,
-        stride=conv.stride,
-        padding=conv.padding,
-        dilation=conv.dilation,
-        groups=1,
-        bias=conv.bias is not None,
-        padding_mode=conv.padding_mode,
-        **_factory_kwargs(conv.weight),
-    )
-    with torch.no_grad():
-        new.weight.copy_(_select(_select(conv.weight, 0, keep_out), 1, keep_in))
-        if conv.bias is not None:
-            new.bias.copy_(_select(conv.bias, 0, keep_out))
+    # Copy everything but the tensors being replaced and the masking state
+    # being dropped: mapping them to None in the memo skips copying them.
+    skipped = [getattr(module, name) for name in tensors]
+    skipped += [module._parameters[f"{name}_orig"] for name in masked] + [module._buffers[f"{name}_mask"] for name in masked]
+    memo = {id(obj): None for obj in [*skipped, *pruning_hooks.values()] if obj is not None}
+    new = copy.deepcopy(module, memo)
+    for name in masked:
+        del new._parameters[f"{name}_orig"], new._buffers[f"{name}_mask"]
+        new.__dict__.pop(name, None)
+    for key in pruning_hooks:
+        del new._forward_pre_hooks[key]
+
+    for name, value in tensors.items():
+        value = None if value is None else value.detach().clone()
+        if name in module._buffers:
+            new._buffers[name] = value
+        else:
+            original = module._parameters.get(f"{name}_orig", module._parameters.get(name))
+            setattr(new, name, None if value is None else nn.Parameter(value, requires_grad=original.requires_grad))
+    for name, value in attrs.items():
+        setattr(new, name, value)
     return new
 
 
-def _slice_bn(bn: nn.BatchNorm2d, keep: torch.Tensor) -> nn.BatchNorm2d:
-    """New BatchNorm2d over channels `keep`, carrying affine params *and*
-    running statistics.
+def _take(module: nn.Module, keep_out, keep_in):
+    """`module`'s live weight with only output rows `keep_out` (dim 0, and
+    the bias with them) and input columns `keep_in` (dim 1). `None` keeps
+    that whole dimension."""
+    weight, bias = live_tensor(module, "weight"), live_tensor(module, "bias")
+    if keep_out is not None:
+        weight = weight.index_select(0, on_device_of(keep_out, weight))
+        if bias is not None:
+            bias = bias.index_select(0, on_device_of(keep_out, bias))
+    if keep_in is not None:
+        weight = weight.index_select(1, on_device_of(keep_in, weight))
+    return weight, bias
+
+
+def is_depthwise_conv(module: nn.Module) -> bool:
+    """One filter per channel: `groups == in_channels == out_channels > 1`.
+    Input and output channels are then the same dimension."""
+    return (
+        isinstance(module, nn.Conv2d)
+        and module.groups > 1
+        and module.groups == module.in_channels == module.out_channels
+    )
+
+
+@torch.no_grad()
+def slice_conv2d(
+    conv: nn.Conv2d, keep_out: torch.Tensor | None = None, keep_in: torch.Tensor | None = None
+) -> nn.Conv2d:
+    """New ungrouped Conv2d keeping output channels `keep_out` and input
+    channels `keep_in` of `conv` (`None` keeps all of that dimension).
+
+    Raises for a grouped conv: its weight's dim 1 is `in_channels / groups`,
+    not `in_channels`, so neither index means what the caller asked for.
+    (`prune_conv_bn` used to build `groups=1` regardless -- a depthwise
+    conv's `[C, 1, kh, kw]` filters were then silently broadcast across
+    every input channel.) Use `slice_depthwise_conv2d` for depthwise.
+    """
+    if conv.groups != 1:
+        raise ValueError(
+            f"slice_conv2d handles ungrouped convs (groups=1) only, got groups={conv.groups}"
+            + ("; use slice_depthwise_conv2d for a depthwise conv" if is_depthwise_conv(conv) else "")
+        )
+    weight, bias = _take(conv, keep_out, keep_in)
+    return _resized_copy(conv, {"weight": weight, "bias": bias}, in_channels=weight.shape[1], out_channels=weight.shape[0])
+
+
+@torch.no_grad()
+def slice_depthwise_conv2d(conv: nn.Conv2d, keep: torch.Tensor) -> nn.Conv2d:
+    """New depthwise Conv2d keeping channels `keep` -- one index set for
+    input and output alike (each filter owns exactly one channel), and
+    `groups` shrinks to match."""
+    if not is_depthwise_conv(conv):
+        raise ValueError(f"expected a depthwise conv (groups == in == out > 1), got {conv}")
+    weight, bias = _take(conv, keep, None)
+    n = weight.shape[0]
+    return _resized_copy(conv, {"weight": weight, "bias": bias}, in_channels=n, out_channels=n, groups=n)
+
+
+@torch.no_grad()
+def slice_linear(
+    linear: nn.Linear, keep_out: torch.Tensor | None = None, keep_in: torch.Tensor | None = None
+) -> nn.Linear:
+    """New Linear keeping output features `keep_out` (rows of weight and
+    bias) and input features `keep_in` (columns of weight) of `linear`
+    (`None` keeps all of that dimension)."""
+    weight, bias = _take(linear, keep_out, keep_in)
+    return _resized_copy(linear, {"weight": weight, "bias": bias}, in_features=weight.shape[1], out_features=weight.shape[0])
+
+
+@torch.no_grad()
+def slice_batchnorm(bn: nn.modules.batchnorm._NormBase, keep: torch.Tensor) -> nn.modules.batchnorm._NormBase:
+    """New BatchNorm (or InstanceNorm) of the same type keeping channels `keep`.
 
     Carrying running statistics across is a deliberate choice: the original
     omitted this, so the forward pass still ran but produced silently wrong
     activations after pruning (no error, just bad numbers). Copying them
     keeps the pruned model numerically sane before any fine-tuning happens.
     """
-    new = nn.BatchNorm2d(
-        keep.numel(),
-        eps=bn.eps,
-        momentum=bn.momentum,
-        affine=bn.affine,
-        track_running_stats=bn.track_running_stats,
-        **_factory_kwargs(bn.running_mean if bn.running_mean is not None else bn.weight),
-    )
-    with torch.no_grad():
-        if bn.affine:
-            new.weight.copy_(_select(bn.weight, 0, keep))
-            new.bias.copy_(_select(bn.bias, 0, keep))
-        if bn.track_running_stats:
-            new.running_mean.copy_(_select(bn.running_mean, 0, keep))
-            new.running_var.copy_(_select(bn.running_var, 0, keep))
-            new.num_batches_tracked.copy_(bn.num_batches_tracked)
-    return new
-
-
-def _slice_linear(
-    linear: nn.Linear,
-    keep_out: torch.Tensor | None = None,
-    keep_in: torch.Tensor | None = None,
-) -> nn.Linear:
-    """New Linear keeping output rows `keep_out` and input columns `keep_in`
-    (None = keep all along that axis). Bias follows the output axis only,
-    so a layer shrunk on its input side keeps its bias untouched."""
-    out_f = linear.out_features if keep_out is None else keep_out.numel()
-    in_f = linear.in_features if keep_in is None else keep_in.numel()
-    new = nn.Linear(in_f, out_f, bias=linear.bias is not None, **_factory_kwargs(linear.weight))
-    with torch.no_grad():
-        new.weight.copy_(_select(_select(linear.weight, 0, keep_out), 1, keep_in))
-        if linear.bias is not None:
-            new.bias.copy_(_select(linear.bias, 0, keep_out))
-    return new
+    keep = as_index(keep)
+    names = (["weight", "bias"] if bn.affine else []) + (["running_mean", "running_var"] if bn.track_running_stats else [])
+    tensors = {name: live_tensor(bn, name) for name in names}
+    tensors = {name: t.index_select(0, on_device_of(keep, t)) for name, t in tensors.items()}
+    return _resized_copy(bn, tensors, num_features=keep.numel())  # num_batches_tracked is copied as-is
 
 
 def prune_conv_bn(
@@ -129,18 +220,17 @@ def prune_conv_bn(
     new channel count through an optional following BatchNorm2d and an
     optional next Conv2d whose input channels must shrink to match.
 
-    Returns new modules; the originals are left untouched.
+    Returns new modules; the originals are left untouched. The seam is
+    validated before anything is built.
     """
     if next_conv is not None and next_conv.in_channels != conv.out_channels:
         raise ValueError(
             f"seam mismatch: conv emits {conv.out_channels} channels, "
             f"next_conv expects {next_conv.in_channels}"
         )
-    keep_out_idx = keep_out_idx.to(torch.long)
-
-    new_conv = _slice_conv(conv, keep_out=keep_out_idx)
-    new_bn = _slice_bn(bn, keep_out_idx) if bn is not None else None
-    new_next_conv = _slice_conv(next_conv, keep_in=keep_out_idx) if next_conv is not None else None
+    new_conv = slice_conv2d(conv, keep_out=keep_out_idx)
+    new_bn = slice_batchnorm(bn, keep_out_idx) if bn is not None else None
+    new_next_conv = slice_conv2d(next_conv, keep_in=keep_out_idx) if next_conv is not None else None
     return new_conv, new_bn, new_next_conv
 
 
@@ -186,7 +276,7 @@ def prune_attention_heads(
             f"output projection expects {output.in_features}"
         )
 
-    keep_heads = keep_heads.to(torch.long)
+    keep_heads = as_index(keep_heads)
     out_of_range = keep_heads[(keep_heads < 0) | (keep_heads >= num_heads)]
     if out_of_range.numel():
         raise ValueError(
@@ -196,15 +286,12 @@ def prune_attention_heads(
     if keep_heads.numel() == 0:
         raise ValueError("keep_heads is empty -- pruning every head would collapse the attention block")
 
-    keep_rows = torch.cat([torch.arange(h * head_dim, (h + 1) * head_dim) for h in keep_heads.tolist()])
+    keep_rows = expand_blocks(keep_heads, head_dim)
 
-    new_query = _slice_linear(query, keep_out=keep_rows)
-    new_key = _slice_linear(key, keep_out=keep_rows)
-    new_value = _slice_linear(value, keep_out=keep_rows)
-    new_output = _slice_linear(output, keep_in=keep_rows)
-
-    if new_output.in_features != new_query.out_features:  # pragma: no cover - should be unreachable
-        raise RuntimeError("post-surgery seam mismatch — this indicates a bug in prune_attention_heads")
+    new_query = slice_linear(query, keep_out=keep_rows)
+    new_key = slice_linear(key, keep_out=keep_rows)
+    new_value = slice_linear(value, keep_out=keep_rows)
+    new_output = slice_linear(output, keep_in=keep_rows)
     return new_query, new_key, new_value, new_output
 
 
@@ -223,11 +310,6 @@ def prune_ffn_block(fc1: nn.Linear, fc2: nn.Linear, keep_idx: torch.Tensor) -> t
             f"seam mismatch before surgery: fc1 emits {fc1.out_features} features, "
             f"fc2 expects {fc2.in_features}"
         )
-    keep_idx = keep_idx.to(torch.long)
-
-    new_fc1 = _slice_linear(fc1, keep_out=keep_idx)
-    new_fc2 = _slice_linear(fc2, keep_in=keep_idx)
-
-    if new_fc1.out_features != new_fc2.in_features:  # pragma: no cover - should be unreachable
-        raise RuntimeError("post-surgery seam mismatch — this indicates a bug in prune_ffn_block")
+    new_fc1 = slice_linear(fc1, keep_out=keep_idx)
+    new_fc2 = slice_linear(fc2, keep_in=keep_idx)
     return new_fc1, new_fc2

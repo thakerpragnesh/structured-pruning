@@ -39,8 +39,12 @@ def kmeans_assign(x: torch.Tensor, k: int, iters: int = 50, seed: int = 0) -> to
         if torch.equal(new_assignment, assignment):
             break
         assignment = new_assignment
-        for cluster in range(k):
-            members = x[assignment == cluster]
-            if members.shape[0] > 0:
-                centroids[cluster] = members.mean(dim=0)
+        # Vectorized centroid update (one scatter-add, not a Python loop over
+        # k clusters -- that loop dominated runtime at BERT-base scale, where
+        # k is ~1,800 per layer). Same semantics: empty clusters keep their
+        # previous centroid.
+        sums = torch.zeros_like(centroids).index_add_(0, assignment, x.to(centroids.dtype))
+        counts = torch.bincount(assignment, minlength=k)
+        filled = counts > 0
+        centroids[filled] = sums[filled] / counts[filled].unsqueeze(1).to(centroids.dtype)
     return assignment

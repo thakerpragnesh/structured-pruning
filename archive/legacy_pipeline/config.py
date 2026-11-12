@@ -11,7 +11,7 @@ see LEGACY_PIPELINE_MIGRATION.md).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -25,6 +25,8 @@ class PruningConfig:
     image_size: int = 224
     batch_size: int = 32
     num_classes: int = 10
+    fakedata_train_size: int = 32   # only used when dataset_name == "FakeData"
+    fakedata_test_size: int = 16    # only used when dataset_name == "FakeData"
 
     # Model
     load_pretrained: bool = True
@@ -35,7 +37,7 @@ class PruningConfig:
     accuracy_drop_threshold: float = 0.01
     max_iterations: int = 15
     fine_tune_epochs_per_iteration: int = 1
-    method: str = "max_k"                   # "max_k" | "l1" | "l2" | "random"
+    method: str = "max_k"                   # any name in prunelib.selection.available_methods()
 
     # Output
     output_dir: Path = Path("./runs")
