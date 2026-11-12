@@ -28,6 +28,97 @@ import torch
 import torch.nn as nn
 
 
+def _factory_kwargs(param: torch.Tensor) -> dict:
+    """Build replacement modules on the same device/dtype as the original,
+    so surgery on a GPU (or half-precision) model doesn't silently hand back
+    CPU float32 layers."""
+    return {"device": param.device, "dtype": param.dtype}
+
+
+def _select(t: torch.Tensor, dim: int, idx: torch.Tensor | None) -> torch.Tensor:
+    return t if idx is None else t.index_select(dim, idx.to(t.device))
+
+
+def _slice_conv(
+    conv: nn.Conv2d,
+    keep_out: torch.Tensor | None = None,
+    keep_in: torch.Tensor | None = None,
+) -> nn.Conv2d:
+    """New Conv2d keeping output channels `keep_out` and input channels
+    `keep_in` (None = keep all along that axis). Bias follows the output
+    axis only."""
+    if conv.groups != 1:
+        raise ValueError(
+            f"grouped/depthwise convolutions (groups={conv.groups}) are not supported -- "
+            "slicing channels independently would break the group partition"
+        )
+    out_ch = conv.out_channels if keep_out is None else keep_out.numel()
+    in_ch = conv.in_channels if keep_in is None else keep_in.numel()
+    new = nn.Conv2d(
+        in_ch,
+        out_ch,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=1,
+        bias=conv.bias is not None,
+        padding_mode=conv.padding_mode,
+        **_factory_kwargs(conv.weight),
+    )
+    with torch.no_grad():
+        new.weight.copy_(_select(_select(conv.weight, 0, keep_out), 1, keep_in))
+        if conv.bias is not None:
+            new.bias.copy_(_select(conv.bias, 0, keep_out))
+    return new
+
+
+def _slice_bn(bn: nn.BatchNorm2d, keep: torch.Tensor) -> nn.BatchNorm2d:
+    """New BatchNorm2d over channels `keep`, carrying affine params *and*
+    running statistics.
+
+    Carrying running statistics across is a deliberate choice: the original
+    omitted this, so the forward pass still ran but produced silently wrong
+    activations after pruning (no error, just bad numbers). Copying them
+    keeps the pruned model numerically sane before any fine-tuning happens.
+    """
+    new = nn.BatchNorm2d(
+        keep.numel(),
+        eps=bn.eps,
+        momentum=bn.momentum,
+        affine=bn.affine,
+        track_running_stats=bn.track_running_stats,
+        **_factory_kwargs(bn.running_mean if bn.running_mean is not None else bn.weight),
+    )
+    with torch.no_grad():
+        if bn.affine:
+            new.weight.copy_(_select(bn.weight, 0, keep))
+            new.bias.copy_(_select(bn.bias, 0, keep))
+        if bn.track_running_stats:
+            new.running_mean.copy_(_select(bn.running_mean, 0, keep))
+            new.running_var.copy_(_select(bn.running_var, 0, keep))
+            new.num_batches_tracked.copy_(bn.num_batches_tracked)
+    return new
+
+
+def _slice_linear(
+    linear: nn.Linear,
+    keep_out: torch.Tensor | None = None,
+    keep_in: torch.Tensor | None = None,
+) -> nn.Linear:
+    """New Linear keeping output rows `keep_out` and input columns `keep_in`
+    (None = keep all along that axis). Bias follows the output axis only,
+    so a layer shrunk on its input side keeps its bias untouched."""
+    out_f = linear.out_features if keep_out is None else keep_out.numel()
+    in_f = linear.in_features if keep_in is None else keep_in.numel()
+    new = nn.Linear(in_f, out_f, bias=linear.bias is not None, **_factory_kwargs(linear.weight))
+    with torch.no_grad():
+        new.weight.copy_(_select(_select(linear.weight, 0, keep_out), 1, keep_in))
+        if linear.bias is not None:
+            new.bias.copy_(_select(linear.bias, 0, keep_out))
+    return new
+
+
 def prune_conv_bn(
     conv: nn.Conv2d,
     keep_out_idx: torch.Tensor,
@@ -40,78 +131,17 @@ def prune_conv_bn(
 
     Returns new modules; the originals are left untouched.
     """
-    keep_out_idx = keep_out_idx.to(torch.long)
-    new_out = keep_out_idx.numel()
-
-    new_conv = nn.Conv2d(
-        conv.in_channels,
-        new_out,
-        kernel_size=conv.kernel_size,
-        stride=conv.stride,
-        padding=conv.padding,
-        dilation=conv.dilation,
-        groups=1,
-        bias=conv.bias is not None,
-    )
-    with torch.no_grad():
-        new_conv.weight.copy_(conv.weight.index_select(0, keep_out_idx))
-        if conv.bias is not None:
-            new_conv.bias.copy_(conv.bias.index_select(0, keep_out_idx))
-
-    new_bn = None
-    if bn is not None:
-        # Carrying running statistics across is a deliberate choice: the
-        # original omitted this, so the forward pass still ran but produced
-        # silently wrong activations after pruning (no error, just bad
-        # numbers). Copying them keeps the pruned model numerically sane
-        # before any fine-tuning happens.
-        new_bn = nn.BatchNorm2d(new_out, eps=bn.eps, momentum=bn.momentum, affine=bn.affine,
-                                 track_running_stats=bn.track_running_stats)
-        with torch.no_grad():
-            if bn.affine:
-                new_bn.weight.copy_(bn.weight.index_select(0, keep_out_idx))
-                new_bn.bias.copy_(bn.bias.index_select(0, keep_out_idx))
-            if bn.track_running_stats:
-                new_bn.running_mean.copy_(bn.running_mean.index_select(0, keep_out_idx))
-                new_bn.running_var.copy_(bn.running_var.index_select(0, keep_out_idx))
-                new_bn.num_batches_tracked.copy_(bn.num_batches_tracked)
-
-    new_next_conv = None
-    if next_conv is not None:
-        if next_conv.in_channels != conv.out_channels:
-            raise ValueError(
-                f"seam mismatch: conv emits {conv.out_channels} channels, "
-                f"next_conv expects {next_conv.in_channels}"
-            )
-        new_next_conv = nn.Conv2d(
-            new_out,
-            next_conv.out_channels,
-            kernel_size=next_conv.kernel_size,
-            stride=next_conv.stride,
-            padding=next_conv.padding,
-            dilation=next_conv.dilation,
-            groups=1,
-            bias=next_conv.bias is not None,
+    if next_conv is not None and next_conv.in_channels != conv.out_channels:
+        raise ValueError(
+            f"seam mismatch: conv emits {conv.out_channels} channels, "
+            f"next_conv expects {next_conv.in_channels}"
         )
-        with torch.no_grad():
-            new_next_conv.weight.copy_(next_conv.weight.index_select(1, keep_out_idx))
-            if next_conv.bias is not None:
-                new_next_conv.bias.copy_(next_conv.bias)
+    keep_out_idx = keep_out_idx.to(torch.long)
 
+    new_conv = _slice_conv(conv, keep_out=keep_out_idx)
+    new_bn = _slice_bn(bn, keep_out_idx) if bn is not None else None
+    new_next_conv = _slice_conv(next_conv, keep_in=keep_out_idx) if next_conv is not None else None
     return new_conv, new_bn, new_next_conv
-
-
-def _slice_out_features(linear: nn.Linear, keep_idx: torch.Tensor) -> nn.Linear:
-    """New Linear keeping only rows `keep_idx` of weight and bias -- shrinks
-    the layer's *output* dimension. Shared by `prune_attention_heads`'
-    Q/K/V slicing (three near-identical calls would otherwise inline this).
-    """
-    new = nn.Linear(linear.in_features, keep_idx.numel(), bias=linear.bias is not None)
-    with torch.no_grad():
-        new.weight.copy_(linear.weight.index_select(0, keep_idx))
-        if linear.bias is not None:
-            new.bias.copy_(linear.bias.index_select(0, keep_idx))
-    return new
 
 
 def prune_attention_heads(
@@ -168,15 +198,10 @@ def prune_attention_heads(
 
     keep_rows = torch.cat([torch.arange(h * head_dim, (h + 1) * head_dim) for h in keep_heads.tolist()])
 
-    new_query = _slice_out_features(query, keep_rows)
-    new_key = _slice_out_features(key, keep_rows)
-    new_value = _slice_out_features(value, keep_rows)
-
-    new_output = nn.Linear(keep_rows.numel(), output.out_features, bias=output.bias is not None)
-    with torch.no_grad():
-        new_output.weight.copy_(output.weight.index_select(1, keep_rows))
-        if output.bias is not None:
-            new_output.bias.copy_(output.bias)
+    new_query = _slice_linear(query, keep_out=keep_rows)
+    new_key = _slice_linear(key, keep_out=keep_rows)
+    new_value = _slice_linear(value, keep_out=keep_rows)
+    new_output = _slice_linear(output, keep_in=keep_rows)
 
     if new_output.in_features != new_query.out_features:  # pragma: no cover - should be unreachable
         raise RuntimeError("post-surgery seam mismatch — this indicates a bug in prune_attention_heads")
@@ -199,17 +224,9 @@ def prune_ffn_block(fc1: nn.Linear, fc2: nn.Linear, keep_idx: torch.Tensor) -> t
             f"fc2 expects {fc2.in_features}"
         )
     keep_idx = keep_idx.to(torch.long)
-    new_hidden = keep_idx.numel()
 
-    new_fc1 = nn.Linear(fc1.in_features, new_hidden, bias=fc1.bias is not None)
-    new_fc2 = nn.Linear(new_hidden, fc2.out_features, bias=fc2.bias is not None)
-    with torch.no_grad():
-        new_fc1.weight.copy_(fc1.weight.index_select(0, keep_idx))
-        if fc1.bias is not None:
-            new_fc1.bias.copy_(fc1.bias.index_select(0, keep_idx))
-        new_fc2.weight.copy_(fc2.weight.index_select(1, keep_idx))
-        if fc2.bias is not None:
-            new_fc2.bias.copy_(fc2.bias)
+    new_fc1 = _slice_linear(fc1, keep_out=keep_idx)
+    new_fc2 = _slice_linear(fc2, keep_in=keep_idx)
 
     if new_fc1.out_features != new_fc2.in_features:  # pragma: no cover - should be unreachable
         raise RuntimeError("post-surgery seam mismatch — this indicates a bug in prune_ffn_block")

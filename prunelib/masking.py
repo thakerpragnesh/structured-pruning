@@ -39,12 +39,13 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 
+from .saliency import _complement
 from .surgery import prune_conv_bn
 
 
 def build_channel_mask(weight: torch.Tensor, prune_idx: torch.Tensor) -> torch.Tensor:
     """Full-shape mask for `weight` (any shape whose dim 0 is the output/row
-    axis -- Conv2d's [out,in,kh,kw] or Linear's [out,in]) that zeroes every
+    axis -- Conv2d's [out,in,kh,kw], Linear's [out,in], or a 1D bias) that zeroes every
     channel/row listed in `prune_idx` and keeps everything else at 1."""
     mask = torch.ones_like(weight)
     if prune_idx.numel() > 0:
@@ -66,15 +67,10 @@ def mask_channels(module: nn.Module, prune_idx: torch.Tensor, name: str = "weigh
     and wouldn't match what happens once the channel is physically removed
     during compression.
     """
-    weight = getattr(module, name)
-    mask = build_channel_mask(weight, prune_idx)
-    prune.custom_from_mask(module, name=name, mask=mask)
+    prune.custom_from_mask(module, name=name, mask=build_channel_mask(getattr(module, name), prune_idx))
 
     if name == "weight" and getattr(module, "bias", None) is not None:
-        bias_mask = torch.ones_like(module.bias)
-        if prune_idx.numel() > 0:
-            bias_mask[prune_idx.to(torch.long)] = 0
-        prune.custom_from_mask(module, name="bias", mask=bias_mask)
+        prune.custom_from_mask(module, name="bias", mask=build_channel_mask(module.bias, prune_idx))
 
 
 def commit_mask(module: nn.Module, name: str = "weight") -> None:
@@ -99,9 +95,7 @@ def zeroed_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
 def surviving_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Complement of `zeroed_channels`: the "unmasked" channels to copy
     across during compression."""
-    n = weight.shape[0]
-    zero_idx = set(zeroed_channels(weight, atol=atol).tolist())
-    return torch.tensor([i for i in range(n) if i not in zero_idx], dtype=torch.long)
+    return _complement(weight.shape[0], zeroed_channels(weight, atol=atol))
 
 
 def compress_masked_conv_bn(

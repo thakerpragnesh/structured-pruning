@@ -5,25 +5,53 @@ Access 2024) and co-activation overlap (for the Transformer extension work).
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
+
+
+DistanceFn = Callable[[torch.Tensor], torch.Tensor]
+"""Maps row vectors `[N, D]` to a pairwise distance matrix `[N, N]`."""
+
+_METRICS: dict[str, DistanceFn] = {}
+
+
+def register_metric(name: str, fn: DistanceFn | None = None, *, overwrite: bool = False):
+    """Register a pairwise distance under `name` for
+    `pairwise_distance_matrix(..., metric=name)`. Usable directly or as a
+    decorator; mirrors `prunelib.saliency.register_saliency`."""
+
+    def _register(f: DistanceFn) -> DistanceFn:
+        if name in _METRICS and not overwrite:
+            raise ValueError(f"distance metric {name!r} is already registered")
+        _METRICS[name] = f
+        return f
+
+    return _register(fn) if fn is not None else _register
+
+
+def _cosine_distance(vectors: torch.Tensor) -> torch.Tensor:
+    normed = torch.nn.functional.normalize(vectors, dim=1, eps=1e-12)
+    return 1.0 - normed @ normed.T
+
+
+register_metric("manhattan", lambda v: torch.cdist(v, v, p=1))
+register_metric("euclidean", lambda v: torch.cdist(v, v, p=2))
+register_metric("cosine", _cosine_distance)
 
 
 def pairwise_distance_matrix(vectors: torch.Tensor, metric: str = "manhattan") -> torch.Tensor:
     """Pairwise distance between rows of `vectors`, shape [N, D] -> [N, N].
 
-    metric: "manhattan" (L1), "euclidean" (L2), or "cosine" (1 - cosine similarity).
+    metric: "manhattan" (L1), "euclidean" (L2), or "cosine" (1 - cosine
+    similarity), plus anything added via `register_metric`.
     Manhattan was found to outperform the other two for K-Means-based channel
     selection in the paper above (35.15% param / 49.11% FLOPs reduction on
     VGG16 vs. Euclidean's 31.01%/43.96% and Cosine's 21.93%/32.03%).
     """
-    if metric == "manhattan":
-        return torch.cdist(vectors, vectors, p=1)
-    if metric == "euclidean":
-        return torch.cdist(vectors, vectors, p=2)
-    if metric == "cosine":
-        normed = torch.nn.functional.normalize(vectors, dim=1, eps=1e-12)
-        return 1.0 - normed @ normed.T
-    raise ValueError(f"unknown metric {metric!r}, expected 'manhattan', 'euclidean', or 'cosine'")
+    if metric not in _METRICS:
+        raise ValueError(f"unknown metric {metric!r}, expected one of {list(_METRICS)}")
+    return _METRICS[metric](vectors)
 
 
 class CoActivationScanner:
@@ -56,7 +84,7 @@ class CoActivationScanner:
         rate = self.firing_rate(activation_mask)
         keep = (rate <= self.firing_rate_ceiling).nonzero(as_tuple=True)[0]
 
-        sim = torch.zeros(n_units, n_units)
+        sim = torch.zeros(n_units, n_units, device=activation_mask.device)
         if keep.numel() < 2:
             return sim
 

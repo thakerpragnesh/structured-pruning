@@ -13,7 +13,7 @@ import time
 import torch
 import torch.nn as nn
 
-from prunelib import compute_score, count_params, measure_latency, prune_conv_bn, select_prune_indices
+from prunelib import available_methods, compute_score, count_params, keep_indices, measure_latency, prune_conv_bn, select_prune_indices
 
 
 class ConvBlock(nn.Module):
@@ -40,17 +40,14 @@ def main():
     example_input = torch.randn(1, 3, 64, 64)
 
     print(f"{'method':<8} {'lowest-score channel':>22} {'top-3 sum':>12}")
-    for method in ("max_k", "l1", "l2", "random"):
-        kwargs = {"k": 3} if method == "max_k" else {}
-        scores = compute_score(model.conv1.weight, method=method, **kwargs)
+    for method in available_methods():
+        scores = compute_score(model.conv1.weight, method=method)
         weakest = select_prune_indices(scores, 1).item()
         print(f"{method:<8} {weakest:>22} {scores[weakest].item():>12.4f}")
 
     scores = compute_score(model.conv1.weight, method="max_k", k=3)
     n_out = model.conv1.out_channels
-    prune_amount = int(n_out * args.prune_fraction)
-    prune_idx = set(select_prune_indices(scores, prune_amount).tolist())
-    keep_idx = torch.tensor([i for i in range(n_out) if i not in prune_idx])
+    keep_idx = keep_indices(scores, int(n_out * args.prune_fraction))
 
     params_before = count_params(model)
     latency_before = measure_latency(model, example_input)

@@ -4,16 +4,19 @@ VGG-specific structural surgery, built on the generic `prune_conv_bn`.
 Pulled out of experiments/01_vgg_cifar10_sweep.py so the corrected legacy
 pipeline (archive/legacy_pipeline/pipeline.py) and the experiment script
 share one implementation instead of two copies drifting apart.
+
+Only `build_vgg16` needs torchvision, and it imports it lazily: the
+seam-level helpers below work on any `nn.Module` whose `.features` is a
+Conv/BN/ReLU `nn.Sequential`, so they don't force an optional dependency
+on callers who bring their own model.
 """
 from __future__ import annotations
 
-import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-import torchvision
 
 from .masking import commit_mask, mask_channels, surviving_channels
-from .saliency import compute_score, select_prune_indices
+from .saliency import compute_score, keep_indices, prune_count, select_prune_indices
 from .surgery import prune_conv_bn
 
 
@@ -31,10 +34,40 @@ def vgg_conv_bn_positions(features: nn.Sequential) -> list[tuple[int, int | None
 def build_vgg16(num_classes: int = 10, pretrained: bool = True) -> nn.Module:
     """Modern torchvision weights API (`weights=`), not the deprecated
     `pretrained=True/False` boolean removed in recent torchvision versions."""
+    import torchvision  # optional dependency: `pip install structured-pruning[vision-experiments]`
+
     weights = torchvision.models.VGG16_Weights.IMAGENET1K_V1 if pretrained else None
     model = torchvision.models.vgg16(weights=weights)
     model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
     return model
+
+
+def _require_prunable(pairs: list[tuple[int, int | None]], layer_position: int) -> None:
+    """The last conv feeds `model.classifier[0]` rather than another Conv2d,
+    so shrinking it would also require resizing the classifier -- which none
+    of the helpers here do."""
+    if not 0 <= layer_position < len(pairs) - 1:
+        raise ValueError(
+            f"layer_position {layer_position} is the last conv layer (or out of range); "
+            "pruning it requires also resizing model.classifier[0].in_features, "
+            "which these helpers don't do. Use 0 <= layer_position < len(pairs) - 1."
+        )
+
+
+def _shrink_seam(features: nn.Sequential, pairs: list[tuple[int, int | None]], position: int, keep_idx) -> None:
+    """Replace conv `position` (plus its BN and the next conv's input side)
+    in `features` with physically smaller copies keeping only `keep_idx`."""
+    conv_idx, bn_idx = pairs[position]
+    next_conv_idx, _ = pairs[position + 1]
+    bn = features[bn_idx] if bn_idx is not None else None
+
+    new_conv, new_bn, new_next_conv = prune_conv_bn(
+        features[conv_idx], keep_idx, bn=bn, next_conv=features[next_conv_idx]
+    )
+    features[conv_idx] = new_conv
+    if bn_idx is not None:
+        features[bn_idx] = new_bn
+    features[next_conv_idx] = new_next_conv
 
 
 def mask_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float, method: str = "max_k") -> int:
@@ -57,29 +90,16 @@ def mask_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float,
     survivors left to prune).
     """
     pairs = vgg_conv_bn_positions(model.features)
-    if layer_position >= len(pairs) - 1:
-        raise ValueError(
-            f"layer_position {layer_position} is the last conv layer (or beyond); "
-            "masking it requires also resizing model.classifier[0].in_features "
-            "at compression time, which compress_masked_vgg doesn't do. Use "
-            "layer_position < len(pairs) - 1."
-        )
-    conv_idx, _ = pairs[layer_position]
-    conv = model.features[conv_idx]
-    n_out_original = conv.weight.shape[0]
+    _require_prunable(pairs, layer_position)
+    conv = model.features[pairs[layer_position][0]]
 
     survivors = surviving_channels(conv.weight)
     if survivors.numel() == 0:
         return 0  # nothing left to prune in this layer
 
-    prune_amount = max(1, int(round(n_out_original * prune_fraction)))
-    prune_amount = min(prune_amount, survivors.numel())
-
-    kwargs = {"k": 3} if method == "max_k" else {}
-    scores = compute_score(conv.weight, method=method, **kwargs)
-    survivor_scores = scores[survivors]
-    newly_selected_positions = select_prune_indices(survivor_scores, prune_amount)
-    new_prune_idx = survivors[newly_selected_positions]
+    scores = compute_score(conv.weight, method=method)
+    prune_amount = prune_count(conv.weight.shape[0], prune_fraction)  # clamped to survivors by select_prune_indices
+    new_prune_idx = survivors[select_prune_indices(scores[survivors], prune_amount)]
 
     mask_channels(conv, new_prune_idx)
     return new_prune_idx.numel()
@@ -102,12 +122,8 @@ def compress_masked_vgg(model: nn.Module) -> int:
     pairs = vgg_conv_bn_positions(model.features)
     total_removed = 0
     for pos in range(len(pairs) - 1):
-        conv_idx, bn_idx = pairs[pos]
-        next_conv_idx, _ = pairs[pos + 1]
-
+        conv_idx, _ = pairs[pos]
         conv = model.features[conv_idx]
-        bn = model.features[bn_idx] if bn_idx is not None else None
-        next_conv = model.features[next_conv_idx]
 
         commit_mask(conv)
         if prune.is_pruned(conv):  # pragma: no cover -- would indicate a bug in commit_mask
@@ -115,12 +131,7 @@ def compress_masked_vgg(model: nn.Module) -> int:
 
         keep_idx = surviving_channels(conv.weight)
         total_removed += conv.out_channels - keep_idx.numel()
-
-        new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep_idx, bn=bn, next_conv=next_conv)
-        model.features[conv_idx] = new_conv
-        if bn_idx is not None:
-            model.features[bn_idx] = new_bn
-        model.features[next_conv_idx] = new_next_conv
+        _shrink_seam(model.features, pairs, pos, keep_idx)
 
     return total_removed
 
@@ -131,33 +142,13 @@ def prune_vgg_layer(model: nn.Module, layer_position: int, prune_fraction: float
     already-correctly-sized modules, substituted back into the Sequential.
 
     Does not support pruning the last conv layer (feeds `model.classifier[0]`
-    rather than another Conv2d).
+    rather than another Conv2d). Returns the number of channels kept.
     """
     pairs = vgg_conv_bn_positions(model.features)
-    if layer_position >= len(pairs) - 1:
-        raise ValueError(
-            f"layer_position {layer_position} is the last conv layer (or beyond); "
-            "pruning it requires also resizing model.classifier[0].in_features, "
-            "which this helper doesn't do. Use layer_position < len(pairs) - 1."
-        )
-    conv_idx, bn_idx = pairs[layer_position]
-    next_conv_idx, _ = pairs[layer_position + 1]
+    _require_prunable(pairs, layer_position)
+    conv = model.features[pairs[layer_position][0]]
 
-    conv = model.features[conv_idx]
-    bn = model.features[bn_idx] if bn_idx is not None else None
-    next_conv = model.features[next_conv_idx]
-
-    n_out = conv.out_channels
-    prune_amount = max(1, int(round(n_out * prune_fraction)))
-    kwargs = {"k": 3} if method == "max_k" else {}
-    scores = compute_score(conv.weight, method=method, **kwargs)
-    prune_idx = set(select_prune_indices(scores, prune_amount).tolist())
-    keep = torch.tensor([i for i in range(n_out) if i not in prune_idx])
-
-    new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep, bn=bn, next_conv=next_conv)
-
-    model.features[conv_idx] = new_conv
-    if bn_idx is not None:
-        model.features[bn_idx] = new_bn
-    model.features[next_conv_idx] = new_next_conv
-    return len(keep)
+    scores = compute_score(conv.weight, method=method)
+    keep = keep_indices(scores, prune_count(conv.out_channels, prune_fraction))
+    _shrink_seam(model.features, pairs, layer_position, keep)
+    return keep.numel()

@@ -17,10 +17,19 @@ import argparse
 
 import torch
 import torch.nn as nn
-import torchvision
 
-from prunelib import build_vgg16, compute_score, count_params, measure_latency, prune_conv_bn, prune_vgg_layer, select_prune_indices
-from prunelib.vgg import vgg_conv_bn_positions
+from prunelib import (
+    available_methods,
+    build_vgg16,
+    compute_score,
+    count_params,
+    keep_indices,
+    measure_latency,
+    prune_conv_bn,
+    prune_count,
+    prune_vgg_layer,
+    vgg_conv_bn_positions,
+)
 
 
 class TinyVGGBlock(nn.Module):
@@ -44,15 +53,13 @@ def run_smoke(prune_step=0.05, n_iterations=5, seed=0):
     example_input = torch.randn(2, 3, 32, 32)
 
     print(f"{'iter':>4} {'method':<8} {'channels':>9} {'params':>8} {'latency(ms)':>12}")
-    for method in ("max_k", "l1", "l2", "random"):
+    prune_amount = prune_count(32, prune_step)  # fraction of the *original* width, every iteration
+    for method in available_methods():
         m = TinyVGGBlock(ch=32)
         m.load_state_dict(model.state_dict())
         for it in range(n_iterations):
-            n_ch = m.conv1.out_channels
-            prune_amount = max(1, int(round(32 * prune_step)))
-            kwargs = {"k": 3} if method == "max_k" else {}
-            scores = compute_score(m.conv1.weight, method=method, **kwargs)
-            keep = torch.tensor([i for i in range(n_ch) if i not in set(select_prune_indices(scores, prune_amount).tolist())])
+            scores = compute_score(m.conv1.weight, method=method)
+            keep = keep_indices(scores, prune_amount)
             new_conv1, new_bn1, new_conv2 = prune_conv_bn(m.conv1, keep, bn=m.bn1, next_conv=m.conv2)
             m = TinyVGGBlock(ch=len(keep))
             m.conv1, m.bn1, m.conv2 = new_conv1, new_bn1, new_conv2
@@ -87,13 +94,14 @@ def _fine_tune(model, loader, device, epochs, lr=1e-4):
 
 
 def run(dataset_factory, pretrained, prune_step=0.05, accuracy_drop_threshold=0.01,
-        max_iterations=15, fine_tune_epochs=1, methods=("max_k", "l1", "l2", "random"), device=None):
+        max_iterations=15, fine_tune_epochs=1, methods=None, device=None):
     """The actual iterative-pruning experiment: for each scoring method,
     prune every (non-final) conv layer by `prune_step`, fine-tune, evaluate,
     and stop when accuracy drop exceeds `accuracy_drop_threshold` -- the same
     schedule as Algorithm 1 in the IEEE Access paper (5% per iteration, 1%
     accuracy-drop stop criterion, defaults here match that)."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    methods = methods or available_methods()
     train_set, test_set = dataset_factory()
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=8, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_set, batch_size=8)
@@ -122,6 +130,8 @@ def run_full():
     not available in every sandboxed environment, but will work on a normal
     machine with internet access."""
     def cifar10():
+        import torchvision
+
         transform = torchvision.transforms.Compose([
             torchvision.transforms.Resize(224),
             torchvision.transforms.ToTensor(),
@@ -144,6 +154,8 @@ def run_tiny_check():
     running `run_full` for a real result.
     """
     def fake_data():
+        import torchvision
+
         transform = torchvision.transforms.Compose([
             torchvision.transforms.Resize(224),
             torchvision.transforms.ToTensor(),

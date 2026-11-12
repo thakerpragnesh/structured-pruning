@@ -319,9 +319,11 @@ correct public implementation. Current state, honestly:
 
 ## 7. Extending this codebase — where new work goes
 
-- **New scoring method** (e.g. a second-order/Hessian-based saliency): add
-  a function to `saliency.py` matching the existing signature
-  (`weight: [out,in,kh,kw] -> Tensor[out]`), register it in `_METHODS`, add
+- **New scoring method** (e.g. a second-order/Hessian-based saliency): write
+  a function matching the existing signature
+  (`weight: [out,in,kh,kw] -> Tensor[out]`) and register it with
+  `@prunelib.register_saliency("name")` -- no edit to `saliency.py` needed
+  (distance metrics work the same way via `register_metric`). Add
   a test in `tests/test_saliency.py` following the existing pattern
   (independent brute-force comparison where feasible, like
   `test_d2_matches_bruteforce_topk`).

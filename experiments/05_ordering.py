@@ -18,7 +18,7 @@ import argparse
 import torch
 import torch.nn as nn
 
-from prunelib import compute_score, prune_conv_bn, select_prune_indices
+from prunelib import compute_score, keep_indices, prune_conv_bn
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
 
     # Order A: score channel importance BEFORE any pruning has happened.
     scores_before = compute_score(conv1.weight, method="max_k", k=3)
-    keep_a = torch.tensor([i for i in range(32) if i not in set(select_prune_indices(scores_before, prune_amount).tolist())])
+    keep_a = keep_indices(scores_before, prune_amount)
     _, _, pruned_conv2_a = prune_conv_bn(conv1, keep_a, bn=bn1, next_conv=conv2)
 
     # Order B: prune conv2's kernels first (simulated by zeroing a slice of

@@ -27,6 +27,8 @@ before this change).
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 
@@ -108,12 +110,42 @@ def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = No
     return torch.rand(out_ch)
 
 
-_METHODS = {
-    "max_k": max_k_saliency,
-    "l1": l1_saliency,
-    "l2": l2_saliency,
-    "random": random_saliency,
-}
+SaliencyFn = Callable[..., torch.Tensor]
+"""A scorer: takes a weight tensor (plus optional keyword arguments) and
+returns one score per output channel/neuron, higher = more important."""
+
+_METHODS: dict[str, SaliencyFn] = {}
+
+
+def register_saliency(name: str, fn: SaliencyFn | None = None, *, overwrite: bool = False):
+    """Register a saliency scorer under `name` so `compute_score(...,
+    method=name)` can dispatch to it -- new criteria plug in from outside
+    this module instead of requiring an edit to it.
+
+    Usable directly (`register_saliency("taylor", taylor_fn)`) or as a
+    decorator (`@register_saliency("taylor")`). Re-registering an existing
+    name raises unless `overwrite=True`, so a typo can't silently replace
+    a built-in criterion.
+    """
+
+    def _register(f: SaliencyFn) -> SaliencyFn:
+        if name in _METHODS and not overwrite:
+            raise ValueError(f"saliency method {name!r} is already registered")
+        _METHODS[name] = f
+        return f
+
+    return _register(fn) if fn is not None else _register
+
+
+def available_methods() -> list[str]:
+    """Names accepted by `compute_score`'s `method` argument."""
+    return list(_METHODS)
+
+
+register_saliency("max_k", max_k_saliency)
+register_saliency("l1", l1_saliency)
+register_saliency("l2", l2_saliency)
+register_saliency("random", random_saliency)
 
 
 def compute_score(weight: torch.Tensor, method: str = "max_k", **kwargs) -> torch.Tensor:
@@ -122,10 +154,21 @@ def compute_score(weight: torch.Tensor, method: str = "max_k", **kwargs) -> torc
     Because scoring always goes through here, there is no code path where a
     caller can compute one score and select against another (which is exactly
     how D1 happened in the original codebase).
+
+    Each scorer's own defaults apply (e.g. `max_k` uses k=3), so callers
+    don't need method-specific keyword arguments to get the paper's setup.
     """
     if method not in _METHODS:
-        raise ValueError(f"unknown method {method!r}, expected one of {list(_METHODS)}")
+        raise ValueError(f"unknown method {method!r}, expected one of {available_methods()}")
     return _METHODS[method](weight, **kwargs)
+
+
+def _complement(n: int, idx: torch.Tensor) -> torch.Tensor:
+    """Ascending indices in `range(n)` that are *not* in `idx`."""
+    keep = torch.ones(n, dtype=torch.bool)
+    if idx.numel() > 0:
+        keep[idx.to(torch.long)] = False
+    return keep.nonzero(as_tuple=True)[0]
 
 
 def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
@@ -144,6 +187,11 @@ def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tenso
 
 def keep_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
     """Complement of `select_prune_indices`: the channels to keep, ascending order."""
-    prune_idx = set(select_prune_indices(scores, prune_amount).tolist())
-    keep = [i for i in range(scores.numel()) if i not in prune_idx]
-    return torch.tensor(keep, dtype=torch.long)
+    return _complement(scores.numel(), select_prune_indices(scores, prune_amount))
+
+
+def prune_count(n_channels: int, fraction: float) -> int:
+    """Number of channels a `fraction` prune step removes from `n_channels`:
+    rounded, and at least 1 so a small layer still makes progress. Shared by
+    every iterative schedule so they can't disagree on the rounding rule."""
+    return max(1, int(round(n_channels * fraction)))

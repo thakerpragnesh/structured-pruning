@@ -17,6 +17,8 @@ Corrects `load_dataset.py`:
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import torchvision
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -49,42 +51,69 @@ def _eval_transform(image_size: int) -> transforms.Compose:
     )
 
 
+DatasetBuilder = Callable[[PruningConfig], "tuple[Dataset, Dataset]"]
+
+# upper-cased name -> (display name, builder); lookup is case-insensitive.
+_DATASETS: dict[str, tuple[str, DatasetBuilder]] = {}
+
+
+def register_dataset(name: str):
+    """Decorator: register a `(cfg) -> (train, test)` builder under `name`
+    (matched case-insensitively against `cfg.dataset_name`), so a new
+    dataset is added alongside the others rather than by editing
+    `build_datasets`."""
+
+    def _register(fn: DatasetBuilder) -> DatasetBuilder:
+        _DATASETS[name.upper()] = (name, fn)
+        return fn
+
+    return _register
+
+
+def available_datasets() -> list[str]:
+    return [display for display, _ in _DATASETS.values()]
+
+
+@register_dataset("CIFAR10")
+def _cifar10(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
+    root = str(cfg.dataset_dir)
+    train = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=_train_transform(cfg.image_size))
+    test = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=_eval_transform(cfg.image_size))
+    return train, test
+
+
+@register_dataset("ImageFolder")
+def _image_folder(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
+    train_dir = cfg.dataset_dir / cfg.train_subdir
+    test_dir = cfg.dataset_dir / cfg.test_subdir
+    for d in (train_dir, test_dir):
+        if not d.is_dir():
+            raise FileNotFoundError(f"expected an ImageFolder-structured directory at {d}")
+    train = torchvision.datasets.ImageFolder(str(train_dir), transform=_train_transform(cfg.image_size))
+    test = torchvision.datasets.ImageFolder(str(test_dir), transform=_eval_transform(cfg.image_size))
+    return train, test
+
+
+@register_dataset("FakeData")
+def _fake_data(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
+    # No download, no disk layout required -- used by the --tiny-check
+    # path to verify the pipeline mechanically. See
+    # LEGACY_PIPELINE_MIGRATION.md for why this exists.
+    def split(size: int) -> Dataset:
+        return torchvision.datasets.FakeData(
+            size=size, image_size=(3, cfg.image_size, cfg.image_size),
+            num_classes=cfg.num_classes, transform=transforms.ToTensor(),
+        )
+
+    return split(32), split(16)
+
+
 def build_datasets(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
     """Returns (train_dataset, test_dataset) per `cfg.dataset_name`."""
-    if cfg.dataset_name.upper() == "CIFAR10":
-        train = torchvision.datasets.CIFAR10(
-            root=str(cfg.dataset_dir), train=True, download=True, transform=_train_transform(cfg.image_size)
-        )
-        test = torchvision.datasets.CIFAR10(
-            root=str(cfg.dataset_dir), train=False, download=True, transform=_eval_transform(cfg.image_size)
-        )
-        return train, test
-
-    if cfg.dataset_name == "ImageFolder":
-        train_dir = cfg.dataset_dir / cfg.train_subdir
-        test_dir = cfg.dataset_dir / cfg.test_subdir
-        for d in (train_dir, test_dir):
-            if not d.is_dir():
-                raise FileNotFoundError(f"expected an ImageFolder-structured directory at {d}")
-        train = torchvision.datasets.ImageFolder(str(train_dir), transform=_train_transform(cfg.image_size))
-        test = torchvision.datasets.ImageFolder(str(test_dir), transform=_eval_transform(cfg.image_size))
-        return train, test
-
-    if cfg.dataset_name == "FakeData":
-        # No download, no disk layout required -- used by the --tiny-check
-        # path to verify the pipeline mechanically. See
-        # LEGACY_PIPELINE_MIGRATION.md for why this exists.
-        train = torchvision.datasets.FakeData(
-            size=32, image_size=(3, cfg.image_size, cfg.image_size),
-            num_classes=cfg.num_classes, transform=transforms.ToTensor(),
-        )
-        test = torchvision.datasets.FakeData(
-            size=16, image_size=(3, cfg.image_size, cfg.image_size),
-            num_classes=cfg.num_classes, transform=transforms.ToTensor(),
-        )
-        return train, test
-
-    raise ValueError(f"unknown dataset_name {cfg.dataset_name!r}, expected 'CIFAR10', 'ImageFolder', or 'FakeData'")
+    entry = _DATASETS.get(cfg.dataset_name.upper())
+    if entry is None:
+        raise ValueError(f"unknown dataset_name {cfg.dataset_name!r}, expected one of {available_datasets()}")
+    return entry[1](cfg)
 
 
 def build_dataloaders(cfg: PruningConfig) -> tuple[DataLoader, DataLoader]:

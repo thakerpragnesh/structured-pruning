@@ -10,7 +10,7 @@ import argparse
 
 import torch
 
-from prunelib import compute_score, count_params, prune_ffn_block, select_prune_indices
+from prunelib import compute_score, count_params, keep_indices, prune_ffn_block
 
 
 def _score_ffn_neurons(fc1_weight: torch.Tensor, method: str = "max_k") -> torch.Tensor:
@@ -20,8 +20,7 @@ def _score_ffn_neurons(fc1_weight: torch.Tensor, method: str = "max_k") -> torch
     `prunelib/saliency.py`), so this used to reshape to a fake `[out, in, 1, 1]`
     conv weight before calling it; that workaround is gone now that scoring
     handles both shapes itself."""
-    kwargs = {"k": 3} if method == "max_k" else {}
-    return compute_score(fc1_weight, method=method, **kwargs)
+    return compute_score(fc1_weight, method=method)
 
 
 def run_smoke(prune_fraction=0.3, seed=0):
@@ -42,11 +41,7 @@ def run_smoke(prune_fraction=0.3, seed=0):
     params_before = count_params(model)
 
     scores = _score_ffn_neurons(fc1.weight, method="max_k")
-    prune_amount = int(config.intermediate_size * prune_fraction)
-    keep_idx = torch.tensor(
-        [i for i in range(config.intermediate_size)
-         if i not in set(select_prune_indices(scores, prune_amount).tolist())]
-    )
+    keep_idx = keep_indices(scores, int(config.intermediate_size * prune_fraction))
 
     new_fc1, new_fc2 = prune_ffn_block(fc1, fc2, keep_idx)
     layer.intermediate.dense, layer.output.dense = new_fc1, new_fc2
