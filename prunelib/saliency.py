@@ -15,15 +15,24 @@ Here there is exactly one function that produces a score, and exactly one
 function that selects indices from a score. Nothing else touches the tensor in
 between, so the two cannot drift apart the way they did before.
 
-Every scorer accepts either a Conv2d weight `[out_channels, in_channels, kh,
-kw]` or a Linear weight `[out_features, in_features]` -- a Linear layer's
-weight *is* a Conv2d weight with a 1x1 kernel: each output feature's row is
+Every scorer accepts any weight laid out `[out, in, *kernel]`: a Conv2d
+weight `[out_channels, in_channels, kh, kw]`, a Linear weight
+`[out_features, in_features]`, a Conv1d or Conv3d weight. A Linear layer's
+weight *is* a conv weight with a 1x1 kernel: each output feature's row is
 its entire "kernel" over the input features, with no spatial extent to
-flatten. `_channel_view` below reshapes either to a common `(out, in,
-spatial)` so one code path covers both, instead of every caller reshaping a
+flatten. `_channel_view` below reshapes any of them to a common `(out, in,
+spatial)` so one code path covers all, instead of every caller reshaping a
 Linear weight to a fake `[out, in, 1, 1]` conv tensor to reuse this module (as
 `experiments/02_bert_sst2_sweep.py` used to -- see its `_score_ffn_neurons`
-before this change).
+before this change). It used to accept only 2D and 4D weights, so a Conv1d
+taught to `DependencyGraph` through a `module_rules.ModuleRule` still
+couldn't be scored by `oneshot.prune_model`.
+
+Scorers live in `SALIENCY_METHODS` (a `registry.Registry`), so a new
+criterion is added from the caller's own code -- `@register_saliency_method(
+"taylor")` on a `(weight, **kwargs) -> Tensor[out]` function -- and is then
+accepted by `compute_score`, `selection.select_prune_indices_by_method`,
+`oneshot.prune_model` and `vgg.py` without editing any of them.
 """
 from __future__ import annotations
 
@@ -31,28 +40,38 @@ from typing import Callable
 
 import torch
 
+from .indices import as_index, complement_indices
+from .registry import Registry
+
+SALIENCY_METHODS: Registry = Registry("method")
+register_saliency_method = SALIENCY_METHODS.register
+# Alias for the name `main` published before the registries were unified
+# (generic-pruning-quantization merge); same signature and behaviour.
+register_saliency = register_saliency_method
+
 
 def _channel_view(weight: torch.Tensor) -> torch.Tensor:
-    """Reshape a weight to `(out_channels, in_channels, spatial)`.
+    """Reshape a weight `[out, in, *kernel]` to `(out_channels,
+    in_channels, spatial)`.
 
     A 2D Linear weight `(out, in)` becomes `(out, in, 1)`: one "spatial"
     position, matching a 1x1 kernel. A 4D Conv2d weight `(out, in, kh, kw)`
-    becomes `(out, in, kh * kw)`. Every scorer below reduces over the last
-    axis (and sums over the input-channel axis), so this is the only place
-    that needs to know about the shape difference between the two layer
-    types.
+    becomes `(out, in, kh * kw)`, and a Conv1d/Conv3d weight its own kernel
+    flattened the same way. Every scorer below reduces over the last axis
+    (and sums over the input-channel axis), so this is the only place that
+    needs to know about the shape difference between layer types.
     """
     if weight.dim() == 2:
         return weight.unsqueeze(-1)
-    if weight.dim() == 4:
-        out_ch, in_ch, kh, kw = weight.shape
-        return weight.reshape(out_ch, in_ch, kh * kw)
+    if weight.dim() > 2:
+        return weight.flatten(start_dim=2)
     raise ValueError(
-        f"expected a 2D Linear weight [out_features, in_features] or a 4D Conv2d "
-        f"weight [out_channels, in_channels, kh, kw], got shape {tuple(weight.shape)}"
+        f"expected a weight laid out [out, in, *kernel] -- a Linear's [out_features, in_features], a "
+        f"Conv2d's [out_channels, in_channels, kh, kw] -- got shape {tuple(weight.shape)}"
     )
 
 
+@register_saliency_method("max_k")
 def max_k_saliency(weight: torch.Tensor, k: int = 3) -> torch.Tensor:
     """Max-k saliency score per output channel/neuron.
 
@@ -61,8 +80,9 @@ def max_k_saliency(weight: torch.Tensor, k: int = 3) -> torch.Tensor:
     scores across all input channels/features to get one score per output
     unit.
 
-    weight: Conv2d weight `[out_channels, in_channels, kh, kw]`, or Linear
-        weight `[out_features, in_features]`
+    weight: Conv2d weight `[out_channels, in_channels, kh, kw]`, Linear
+        weight `[out_features, in_features]`, or any other `[out, in,
+        *kernel]` weight
     returns: [out_channels] (or [out_features]) tensor, higher = more
         important (keep it)
 
@@ -92,16 +112,19 @@ def max_k_saliency(weight: torch.Tensor, k: int = 3) -> torch.Tensor:
     return channel_scores
 
 
+@register_saliency_method("l1")
 def l1_saliency(weight: torch.Tensor) -> torch.Tensor:
     """L1-norm saliency: sum of absolute weights per output channel/neuron."""
     return _channel_view(weight.detach()).abs().sum(dim=(1, 2))
 
 
+@register_saliency_method("l2")
 def l2_saliency(weight: torch.Tensor) -> torch.Tensor:
     """L2-norm saliency: Euclidean norm of weights per output channel/neuron."""
     return _channel_view(weight.detach()).pow(2).sum(dim=(1, 2)).sqrt()
 
 
+@register_saliency_method("csd")
 def csd_saliency(weight: torch.Tensor) -> torch.Tensor:
     """CSD saliency: L1 dispersion of each output unit's incoming weights
     from their own mean, `sum(|w - mean(w)|)`.
@@ -112,83 +135,51 @@ def csd_saliency(weight: torch.Tensor) -> torch.Tensor:
     whose incoming weights are nearly uniform emits a roughly constant
     signal (indistinguishable from a bias), so low dispersion means low
     informativeness. Accepts any weight whose dim 0 is the output axis.
+    Shared with `prunelib.transformer.CSDScorer` -- one implementation.
     """
     flat = weight.detach().reshape(weight.shape[0], -1)
     return (flat - flat.mean(dim=1, keepdim=True)).abs().sum(dim=1)
 
 
+@register_saliency_method("random")
 def random_saliency(weight: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-    """Random baseline score, one draw per output channel/neuron. Seed via `generator`."""
+    """Random baseline score, one draw per output channel/neuron. Seed via
+    `generator` (a CPU generator: the same seed gives the same draw on any
+    device), returned on `weight`'s device like every other scorer's."""
     out_ch = _channel_view(weight).shape[0]
-    if generator is not None:
-        return torch.rand(out_ch, generator=generator)
-    return torch.rand(out_ch)
+    return torch.rand(out_ch, generator=generator, device="cpu").to(weight.device)
 
 
-SaliencyFn = Callable[..., torch.Tensor]
-"""A scorer: takes a weight tensor (plus optional keyword arguments) and
-returns one score per output channel/neuron, higher = more important."""
-
-_METHODS: dict[str, SaliencyFn] = {}
-
-
-def register_saliency(name: str, fn: SaliencyFn | None = None, *, overwrite: bool = False):
-    """Register a saliency scorer under `name` so `compute_score(...,
-    method=name)` can dispatch to it -- new criteria plug in from outside
-    this module instead of requiring an edit to it.
-
-    Usable directly (`register_saliency("taylor", taylor_fn)`) or as a
-    decorator (`@register_saliency("taylor")`). Re-registering an existing
-    name raises unless `overwrite=True`, so a typo can't silently replace
-    a built-in criterion.
-    """
-
-    def _register(f: SaliencyFn) -> SaliencyFn:
-        if name in _METHODS and not overwrite:
-            raise ValueError(f"saliency method {name!r} is already registered")
-        _METHODS[name] = f
-        return f
-
-    return _register(fn) if fn is not None else _register
-
-
-def available_methods() -> list[str]:
-    """Names accepted by `compute_score`'s `method` argument."""
-    return list(_METHODS)
-
-
-register_saliency("max_k", max_k_saliency)
-register_saliency("l1", l1_saliency)
-register_saliency("l2", l2_saliency)
-register_saliency("csd", csd_saliency)
-register_saliency("random", random_saliency)
-
-
-def compute_score(weight: torch.Tensor, method: str = "max_k", **kwargs) -> torch.Tensor:
+def compute_score(weight: torch.Tensor, method: str | Callable[..., torch.Tensor] = "max_k", **kwargs) -> torch.Tensor:
     """Single entry point used by every experiment and by `select_prune_indices`.
 
     Because scoring always goes through here, there is no code path where a
     caller can compute one score and select against another (which is exactly
-    how D1 happened in the original codebase).
+    how D1 happened in the original codebase). `method` is any name in
+    `SALIENCY_METHODS`, or a scorer itself (`(weight, **kwargs) ->
+    Tensor[out]`); `kwargs` are forwarded to that scorer.
 
-    Each scorer's own defaults apply (e.g. `max_k` uses k=3), so callers
-    don't need method-specific keyword arguments to get the paper's setup.
+    The scorer's answer is checked against that contract -- one score per
+    output channel, shape `(weight.shape[0],)` -- and anything else raises,
+    naming the method. A registered scorer used to be trusted: one that
+    reduced over the wrong axis (one score per *input* channel, say) had its
+    scores ranked anyway, and a channel was pruned for a score that wasn't
+    its own, silently.
     """
-    if method not in _METHODS:
-        raise ValueError(f"unknown method {method!r}, expected one of {available_methods()}")
-    return _METHODS[method](weight, **kwargs)
-
-
-def _complement(n: int, idx: torch.Tensor) -> torch.Tensor:
-    """Ascending indices in `range(n)` that are *not* in `idx`."""
-    keep = torch.ones(n, dtype=torch.bool)
-    if idx.numel() > 0:
-        keep[idx.to(torch.long)] = False
-    return keep.nonzero(as_tuple=True)[0]
+    scores = SALIENCY_METHODS.resolve(method)(weight, **kwargs)
+    expected = (weight.shape[0],)
+    if not isinstance(scores, torch.Tensor) or tuple(scores.shape) != expected:
+        got = tuple(scores.shape) if isinstance(scores, torch.Tensor) else type(scores).__name__
+        raise ValueError(
+            f"saliency method {getattr(method, '__name__', method)!r} returned {got} for a weight of shape "
+            f"{tuple(weight.shape)}; a scorer returns one score per output channel, shape {expected}"
+        )
+    return scores
 
 
 def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
-    """Indices of the `prune_amount` lowest-scoring channels, ascending order.
+    """Indices of the `prune_amount` lowest-scoring channels, ascending order
+    (a CPU tensor, wherever `scores` is -- see `indices.py`).
 
     Takes a *score tensor*, not a weight tensor — the caller must have already
     produced it via `compute_score`, so there is no separate "recompute the
@@ -196,18 +187,11 @@ def select_prune_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tenso
     """
     prune_amount = max(0, min(prune_amount, scores.numel()))
     if prune_amount == 0:
-        return torch.empty(0, dtype=torch.long)
+        return torch.empty(0, dtype=torch.long, device="cpu")
     idx = torch.topk(scores, prune_amount, largest=False).indices
-    return idx.sort().values
+    return as_index(idx).sort().values
 
 
 def keep_indices(scores: torch.Tensor, prune_amount: int) -> torch.Tensor:
     """Complement of `select_prune_indices`: the channels to keep, ascending order."""
-    return _complement(scores.numel(), select_prune_indices(scores, prune_amount))
-
-
-def prune_count(n_channels: int, fraction: float) -> int:
-    """Number of channels a `fraction` prune step removes from `n_channels`:
-    rounded, and at least 1 so a small layer still makes progress. Shared by
-    every iterative schedule so they can't disagree on the rounding rule."""
-    return max(1, int(round(n_channels * fraction)))
+    return complement_indices(scores.numel(), select_prune_indices(scores, prune_amount))

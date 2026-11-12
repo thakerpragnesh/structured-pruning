@@ -39,6 +39,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from prunelib import compress_masked_vgg, count_params, mask_vgg_layer
+from prunelib.selection import available_methods
 from prunelib.vgg import vgg_conv_bn_positions
 
 from .config import PruningConfig
@@ -152,8 +153,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    from prunelib import available_methods
-
     from .data import available_datasets
 
     parser.add_argument("--method", default="max_k", choices=available_methods())

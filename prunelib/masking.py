@@ -39,18 +39,24 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
 
-from .saliency import _complement
+from .indices import as_index, on_device_of
 from .surgery import prune_conv_bn
 
 
 def build_channel_mask(weight: torch.Tensor, prune_idx: torch.Tensor) -> torch.Tensor:
     """Full-shape mask for `weight` (any shape whose dim 0 is the output/row
-    axis -- Conv2d's [out,in,kh,kw], Linear's [out,in], or a 1D bias) that zeroes every
+    axis -- Conv2d's [out,in,kh,kw] or Linear's [out,in]) that zeroes every
     channel/row listed in `prune_idx` and keeps everything else at 1."""
     mask = torch.ones_like(weight)
     if prune_idx.numel() > 0:
-        mask[prune_idx.to(torch.long)] = 0
+        mask[on_device_of(prune_idx, mask)] = 0
     return mask
+
+
+def _zero_channel_mask(weight: torch.Tensor, atol: float) -> torch.Tensor:
+    """[out] bool: True where that output channel is entirely (within
+    `atol`) zero."""
+    return weight.reshape(weight.shape[0], -1).abs().sum(dim=1) <= atol
 
 
 def mask_channels(module: nn.Module, prune_idx: torch.Tensor, name: str = "weight") -> None:
@@ -87,15 +93,13 @@ def zeroed_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Indices of output channels that are entirely zero. Meaningful once a
     mask has been committed (see `commit_mask`) -- everything *not* in this
     list is an "unmasked" survivor."""
-    flat = weight.reshape(weight.shape[0], -1)
-    is_zero = flat.abs().sum(dim=1) <= atol
-    return is_zero.nonzero(as_tuple=True)[0]
+    return as_index(_zero_channel_mask(weight, atol).nonzero(as_tuple=True)[0])
 
 
 def surviving_channels(weight: torch.Tensor, atol: float = 0.0) -> torch.Tensor:
     """Complement of `zeroed_channels`: the "unmasked" channels to copy
     across during compression."""
-    return _complement(weight.shape[0], zeroed_channels(weight, atol=atol))
+    return as_index((~_zero_channel_mask(weight, atol)).nonzero(as_tuple=True)[0])
 
 
 def compress_masked_conv_bn(

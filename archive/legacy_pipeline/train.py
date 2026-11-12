@@ -25,8 +25,7 @@ file exists rather than reusing the original almost-as-is.
 """
 from __future__ import annotations
 
-import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -131,12 +130,3 @@ def fit_one_cycle(
                 f.write(line + "\n")
 
     return history
-
-
-def write_history_csv(history: list[EpochResult], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_loss", "val_acc", "lr"])
-        for r in history:
-            writer.writerow([r.epoch, r.train_loss, r.val_loss, r.val_acc, r.lr])

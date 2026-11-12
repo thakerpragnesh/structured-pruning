@@ -1,5 +1,5 @@
 """
-06_transformer_techniques.py — the calibration-aware transformer pipeline
+08_transformer_techniques.py — the calibration-aware transformer pipeline
 from `prunelib.transformer`, end to end on a real HuggingFace BERT class.
 
     1. heads:  calibrate (activation moments + Michel et al. gradient
@@ -11,7 +11,7 @@ from `prunelib.transformer`, end to end on a real HuggingFace BERT class.
     3. twins:  record firing patterns, find co-activation twins, and merge
                (not just drop) them in one layer
 
-    python experiments/06_transformer_techniques.py --smoke
+    python experiments/08_transformer_techniques.py --smoke
 
 `--smoke` uses a random-init tiny BertForSequenceClassification and random
 token batches -- no downloads -- so it verifies the mechanics (shapes, seams,

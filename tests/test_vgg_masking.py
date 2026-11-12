@@ -1,8 +1,10 @@
+import pytest
 import torch
 import torch.nn.utils.prune as prune
 
-from prunelib import build_vgg16, compress_masked_vgg, count_params, mask_vgg_layer
+from prunelib import build_vgg16, compress_masked_vgg, count_params, mask_vgg_layer, prune_vgg_layer
 from prunelib.masking import surviving_channels
+from prunelib.selection import available_methods
 from prunelib.vgg import vgg_conv_bn_positions
 
 
@@ -44,25 +46,38 @@ def test_mask_vgg_layer_excludes_already_masked_channels_on_repeat_calls():
     assert second == expected_per_call  # not ~0, which is what the un-fixed version would give
     assert third == expected_per_call
 
-    total_masked = len(vgg_conv_bn_positions(model.features))  # placeholder, real check below
     zeroed = n_out - surviving_channels(model.features[conv_idx].weight).numel()
     assert zeroed == first + second + third  # every call's contribution is additive, none wasted on re-selection
 
 
-def test_mask_vgg_layer_stops_gracefully_when_fully_masked():
-    model = _tiny_vgg()
+def _vgg_shaped(n_out=64):
+    """Just enough of torchvision's VGG layout for `mask_vgg_layer` (a
+    `.features` Sequential, a `.classifier` starting with a Linear), at a
+    fraction of VGG16's memory -- the test below builds one per method."""
+    model = torch.nn.Module()
+    model.features = torch.nn.Sequential(torch.nn.Conv2d(3, n_out, 3, padding=1), torch.nn.BatchNorm2d(n_out))
+    model.classifier = torch.nn.Sequential(torch.nn.Linear(n_out * 49, 5))
+    return model
+
+
+@pytest.mark.parametrize("method", available_methods())
+def test_mask_vgg_layer_stops_gracefully_when_fully_masked(method):
+    """Every selection rule, not just `"max_k"`: `"kmeans"` used to raise on
+    the last few channels instead of masking them."""
+    torch.manual_seed(0)
+    model = _vgg_shaped()
     conv_idx, _ = vgg_conv_bn_positions(model.features)[0]
     n_out = model.features[conv_idx].out_channels
 
     total = 0
     for _ in range(30):  # enough calls at 10%/call to exhaust every channel
-        newly = mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method="max_k")
+        newly = mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method=method)
         total += newly
         if newly == 0:
             break
 
     assert total == n_out  # every channel eventually masked, none double-counted
-    assert mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method="max_k") == 0  # nothing left
+    assert mask_vgg_layer(model, layer_position=0, prune_fraction=0.1, method=method) == 0  # nothing left
 
 
 def test_compress_masked_vgg_matches_masked_accuracy_numerically():
@@ -107,3 +122,143 @@ def test_compress_masked_vgg_propagates_through_unmasked_layers():
     conv0_idx, _ = pairs[0]
     conv1_idx, _ = pairs[1]
     assert model.features[conv1_idx].in_channels == model.features[conv0_idx].out_channels
+
+
+def test_prune_vgg_layer_can_prune_the_last_conv_layer():
+    """The last conv feeds classifier[0] (a Linear over the flattened 7x7
+    avgpool output), not another conv. Pruning it must also drop that
+    channel's 49 input columns from classifier[0] -- and give the same output
+    as the unpruned model with that channel zeroed."""
+    torch.manual_seed(0)
+    model = _tiny_vgg().eval()
+    pairs = vgg_conv_bn_positions(model.features)
+    last = len(pairs) - 1
+    conv_idx, _ = pairs[last]
+    x = torch.randn(1, 3, 32, 32)
+
+    reference = _tiny_vgg().eval()
+    reference.load_state_dict(model.state_dict())
+
+    kept = prune_vgg_layer(model, last, prune_fraction=0.25, method="l1")
+
+    new_conv = model.features[conv_idx]
+    assert new_conv.out_channels == kept == 384
+    assert model.classifier[0].in_features == kept * 49
+
+    removed = sorted(set(range(512)) - set(_matching_rows(reference.features[conv_idx].weight, new_conv.weight)))
+    with torch.no_grad():
+        reference.features[conv_idx].weight[removed] = 0
+        reference.features[conv_idx].bias[removed] = 0
+        assert torch.allclose(model(x), reference(x), atol=1e-4)
+
+
+def _matching_rows(original: torch.Tensor, pruned: torch.Tensor) -> list[int]:
+    """Which rows of `original` survived into `pruned`, by exact value."""
+    flat_o = original.reshape(original.shape[0], -1)
+    flat_p = pruned.reshape(pruned.shape[0], -1)
+    return [int((flat_o == row).all(dim=1).nonzero()[0]) for row in flat_p]
+
+
+def test_mask_and_compress_the_last_conv_layer_matches_masked_output():
+    torch.manual_seed(0)
+    model = _tiny_vgg().eval()
+    last = len(vgg_conv_bn_positions(model.features)) - 1
+    x = torch.randn(1, 3, 32, 32)
+
+    mask_vgg_layer(model, last, prune_fraction=0.5, method="max_k")
+    with torch.no_grad():
+        out_masked = model(x)
+
+    assert compress_masked_vgg(model) == 256
+    assert model.classifier[0].in_features == 256 * 49
+    with torch.no_grad():
+        assert torch.allclose(model(x), out_masked, atol=1e-4)
+
+
+def test_kmeans_method_works_through_both_vgg_pruning_paths():
+    torch.manual_seed(0)
+    model = _tiny_vgg().eval()
+    conv_idx, _ = vgg_conv_bn_positions(model.features)[0]
+
+    kept = prune_vgg_layer(model, 0, prune_fraction=0.25, method="kmeans", metric="manhattan")
+    assert kept == model.features[conv_idx].out_channels == 48
+
+    first = mask_vgg_layer(model, 1, prune_fraction=0.25, method="kmeans", metric="euclidean")
+    second = mask_vgg_layer(model, 1, prune_fraction=0.25, method="kmeans", metric="euclidean")
+    assert first == second == 16  # second call clusters survivors only, so both calls count
+    compress_masked_vgg(model)
+    assert model(torch.randn(1, 3, 32, 32)).shape == (1, 5)
+
+
+def test_vgg_surgery_does_not_need_torchvision():
+    """Only build_vgg16 needs torchvision (an optional dependency); the VGG
+    surgery functions are plain torch over any torchvision-shaped VGG, so
+    they must import and run without it. Run in a subprocess so blocking
+    the import can't leak into other tests."""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent("""
+        import sys
+        sys.modules["torchvision"] = None  # any `import torchvision` now raises ImportError
+        import torch, torch.nn as nn
+        import prunelib
+
+        model = nn.Module()
+        model.features = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8), nn.ReLU(),
+                                       nn.Conv2d(8, 6, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d((2, 2)))
+        model.classifier = nn.Sequential(nn.Linear(6 * 4, 3))
+        assert prunelib.prune_vgg_layer(model, 0, 0.25) == 6
+        assert prunelib.prune_vgg_layer(model, 1, 0.5) == 3
+        assert model.classifier[0].in_features == 3 * 4
+        try:
+            prunelib.build_vgg16(pretrained=False)
+        except ImportError:
+            print("ok")
+    """)
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def _small_vgg(sync_bn=False):
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.features = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 8, 3, padding=1), torch.nn.BatchNorm2d(8), torch.nn.ReLU(),
+        torch.nn.Conv2d(8, 6, 3, padding=1), torch.nn.BatchNorm2d(6), torch.nn.ReLU(), torch.nn.AdaptiveAvgPool2d(2),
+    )
+    model.classifier = torch.nn.Sequential(torch.nn.Linear(6 * 4, 3))
+    if sync_bn:
+        model.features = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model.features)
+    model.forward = lambda x: model.classifier(torch.flatten(model.features(x), 1))
+    return model.eval()
+
+
+def test_vgg_wiring_pairs_each_conv_with_a_sync_batchnorm_too():
+    """`vgg_conv_bn_positions` only recognized `BatchNorm2d`, so in a VGG
+    converted for DDP training (`SyncBatchNorm.convert_sync_batchnorm`)
+    every conv was pruned without its BatchNorm, and the model failed on its
+    next forward pass."""
+    model = _small_vgg(sync_bn=True)
+    assert vgg_conv_bn_positions(model.features) == [(0, 1), (3, 4)]
+    assert prune_vgg_layer(model, 0, 0.25) == 6
+    assert model.features[1].num_features == 6 and model(torch.randn(1, 3, 8, 8)).shape == (1, 3)
+
+
+def test_mask_vgg_layer_selects_by_the_current_masked_weights():
+    """The next masking iteration scored `conv.weight` -- what the mask's
+    forward pre-hook computed on the last forward pass -- so after an
+    optimizer step it chose channels by the weights of one step earlier.
+    It now scores `weight_orig * weight_mask` as it is."""
+    model = _small_vgg()
+    conv = model.features[0]
+    assert mask_vgg_layer(model, 0, 0.25, method="l1") == 2
+    survivors = surviving_channels(conv.weight_orig * conv.weight_mask)
+    with torch.no_grad():  # an "optimizer step" that makes the last survivors the weakest
+        norms = conv.weight_orig.abs().sum((1, 2, 3), keepdim=True)
+        conv.weight_orig.mul_(torch.logspace(2, -2, 8).view(8, 1, 1, 1) / norms)
+    mask_vgg_layer(model, 0, 0.25, method="l1")
+    newly = set(survivors.tolist()) - set(surviving_channels(conv.weight_orig * conv.weight_mask).tolist())
+    assert newly == set(survivors[-2:].tolist())

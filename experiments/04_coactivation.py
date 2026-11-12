@@ -6,12 +6,18 @@ matters, using synthetic activations (always available, no --smoke needed).
 
     python experiments/04_coactivation.py
 """
+import argparse
+
 import torch
 
 from prunelib import CoActivationScanner
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
     torch.manual_seed(0)
     num_units, num_tokens = 8, 200
 
@@ -22,6 +28,8 @@ def main():
 
     # Plant a near-universal-firing unit -- this is the case the ceiling exists for.
     mask[5] = torch.rand(num_tokens) > 0.02  # fires on ~98% of tokens
+    mask = mask.to(args.device)
+    print(f"device: {args.device}")
 
     scanner_no_filter = CoActivationScanner(firing_rate_ceiling=1.0)  # effectively no filter
     scanner_filtered = CoActivationScanner(firing_rate_ceiling=0.9)

@@ -25,12 +25,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--budget", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    conv1 = nn.Conv2d(3, 32, 3, padding=1)
-    bn1 = nn.BatchNorm2d(32)
-    conv2 = nn.Conv2d(32, 32, 3, padding=1)
+    conv1 = nn.Conv2d(3, 32, 3, padding=1).to(args.device)
+    bn1 = nn.BatchNorm2d(32).to(args.device)
+    conv2 = nn.Conv2d(32, 32, 3, padding=1).to(args.device)
+    print(f"device: {args.device}")
 
     prune_amount = int(32 * args.budget)
 
@@ -39,12 +41,8 @@ def main():
     keep_a = keep_indices(scores_before, prune_amount)
     _, _, pruned_conv2_a = prune_conv_bn(conv1, keep_a, bn=bn1, next_conv=conv2)
 
-    # Order B: prune conv2's kernels first (simulated by zeroing a slice of
-    # conv2's *input* side -- the kernel-level analogue), THEN re-score conv1.
-    conv2_kernel_pruned = conv2.weight.clone()
-    kernel_prune_amount = int(conv2_kernel_pruned.shape[1] * args.budget)
-    conv2_kernel_pruned[:, :kernel_prune_amount] = 0.0
-
+    # Order B: prune conv2's kernels first (zeroing a slice of conv2's
+    # *input* side -- the kernel-level analogue), THEN re-score conv1.
     # After kernel pruning has zeroed part of conv2's input side, conv1's
     # output channels feeding those zeroed slots are effectively invisible
     # to the network -- but conv1's OWN weights (what compute_score sees)
