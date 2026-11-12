@@ -180,6 +180,17 @@ Report the latency *ratio* to the baseline (`latency_ratio` in
   use DataParallel and double the effective batch size, so Kaggle results
   wouldn't match Colab's. The runner sets `CUDA_VISIBLE_DEVICES=0` unless
   you pass `--all-gpus`.
+- **transformers 5 and the small `prajjwal1/bert-*` checkpoints.** They
+  ship only `vocab.txt`, which transformers 5 can no longer turn into a
+  tokenizer. Add `--tokenizer google-bert/bert-base-uncased`: same vocabulary,
+  identical token ids (verified to give identical results on transformers
+  4.57), and recorded in every result row. Their config also lacks
+  `model_type`; the runner loads them as BERT automatically. `bert-base-uncased`
+  itself needs neither.
+- **Both transformers 4.x and 5.x work.** The runner picks the right warmup
+  argument for the installed version (`warmup_ratio` on 4.x, a fractional
+  `warmup_steps` on 5.x), so the training recipe is the same on either; the
+  version used is recorded in `environment.jsonl`.
 - **`ImportError: huggingface-hub>=0.34.0,<1.0 is required`.** A newer
   `datasets` pulled in an incompatible hub. Run
   `pip install "huggingface-hub>=0.34,<1.0"`, or upgrade `transformers`
