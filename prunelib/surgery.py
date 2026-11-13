@@ -3,14 +3,11 @@ Structural surgery: given indices of channels/neurons to keep, produce
 genuinely smaller modules (fewer real parameters, less real compute) rather
 than zero-masking the pruned ones.
 
-Design note: the original `deep_model_copy_channelwise` (D6 in GITHUB_AUDIT.md)
-had two independent bugs — a "keep this channel?" check that computed
-`torch.norm(tensor != 0)`, i.e. the norm of a *boolean* tensor (almost always
-non-zero, so the check was nearly always true), and a destination-index
-counter that was never incremented, so every surviving channel got written to
-index 0 and the rest of the new tensor stayed at its uninitialised value.
-
-Here there is no manual loop over "should I keep this one" at all. Keeping is
+Design note (invariants D6/D7, docs/ARCHITECTURE.md): a hand-written
+per-channel copy loop needs a correct "keep this channel?" test and a
+destination counter that advances exactly once per survivor; both are easy
+to get subtly wrong. Here there is no manual loop over "should I keep this
+one" at all. Keeping is
 decided once (by `prunelib.saliency`) and surgery is pure indexing:
 `weight[keep_idx]`. Advanced indexing can't leave a counter behind to forget
 to increment.

@@ -15,3 +15,7 @@ study_runs*/
 
 # Claude Code personal settings (permissions granted on this machine only)
 .claude/settings.local.json
+
+# Private notes kept out of the public repo (profile audit, generated PDFs)
+.private/
+my papers/

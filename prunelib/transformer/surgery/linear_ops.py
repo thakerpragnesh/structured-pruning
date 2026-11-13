@@ -2,9 +2,9 @@
 replaces -- the single mechanical step both surgeons end in.
 
 `FFNSurgeon` and `AttentionSurgeon` each used to construct their new
-Linears by hand, and that hand-written step is where real bugs lived: a
-bare `nn.Linear(...)` defaults to float32 (CHANGELOG 0.2.0, bug 3 -- it
-silently converted a half-precision model's FFN) and to
+Linears by hand, and a hand-written step is easy to get subtly wrong: a
+bare `nn.Linear(...)` defaults to float32 (CHANGELOG 0.2.0 -- it would
+convert a half-precision model's FFN) and to
 `requires_grad=True` (a frozen layer would quietly start training during a
 "heal"). Three copies of those guarantees became one function.
 """

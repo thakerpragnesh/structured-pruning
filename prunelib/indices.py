@@ -9,7 +9,7 @@ _handle_flatten` (spatial positions after a flatten), `vgg.
 _shrink_classifier_input` (the same thing, VGG-specific) and `surgery.
 prune_attention_heads` (`head_dim` rows per head). Both are vectorized --
 a boolean mask + `nonzero()`, and broadcast arithmetic -- never a Python
-`set()` or per-index loop (KT.md section 3's last design-decision row).
+`set()` or per-index loop (docs/ARCHITECTURE.md, "Index sets").
 
 Index sets live on the CPU, whatever device the weights they index are on:
 every function in `prunelib` that returns channel indices returns a CPU

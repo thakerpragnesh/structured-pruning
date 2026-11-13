@@ -98,7 +98,7 @@ def _image_folder(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
 def _fake_data(cfg: PruningConfig) -> tuple[Dataset, Dataset]:
     # No download, no disk layout required -- used by the --tiny-check
     # path to verify the pipeline mechanically. See
-    # LEGACY_PIPELINE_MIGRATION.md for why this exists.
+    # docs/LEGACY_PIPELINE_MIGRATION.md for why this exists.
     def split(size: int) -> Dataset:
         return torchvision.datasets.FakeData(
             size=size, image_size=(3, cfg.image_size, cfg.image_size),

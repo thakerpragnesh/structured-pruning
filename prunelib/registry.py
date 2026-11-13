@@ -11,7 +11,7 @@ Before this module, each of those lived in a private dict
 (`saliency._METHODS`, `quantization._MODEL_METHODS`) or an `if metric ==
 ...` chain (`clustering._distance`, `scanners.pairwise_distance_matrix`, the
 same three metrics written out twice), so adding a method meant editing the
-library itself -- KT.md section 7 used to say exactly that ("register it in
+library itself -- docs/KT.md section 7 used to say exactly that ("register it in
 `_METHODS`"). A registry is open for extension from the caller's own code
 (`register_saliency_method("taylor", fn)`) and closed for modification:
 the dispatch code that reads it never changes.

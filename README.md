@@ -1,64 +1,41 @@
 # structured-pruning
 
-**`structured-pruning` is the library-first repo for pruning modern
-(Transformer) architectures** — a pip-installable `prunelib` package plus
-tested experiments, not a config.ini-driven pipeline you edit and run in
-place. For CNN channel-pruning from my Ph.D. work — Max-3 saliency,
-L1/SVD/K-means criteria, hybrid multi-criterion sequencing — the canonical
-repo is [`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4)
-instead: that repo has all five criteria working and verified, where this
-one has Max-k/L1/L2/random plus K-Means clustering selection (no SVD or
-hybrid sequencing). This repo's actual job is the three things
-below.
+**`prunelib`: a tested, pip-installable library for structured pruning and
+quantization of CNNs and Transformers**, with reproducible experiments built
+on it. It implements the Max-3 saliency criterion and K-Means channel
+selection with Manhattan, Euclidean and cosine distance from the author's
+IEEE Access 2024 papers, adapts the CSD idea from the second paper into a
+one-shot score, and extends these criteria to BERT-style Transformers (see
+[`PUBLICATIONS.md`](PUBLICATIONS.md)).
 
-## What this repo is for
+## Capabilities
 
-**1. Extending the same saliency and redundancy ideas to Transformers.**
-`experiments/02` through `05` and the corresponding pieces of `prunelib/`
-apply Max-k-style saliency to BERT FFN neurons, and Manhattan/Euclidean/
-Cosine distance to attention heads — the CNN methods don't have a
-Transformer equivalent anywhere else on my account. The calibration-aware
-Transformer work from
-[`transformer_pruning`](https://github.com/thakerpragnesh/transformer_pruning)
-is now merged in as `prunelib.transformer` (see
-[Transformer techniques](#transformer-techniques-prunelibtransformer) below),
-so the earlier experiments `02`–`05` and the newer criteria share one
-package and one test suite.
+- **Saliency and redundancy criteria.** Max-k, L1, L2, CSD-based and random
+  scoring for any `[out, in, *kernel]` weight (Conv1d/2d/3d, Linear);
+  K-Means channel selection under Manhattan, Euclidean or cosine distance;
+  co-activation and pairwise-distance redundancy scanning.
+- **Architecture-agnostic structural pruning.** `DependencyGraph` traces any
+  `torch.fx`-traceable model and works out which layers a prune couples to
+  (residual adds, squeeze-and-excitation gates, `cat`, flatten into a
+  classifier, depthwise convs), then physically shrinks them. Verified on
+  torchvision ResNet-18 and MobileNetV3-Small.
+- **Mask, then compress.** Mask channels during fine-tuning, then commit and
+  physically shrink once at the end; the compressed model's output matches
+  the masked model's exactly.
+- **Transformer pruning (`prunelib.transformer`).** Calibration-aware FFN-neuron
+  and attention-head selection for HuggingFace BERT/RoBERTa-layout models,
+  bias compensation, twin-neuron merging, and uniform or global budgets.
+- **Post-training quantization.** Float16, linear INT8 and Fixed-Point32,
+  applied after pruning, plus size and latency measurement.
+- **Extensible without forking.** Scorers, selection rules, distance metrics,
+  quantization methods, prunable layer types and graph ops are all public
+  registries.
+- **Tested.** 390 tests (3 need a CUDA GPU), CI on Python 3.10–3.13, and
+  every experiment has a `--smoke` mode that runs in seconds.
 
-**2. A tested reference implementation of the mask-then-compress design.**
-`prunelib/masking.py` implements the two-phase workflow — mask channels
-during pruning via `torch.nn.utils.prune.custom_from_mask`, physically
-compress once at the end — cleanly and with a real test suite (178 tests,
-CI on every push). If you're implementing that pattern elsewhere
-(including in `pruning_framwork_v4`, which arrived at a similar design
-independently), this is a working, tested reference for it.
-
-**3. Architecture-agnostic pruning plus quantization.** `prunelib/graph.py`
-(with `propagation.py`, `group.py`, `op_rules.py` and `oneshot.py`) traces any `torch.fx`-traceable model and resolves which layers a prune
-decision couples to (residual adds, squeeze-and-excitation gates, `cat`,
-flatten-into-classifier, depthwise convs; channels on dim 1 of a conv's output or the last dim of a Linear's),
-so pruning isn't limited to VGG's flat `.features`.
-`prunelib/quantization.py` adds the thesis's three post-training
-quantization methods (Float16, linear INT8, Fixed-Point32) as a separate
-stage applied after pruning. Both are covered below.
-
-**What's now redundant:** `archive/legacy_pipeline/` (moved there 2026-09-21,
-formerly `legacy_pipeline/` at the repo root — see `LEGACY_PIPELINE_MIGRATION.md`)
-was a corrected rebuild of `pruning_framwork_v4`'s original driver scripts,
-done in parallel with this package. Since then, those same scripts got fixed
-directly in `pruning_framwork_v4` itself — and more completely, since that
-fix added K-means/SVD/hybrid sequencing that `legacy_pipeline` (whose config
-only offers Max-k/L1/L2/random) never had. It moved under
-`archive/` rather than staying at the top level to make that explicit: this
-repo is `prunelib` plus the Transformer experiments first, with
-`legacy_pipeline` kept only for its test suite and as a record of the
-mask-then-compress design being applied to a full VGG16 — not as something
-to run instead of `pruning_framwork_v4`, and not part of the library's public
-surface (`from prunelib import ...` never touches it).
-
-See `GITHUB_AUDIT.md` for the original bug-by-bug history of why this
-package was built, and `KT.md` if you're extending the code here
-specifically (the Transformer experiments or `prunelib/masking.py`).
+CNN pruning with SVD and hybrid multi-criterion sequencing lives in the
+companion repo
+[`pruning_framwork_v4`](https://github.com/thakerpragnesh/pruning_framwork_v4).
 
 ## Install
 
@@ -85,7 +62,9 @@ and smoke runs on the GPU, then runs a resumable VGG16 / CIFAR-10 sweep.
 ## Quickstart
 
 ```bash
-python experiments/00_demo.py
+python experiments/00_demo.py                          # prune a conv block, measure params and latency
+python experiments/06_generic_pruning.py --tiny-check  # DependencyGraph on a real ResNet-18
+python experiments/08_transformer_techniques.py --smoke  # calibrated head + FFN pruning on BERT
 ```
 
 ```
@@ -101,181 +80,15 @@ verifying the machinery before spending GPU time on the real run. The rest
 (`00`, `04`, `05`, `07`) are synthetic already and run in seconds as-is. CI
 runs all of them this way on every commit (see `.github/workflows/tests.yml`).
 
-## API
-
-```python
-from prunelib import compute_score, keep_indices, prune_conv_bn, prune_ffn_block
-
-scores = compute_score(conv.weight, method="max_k", k=3)   # or "l1", "l2", "random"
-keep_idx = keep_indices(scores, n_to_prune)                 # complement of select_prune_indices(scores, n_to_prune)
-new_conv, new_bn, new_next_conv = prune_conv_bn(conv, keep_idx, bn=bn, next_conv=next_conv)
-```
-
-For Transformer FFN blocks:
-
-```python
-from prunelib import prune_ffn_block
-new_fc1, new_fc2 = prune_ffn_block(fc1, fc2, keep_idx)
-```
-
-`compute_score` also takes a Linear weight `[out_features, in_features]`
-directly (no reshaping to a fake conv tensor needed) — e.g. `compute_score(
-fc1.weight, method="max_k", k=3)`.
-
-For attention heads:
-
-```python
-from prunelib import prune_attention_heads
-new_q, new_k, new_v, new_out = prune_attention_heads(
-    query, key, value, output, keep_heads=keep_heads, num_heads=num_heads,
-)
-```
-
-For redundancy scanning (channels, attention heads, or arbitrary activation
-patterns):
-
-```python
-from prunelib import pairwise_distance_matrix, CoActivationScanner
-dist = pairwise_distance_matrix(vectors, metric="manhattan")  # or "euclidean", "cosine"
-scanner = CoActivationScanner(firing_rate_ceiling=0.9)
-similarity = scanner.jaccard(activation_mask)
-```
-
-Everything above needs the caller to already know the seam (`next_conv=`,
-which two Linears form an FFN block). `prunelib.graph.DependencyGraph`
-doesn't — it traces an arbitrary model with `torch.fx` and works out which
-other layers a prune decision couples to (a residual/skip partner, a
-squeeze-and-excitation gate, a downstream conv/Linear, a `cat`, a flatten
-into a classifier head) on its own, whether activations are written as
-modules (`nn.ReLU()`) or functions (`F.relu(x)`):
-
-```python
-from prunelib import DependencyGraph
-
-dep = DependencyGraph(model, example_input)          # one graph, reused for as many prunes as you like
-group = dep.get_pruning_group(model.layer2[0].conv2, keep_idx)
-group.prune()                                         # mutates model in place -- see group.py's docstring for why
-```
-
-It handles Conv2d/BatchNorm/Linear chains coupled by elementwise add,
-`torch.cat`, the conv-output-flattened-into-Linear boundary, and depthwise
-convs — see `prunelib/graph.py`'s module docstring for exactly what it does
-and doesn't handle (it does not attempt *automatic* attention-block
-discovery; a `special_handlers` hook lets you register one manually, see
-below).
-
-`prune_model` is the one-call convenience on top of `DependencyGraph` —
-score, select, and prune a layer plus everything it's coupled to, for any
-model the graph can trace (not just VGG's flat `.features`):
+Prune any traceable model in one call:
 
 ```python
 from prunelib import prune_model
 
-group = prune_model(model, example_input, model.layer2[0].conv2, prune_fraction=0.3, method="l1")
+group = prune_model(model, example_input, model.layer2[0].conv2, prune_fraction=0.3, method="max_k")
 ```
 
-`DependencyGraph` also has a two-phase mode, mirroring the mask-then-compress
-workflow below at the level of a whole dependency group instead of one layer:
-
-```python
-group = dep.get_pruning_group(layer, keep_idx)
-group.mask()                 # zero the group's channels, shapes unchanged -- safe to fine-tune against
-# ... fine-tune / evaluate ...
-group.commit_and_compress()  # bake the zeros in and physically shrink everything the group touches
-```
-
-And for attention blocks specifically -- which `DependencyGraph` can't wire
-up on its own, since `prune_attention_heads` needs four Linears rewired
-together at once, not one module resized -- `special_handlers` registers a
-handler that takes over when a given block type is the *starting* layer of
-a `get_pruning_group` call:
-
-```python
-from prunelib import DependencyGraph, LeafTracer
-
-def handle_attention_block(block, keep_heads):
-    block.query, block.key, block.value, block.out = prune_attention_heads(
-        block.query, block.key, block.value, block.out,
-        keep_heads=keep_heads, num_heads=block.num_heads,
-    )
-    block.num_heads = keep_heads.numel()
-    return block
-
-dep = DependencyGraph(
-    model, example_input,
-    tracer=LeafTracer([MyAttentionBlockClass]),  # needed so the block traces as one node
-    special_handlers={MyAttentionBlockClass: handle_attention_block},
-)
-dep.get_pruning_group(model.attn, keep_heads).prune()
-```
-
-### Extending `prunelib` without editing it
-
-Every pluggable part — saliency scorers, selection rules, distance metrics,
-quantization methods, the layer types `DependencyGraph` can prune, and the
-ops it can carry a prune through — is a public registry. Register from your own code, and every entry point that
-dispatches on it picks the new entry up:
-
-```python
-from prunelib import (
-    ChannelRole, DistanceMetric, ModuleRule, propagate_elementwise, register_distance_metric,
-    register_module_rule, register_op_propagator, register_quantization_method,
-    register_saliency_method,
-)
-
-@register_saliency_method("taylor")            # now valid as method="taylor" in compute_score,
-def taylor_saliency(weight, **kwargs): ...     # select_prune_indices_by_method, prune_model, vgg.py
-
-register_distance_metric("chebyshev", DistanceMetric(  # scanning and K-Means both accept it
-    pairwise=lambda x, y: torch.cdist(x, y, p=float("inf")),
-    centroid=lambda m: (m.max(0).values + m.min(0).values) / 2,
-))
-
-register_quantization_method("log2", my_log2_round_trip)   # quantize_model_(model, method="log2")
-
-class Conv1dRule(ModuleRule):                  # teach DependencyGraph a new layer type
-    def role(self, conv): return ChannelRole.MIXING
-    def rebuild(self, conv, prune_out, prune_in): ...
-    # optional, for a type whose output channels aren't dim 0 of its weight (ConvTranspose2d):
-    # output_weight(self, conv) -> weight as [out, in, ...]; mask(self, conv, prune_out); commit_mask(self, conv)
-    # optional, for a type whose tensors keep channels last rather than on dim 1 (as Linear's do):
-    # channel_dim(self, module) -> -1
-register_module_rule(nn.Conv1d, Conv1dRule())  # or DependencyGraph(..., module_rules={...}) for one graph
-                                               # prune_model then scores and prunes Conv1d too
-
-register_op_propagator(torch.maximum, propagate_elementwise)  # a residual merged with torch.maximum couples like `+`
-                                                              # (or DependencyGraph(..., op_propagators={...}));
-                                                              # propagate_channelwise for your own activation function
-```
-
-Every `method=` argument also takes the implementation itself, for a
-one-off not worth registering: a selector `(weight, prune_amount) ->
-prune_idx` for `prune_model` / `prune_vgg_layer` / `mask_vgg_layer`, a
-scorer for `compute_score`, a same-shape round-trip for `quantize_model_`.
-Whatever answers is held to its contract -- one score per output channel,
-exactly `prune_amount` distinct channels, the parameter's own shape -- and
-a plugin that breaks it raises, naming itself. Every pruned module is rebuilt by
-`surgery.py`'s `slice_conv2d` / `slice_depthwise_conv2d` / `slice_linear` /
-`slice_batchnorm`, each of which returns a copy of the original with only
-its channels resized: same class (a `Conv2d` subclass stays that
-subclass), configuration, device, dtype, train/eval mode and
-`requires_grad`. `tests/test_extension_points.py` has a worked example of
-each extension point.
-
-## Transformer techniques (`prunelib.transformer`)
-
-Merged from `transformer_pruning`. Where the core API above is stateless
-tensor-in/tensor-out, this subpackage works on a whole model (any
-HuggingFace BERT/RoBERTa-layout encoder or task model, via
-`resolve_adapter`), and adds the pieces weight-only criteria can't see:
-
-| Area | What it adds |
-|---|---|
-| **Calibration** | `FFNCalibrator` (per-neuron activation moments), `HeadCalibrator` (per-head contribution moments + Michel et al. 2019 gradient importance), `ActivationRecorder` (per-token firing patterns). Padding is masked out everywhere. |
-| **FFN criteria** | `SaliencySelector` (any scorer: `TopKMagnitudeScorer`/Max-3, `LpNormScorer`, `CSDScorer`, or any core method via `RegisteredScorer`), `InOutNormSelector`, `ActivationAwareSelector`, `TwinRedundancySelector` (co-activation twins), `WeightClusterRedundancySelector` (K-means on `W_in` direction) |
-| **Head criteria** | `RedundantHeadSelector` (OV-circuit or query cosine), `OVNormHeadSelector`, `ActivationAwareHeadSelector`, `GradientHeadSelector` |
-| **Cheaper cuts** | Bias compensation (fold a removed neuron's/head's mean output into the bias: zero-ablation becomes mean-ablation) and merging (fold a redundant neuron's output column into its twin) |
-| **Model-wide budgets** | `allocation="uniform"` (every layer loses the same fraction) or `"global"` (every unit ranked against every other, with per-layer floors), or your own `AllocationStrategy` |
+Prune a BERT model's attention heads and FFN neurons:
 
 ```python
 from prunelib.transformer import (
@@ -283,7 +96,6 @@ from prunelib.transformer import (
     prune_model_attention, prune_model_ffn,
 )
 
-# Heads first: the head cut changes every downstream FFN's input distribution.
 cal = HeadCalibrator(model)
 prune_model_attention(
     model, GradientHeadSelector(prune_percent=25), allocation="global", normalize="l2",
@@ -291,41 +103,17 @@ prune_model_attention(
     gradient_importance_by_layer=cal.collect_gradient_importance(labelled_batches),
     compensate_bias=True,
 )
-# Then calibrate the FFN on the head-pruned model and cut it.
 prune_model_ffn(
     model, ActivationAwareSelector(prune_percent=40), allocation="global",
     stats_by_layer=FFNCalibrator(model).collect_many(batches), compensate_bias=True,
 )
 ```
 
-`python experiments/08_transformer_techniques.py --smoke` runs exactly this
-(plus a twin merge) on a random-init HF BERT in seconds.
+The [usage guide](docs/USAGE.md) covers the full API: the tensor-level
+primitives, `DependencyGraph` and its two-phase mode, attention-block
+handlers, every extension point, and quantization.
 
-**Shared with core:** CSD is one implementation (`prunelib.compute_score(w,
-"csd")` and `CSDScorer` are the same function, so CSD now works for CNN
-channel masking too), and head distances use the core
-`pairwise_distance_matrix` registry. The dependency runs one way only:
-`prunelib.transformer` imports core, never the reverse
-(`tests/transformer/test_package_layout.py` enforces it, along with the
-subpackage layering).
-
-Two things share a name across the two layers on purpose. The core
-`prunelib.prune_attention_heads(q, k, v, o, keep_heads, num_heads)` is the
-tensor-level primitive and takes heads to **keep**. The model-level
-`prunelib.transformer.prune_attention_heads(model, layer, head_indices)`
-takes heads to **drop** and also updates the layer's head-count
-bookkeeping. Likewise, core `"max_k"` treats a Linear weight as a 1x1 conv,
-so on an FFN it equals L1, while `TopKMagnitudeScorer(k)` sums each
-neuron's k strongest incoming connections.
-
-The research numbers for these criteria have **not** been produced yet.
-The harness that produces them is `experiments/research/`: GLUE tasks ×
-seeds × criteria × budgets, resumable on free Kaggle/Colab GPUs, with
-paired mean ± std tables and plots. See
-[`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md) and
-`notebooks/pruning_study_kaggle_colab.ipynb`.
-
-## Results
+## Benchmarks
 
 CNN results below are the published, peer-reviewed figures (see
 `PUBLICATIONS.md`). Latency is a fresh measurement from `experiments/00_demo.py`
@@ -335,7 +123,7 @@ and how much of the network is pruned, and will not be identical across runs.
 
 | Method | Model | Params ↓ | FLOPs ↓ | Acc. drop | Venue |
 |---|---|---|---|---|---|
-| Max-3 saliency | VGG16 / CIFAR-10 | 46.1% | 61.9% | <1% | IEEE Access 2024 |
+| Max-3 saliency | VGG16 / CIFAR-10 | 46.1% | 61.9% | 0.97% | IEEE Access 2024 |
 | Max-3 saliency | ResNet56 | 35.2% | 35.2% | <1% | IEEE Access 2024 |
 | CSD group regularization | VGG16 | 46.1% | 61.9% | 0.95% | IEEE Access 2024 |
 | Manhattan K-Means | VGG16 | 35.2% | 49.1% | 0.98% | IEEE Access 2024 |
@@ -357,68 +145,24 @@ and how much of the network is pruned, and will not be identical across runs.
 | `experiments/03` head redundancy | Distance scan plus K-Means head pruning (`prune_attention_heads`) verified in `--smoke` against a real HF BERT forward pass; full run needs a fine-tuned checkpoint |
 | `experiments/05` ordering | Scoring-perturbation mechanism verified; full accuracy-drop reproduction not yet run |
 
-That last column is deliberately explicit: the CNN numbers above are the
-published, real results. The Transformer-extension experiments are new
-infrastructure — correct and tested, but not yet run against real fine-tuned
-models. Don't claim results those runs haven't produced yet.
+The CNN numbers above are the published, peer-reviewed results. The
+Transformer experiments are tested infrastructure whose full runs are in
+progress; their results will be added here once produced.
 
-## Two-phase pruning: mask, then compress
+## Running the Transformer study
 
-The original design intent behind the old driver scripts (confirmed
-directly, not inferred) was: mask the weights being pruned during the
-schedule, and once it's done, build a compressed model by copying the
-unmasked (surviving) weights across. `prunelib.masking` implements exactly
-that, using `torch.nn.utils.prune.custom_from_mask` instead of the
-hand-rolled `BasePruningMethod` subclasses that caused the original bugs
-(see `GITHUB_AUDIT.md` section 11 and `LEGACY_PIPELINE_MIGRATION.md`):
+`experiments/research/` runs GLUE tasks × seeds × criteria × budgets,
+resumable on free Kaggle/Colab GPUs, and produces paired mean ± std tables
+and plots. See [`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md)
+and `notebooks/pruning_study_kaggle_colab.ipynb`.
 
-```python
-from prunelib import mask_channels, commit_mask, compress_masked_conv_bn, select_prune_indices, compute_score
+## Documentation
 
-# Phase 1, safe to call repeatedly across a fine-tuning schedule:
-scores = compute_score(conv.weight, method="max_k", k=3)
-mask_channels(conv, select_prune_indices(scores, n_to_prune))
-# ... fine-tune / evaluate with the mask active as many times as you like ...
-
-# Phase 2, once, when you're ready to commit:
-commit_mask(conv)
-new_conv, new_bn, new_next_conv, keep_idx = compress_masked_conv_bn(conv, bn=bn, next_conv=next_conv)
-```
-
-For a whole VGG16, `archive/legacy_pipeline` wraps this into a complete
-pipeline — see `LEGACY_PIPELINE_MIGRATION.md` for how to run it and exactly
-what it replaces.
-
-## Quantization
-
-`prunelib.quantization` implements the three post-training quantization
-methods from the thesis this repo is based on (Ch. 6.6) as a separate
-compression stage, applied *after* pruning:
-
-```python
-from prunelib import quantize_model_, quantize_int8_linear, dequantize_int8_linear, estimate_size_bytes
-
-# Float16 or Fixed-Point32: in-place, round-trips every floating-point
-# parameter through the target precision, cast back to float32
-# (module_types=prunelib.quantization.QUANTIZABLE_MODULE_TYPES for the thesis's Linear/Conv2d/BatchNorm scope).
-quantize_model_(pruned_model, method="float16")
-quantize_model_(pruned_model, method="fixed_point32", integer_bits=3, fractional_bits=28)
-
-# Linear INT8: per-tensor scale/zero-point, since realizing its actual
-# memory savings means storing int8 values plus that metadata, not a
-# same-shape float tensor you can substitute in place.
-q = quantize_int8_linear(conv.weight)
-approx_weight = dequantize_int8_linear(q)
-
-estimate_size_bytes(pruned_model, bits_per_param=16)  # compare precision options without writing a checkpoint per option
-```
-
-See `experiments/07_quantization.py` for the whole pipeline (`prune_model`
-then all three methods) end to end, and `KT.md` section 10.2 for the
-thesis's own numbers (Float16: 1.34% accuracy drop for half the memory;
-Fixed-Point32: 3.26%, markedly worse, since a fixed exponent can't adapt to
-a layer's actual weight distribution) — not yet reproduced against a real
-fine-tuned model in this codebase, only verified mechanically so far.
+- [`docs/USAGE.md`](docs/USAGE.md): full API guide with examples
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): design decisions and the invariants the tests pin
+- [`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md): producing publishable numbers
+- [`docs/KT.md`](docs/KT.md): maintainer handbook (module walkthrough, known gaps, thesis material)
+- [`docs/LEGACY_PIPELINE_MIGRATION.md`](docs/LEGACY_PIPELINE_MIGRATION.md): the archived end-to-end VGG16 pipeline
 
 ## Repository layout
 
@@ -473,13 +217,16 @@ notebooks/
     run_on_colab_kaggle.ipynb          CNN pipeline (tests, VGG prune/fine-tune) on Colab/Kaggle
     pruning_study_kaggle_colab.ipynb   the GLUE transformer study on Kaggle/Colab
 docs/
+    USAGE.md                    full API guide with examples
+    ARCHITECTURE.md             design decisions and the invariants tests pin
     RUNNING_EXPERIMENTS.md      step-by-step guide to producing publishable numbers
+    KT.md                       maintainer handbook: module walkthrough, known gaps
+    LEGACY_PIPELINE_MIGRATION.md  the archived VGG16 mask-then-compress pipeline
 archive/
-    legacy_pipeline/            corrected replacement for the six original
-        config.py, data.py, model.py,   driver scripts -- now redundant with
-        train.py, pipeline.py           pruning_framwork_v4, see
-                                         LEGACY_PIPELINE_MIGRATION.md
-tests/          191 core tests, each naming the defect or behavior it guards against
+    legacy_pipeline/            end-to-end VGG16 mask-then-compress pipeline,
+        config.py, data.py, model.py,   kept as a tested example (CNN pruning is
+        train.py, pipeline.py           maintained in pruning_framwork_v4)
+tests/          191 core tests, each naming the invariant or behavior it guards
     transformer/  199 tests for prunelib.transformer (BERT-shaped stub model, no HF needed)
 ```
 

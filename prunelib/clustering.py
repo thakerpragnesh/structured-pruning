@@ -4,9 +4,17 @@ K-Means clustering-based channel selection: group a layer's output channels
 cluster*, prune the channels with the smallest L1 norm and keep the
 strongest one as that cluster's representative.
 
-This is the selection rule behind the Manhattan/Euclidean/Cosine K-Means
-comparison in Thaker & Mohan, IEEE Access 2024 (Manhattan: 35.15% param /
-49.11% FLOPs reduction on VGG16 at <1% accuracy drop). The intuition: channels
+This follows the selection rule of the K-Means experiments in Thaker &
+Mohan, IEEE Access 2024 (both papers): K-Means with one cluster per channel
+to keep, and each cluster's highest-L1 channel kept. The second paper's
+Manhattan/Euclidean/Cosine comparison found Manhattan best (35.15% param /
+49.11% FLOPs reduction on VGG16 at a 0.98% accuracy drop).
+
+Not yet identical to the papers' setup: the papers L1-normalize each channel
+before clustering (Paper 2), or cluster a condensed per-kernel encoding
+(Paper 1, Eq. 1); this module clusters each channel's raw flattened weights,
+and uses each metric's own centroid rule (below). Its numbers are therefore
+not expected to reproduce the published ones exactly. The intuition: channels
 that land in the same cluster compute nearly the same feature, so all but
 one of them are redundant -- and among near-duplicates, the one with the
 largest L1 norm contributes the most, so it's the one worth keeping.

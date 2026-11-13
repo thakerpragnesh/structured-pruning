@@ -5,15 +5,10 @@ Reference implementation of the Max-k criterion from:
   Thaker & Mohan, "Channel Pruning of Transfer Learning Models Using Novel
   Techniques," IEEE Access, vol. 12, pp. 94914-94925, 2024.
 
-Design note (fixes a real bug found in the original pruning_framwork_v4 repo,
-tracked as D1 in GITHUB_AUDIT.md): that code computed the Max-3 score into one
-tensor (`channel_norm`) but selected channels to prune by comparing a *different*
-tensor (`channel_norm_temp`, which was never overwritten and still held the plain
-L1 norm). The score was computed, printed, and then silently ignored.
-
-Here there is exactly one function that produces a score, and exactly one
-function that selects indices from a score. Nothing else touches the tensor in
-between, so the two cannot drift apart the way they did before.
+Design note (invariant D1, docs/ARCHITECTURE.md): there is exactly one
+function that produces a score and exactly one that selects indices from a
+score, and nothing else touches the tensor in between. A caller therefore
+can't score with one tensor and select with another.
 
 Every scorer accepts any weight laid out `[out, in, *kernel]`: a Conv2d
 weight `[out_channels, in_channels, kh, kw]`, a Linear weight

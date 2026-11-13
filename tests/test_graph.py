@@ -678,7 +678,7 @@ def _prune_tiny_attention_block(module: TinyAttentionBlock, keep_heads: torch.Te
 
 
 def test_special_handler_prunes_attention_block_via_prune_attention_heads():
-    """`special_handlers` is the extension point KT.md calls out for
+    """`special_handlers` is the extension point docs/KT.md calls out for
     attention-block pruning: DependencyGraph can't work out Q/K/V/output
     rewiring on its own (that's the "much harder problem" its module
     docstring disclaims), but a registered handler can act on it as the

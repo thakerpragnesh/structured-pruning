@@ -3,7 +3,7 @@ Post-training quantization: precision-reduction methods applied to a
 model's weights, as a separate compression stage from pruning. Reference
 implementation of thesis Ch. 6.6 (Pragnesh Thaker's Ph.D. thesis, "Pruning
 and Quantization Techniques for Deep Neural Network Acceleration", NITK
-Surathkal, July 2025 -- see KT.md section 10.2, which is where this gap was
+Surathkal, July 2025 -- see docs/KT.md section 10.2, which is where this gap was
 first written down). None of this existed anywhere in `prunelib` before
 this module; `prunelib` covered pruning only.
 
@@ -59,7 +59,7 @@ QUANTIZABLE_MODULE_TYPES = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.BatchNorm1d
 # INT8 is deliberately *not* one of them -- `quantize_int8_linear` returns an
 # `Int8Tensor` struct, a different contract, so registering it here would
 # break `quantize_model_`'s uniform copy-back loop. Register new same-shape
-# methods (e.g. logarithmic quantization, KT.md section 10.2) with
+# methods (e.g. logarithmic quantization, docs/KT.md section 10.2) with
 # `register_quantization_method`.
 QUANTIZATION_METHODS: Registry = Registry("method")
 register_quantization_method = QUANTIZATION_METHODS.register

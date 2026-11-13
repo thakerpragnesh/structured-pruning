@@ -1,16 +1,13 @@
 """
 Two-phase pruning: mask first, compress second.
 
-This is the workflow the original codebase was trying to implement (score a
-channel, mask it, eventually copy the "unmasked" survivors into a smaller
-model) but never got working end to end -- see GITHUB_AUDIT.md section 11
-for the full list of what actually went wrong (a `layer_number` tracking
-variable that was supposed to tell each `compute_mask` callback which layer
-it was operating on, but the line that updated it was commented out in all
-six driver scripts; a mask-assignment line commented out in the one file
-that got furthest; etc).
+This is the workflow the earlier prototype scripts were designed around
+(score a channel, mask it, eventually copy the "unmasked" survivors into a
+smaller model). There, each `compute_mask` callback had to learn which layer
+it was on from a shared `layer_number` variable, which made the per-layer
+state easy to get out of sync.
 
-The root design flaw in the old approach was implementing masking via a
+The weakness of that approach was implementing masking via a
 subclass of `torch.nn.utils.prune.BasePruningMethod` whose `compute_mask`
 had to reconstruct, from scratch and from global state, a full mask for the
 whole tensor on every call. That's exactly the kind of place a bookkeeping

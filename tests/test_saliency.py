@@ -1,4 +1,4 @@
-"""Each test names the defect (from GITHUB_AUDIT.md) it would catch if reintroduced."""
+"""Each test names the invariant it pins (test_dN_... = invariant DN in docs/ARCHITECTURE.md)."""
 import pytest
 import torch
 
@@ -120,7 +120,7 @@ def test_2d_linear_weight_matches_equivalent_4d_conv_weight():
 def test_max_k_saliency_2d_degenerates_to_l1_regardless_of_k():
     """A Linear weight's "kernel" per input feature is a single element (no
     spatial extent), so k_eff = min(k, 1) = 1 for every input feature: max_k
-    on a 2D weight is exactly L1, for any k -- matching KT.md's prediction
+    on a 2D weight is exactly L1, for any k -- matching docs/KT.md's prediction
     that Max-k "degenerates sensibly to ... magnitude-based selection"."""
     torch.manual_seed(5)
     weight = torch.randn(6, 10)

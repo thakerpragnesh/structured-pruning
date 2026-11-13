@@ -4,7 +4,7 @@ selection rules, distance metrics, quantization methods, prunable layer
 types, the ops a prune passes through -- is extended from the caller's own code, and the extension then
 works through every entry point that dispatches on it, with no edit to the
 library. Before `registry.py`, each of these was a private dict or an
-if-chain inside the library (KT.md section 7 said "register it in
+if-chain inside the library (docs/KT.md section 7 said "register it in
 `_METHODS`"), so these tests had nothing public to exercise.
 """
 import inspect

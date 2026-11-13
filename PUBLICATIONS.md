@@ -11,9 +11,10 @@ DOI: [10.1109/ACCESS.2024.3416997](https://doi.org/10.1109/ACCESS.2024.3416997)
 
 Introduces the Max-3 saliency criterion (`prunelib.saliency.max_k_saliency`),
 compared against K-Means clustering and SVD on VGG16 and ResNet56 (CIFAR-10).
-Max-3: 46.19% param / 61.91% FLOPs reduction on VGG16, 35.15% on ResNet56,
-both under a 1% accuracy-drop threshold — ahead of K-Means (40.00%/49.20%)
-and SVD (20.07%/24.64%) on VGG16.
+Max-3: 46.14% param / 61.91% FLOPs reduction on VGG16 (Table 2, 0.97%
+accuracy drop) and 35.15% on ResNet56, both under a 1% accuracy-drop
+threshold — ahead of K-Means (40.00% param / 49.20% FLOPs on VGG16, Table 3)
+and SVD.
 
 ```bibtex
 @article{thaker2024channel,
@@ -125,9 +126,3 @@ Conference on Advances in Data-driven Computing and Intelligent Systems
   year      = {2022}
 }
 ```
-
-**Note on provenance:** if this RNN work is the code currently sitting in
-`DeepLearning/Major Project/G4 Sagar Ashis/Pruning_RNN` (Sagar Choudhury is a
-co-author here), it deserves its own properly-attributed repository rather
-than living inside a student-coursework folder. See `GITHUB_AUDIT.md`,
-section 9.

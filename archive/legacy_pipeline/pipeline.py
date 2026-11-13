@@ -9,8 +9,8 @@ build: mask the weakest channels during pruning (weights zeroed, nothing
 resized yet, safe to fine-tune against), and only once the whole pruning
 schedule is done, build one compressed model and copy the surviving
 ("unmasked") weights across. See `prunelib/masking.py` for the phase-1/
-phase-2 primitives and `LEGACY_PIPELINE_MIGRATION.md` for the full list of
-what was wrong with the originals and why.
+phase-2 primitives and `docs/LEGACY_PIPELINE_MIGRATION.md` for how it maps
+onto the original scripts.
 
 Why masking during the loop rather than resizing every iteration (an
 earlier, simpler version of this file did that, and it's still what
@@ -24,9 +24,8 @@ model has to be a valid standalone nn.Module (fine for VGG's simple
 Sequential, more awkward for architectures with skip connections).
 
 No `layer_number` global tracking "which layer is currently being pruned"
-for a `compute_mask` callback to read -- the bug shared by all six original
-driver scripts (GITHUB_AUDIT.md section 11). Here there's no such global to
-begin with: the loop below passes the layer position directly to
+for a `compute_mask` callback to read, as the original driver scripts had.
+Here there's no such global to begin with: the loop below passes the layer position directly to
 `mask_vgg_layer`.
 """
 from __future__ import annotations

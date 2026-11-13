@@ -5,7 +5,7 @@ in a few seconds on CPU.
 Prunes a small conv net with `prune_model` (generic, `DependencyGraph`-based
 pruning -- see `06_generic_pruning.py`), then applies each of the three
 post-training quantization methods from thesis Ch. 6.6 (`prunelib.quantization`,
-which closes the gap KT.md section 10.2 used to describe: quantization
+which closes the gap docs/KT.md section 10.2 used to describe: quantization
 wasn't implemented anywhere in this codebase) to the pruned model, and
 reports estimated size and the resulting change in output relative to the
 unquantized pruned model as a cheap proxy for "how much did precision loss

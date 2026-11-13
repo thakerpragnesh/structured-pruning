@@ -2,8 +2,9 @@
 
 **Since 2026-09-21, `legacy_pipeline/` lives at `archive/legacy_pipeline/`**
 (import as `archive.legacy_pipeline`, run as `python -m
-archive.legacy_pipeline.pipeline`) — see `README.md`'s "What's now redundant"
-for why. Everything below still describes the package itself accurately;
+archive.legacy_pipeline.pipeline`): CNN pruning with the full method set is
+maintained in `pruning_framwork_v4`, so this package is kept as a tested
+example rather than something to run instead. Everything below still describes the package itself accurately;
 only its location changed.
 
 `archive/legacy_pipeline/` replaces `channel_pruning_saliency.py`,
@@ -11,34 +12,28 @@ only its location changed.
 `vgg_channel_pruning_dist.py`, and the two never-finished kernel-level
 scripts (`kernel_pruning_saliency.py`, `vgg_kernel_pruning_saliency.py`).
 `kernel_pruning_similarites.py`'s scoring function
-(`compute_distance_score_kernel`) was one of the few genuinely correct
-functions in the old codebase, but kernel-level (as opposed to channel-level)
-structural surgery isn't implemented anywhere in this package yet — see
-"What's not covered" below.
+(`compute_distance_score_kernel`) carries over as-is in spirit, but
+kernel-level (as opposed to channel-level) structural surgery isn't
+implemented anywhere in this package yet — see "What's not covered" below.
 
-Full defect-by-defect detail on what was wrong with the originals is in
-`GITHUB_AUDIT.md`, sections 4, 5, and 11. This document is about what
-replaced it and why, and how to move a workflow from the old scripts to the
-new package.
+This document is about what replaced the original scripts and why, and how
+to move a workflow from them to the new package.
 
-## The design change, not just the bug fixes
+## The design change
 
-The original scripts' intent — confirmed directly, not inferred — was:
+The original scripts' intent was:
 **during pruning, mask the weights being pruned; once the whole pruning
 schedule is finished, build a compressed model and copy the unmasked
-(surviving) weights across from the original.** That's a real, sound
-two-phase design. It just never worked, because of the specific bugs listed
-in `GITHUB_AUDIT.md` section 11: masking used a hand-written
-`torch.nn.utils.prune.BasePruningMethod` subclass whose `compute_mask` had
-to reconstruct the correct mask from scratch on every call using a global
-`layer_number` that was supposed to track which layer was active — and the
-line that updated it was commented out in all six scripts, so it silently
-stayed 0 forever.
+(surviving) weights across from the original.** That's a sound two-phase
+design. The scripts implemented masking with a hand-written
+`torch.nn.utils.prune.BasePruningMethod` subclass whose `compute_mask`
+reconstructed the mask on every call from a global `layer_number` that
+tracked which layer was active, which makes the per-layer state easy to
+get out of sync.
 
-`legacy_pipeline` implements the same two-phase design the original scripts
-were reaching for, using `torch.nn.utils.prune.custom_from_mask` (the
-current, stable PyTorch API for applying a precomputed mask) instead of a
-`BasePruningMethod` subclass:
+`legacy_pipeline` implements the same two-phase design using
+`torch.nn.utils.prune.custom_from_mask` (the current, stable PyTorch API
+for applying a precomputed mask) instead of a `BasePruningMethod` subclass:
 
 **Phase 1 — mask** (`prunelib.mask_vgg_layer`, called once per layer per
 iteration from `legacy_pipeline.pipeline.run_pruning`): compute a saliency
@@ -79,12 +74,12 @@ masks approximately `prune_step * n_channels_original` *new* channels.
 is the regression test for this; without the fix it fails by showing the
 second and third calls masking far fewer channels than the first.
 
-## Other corrections along the way
+## Other changes along the way
 
-| Original file | Problem | Fix |
+| Original file | Original behaviour | Here |
 |---|---|---|
-| `train_model.py::evaluate()` | D14: reassigned `outputs` inside the batch loop instead of accumulating — reported only the last batch | `archive/legacy_pipeline/train.py::evaluate()` accumulates loss/correct/sample counts across the whole loader, divides once at the end |
-| `train_model.py::fit_one_cycle()` | D15: called `evaluate()` once per training batch, not once per epoch | `archive/legacy_pipeline/train.py::fit_one_cycle()` evaluates once, after the epoch's training loop |
+| `train_model.py::evaluate()` | Reassigned `outputs` inside the batch loop instead of accumulating — reported only the last batch | `archive/legacy_pipeline/train.py::evaluate()` accumulates loss/correct/sample counts across the whole loader, divides once at the end |
+| `train_model.py::fit_one_cycle()` | Called `evaluate()` once per training batch, not once per epoch | `archive/legacy_pipeline/train.py::fit_one_cycle()` evaluates once, after the epoch's training loop |
 | `train_model.py`'s L1 term | `sum(nn.L1Loss()(param, zeros) for param in model.parameters())` averages *within* each parameter tensor before summing across tensors — implicitly weights a small bias vector the same as a huge weight matrix | `archive/legacy_pipeline/train.py::_l1_penalty()` sums raw magnitudes globally |
 | `load_model.py::freeze()` | Hardcoded a parameter *index* ("if count == 30") correct for exactly one `num_classes` value | `archive/legacy_pipeline/model.py::freeze_all_but_classifier()` freezes everything except `model.classifier` directly — can't drift out of sync with the architecture |
 | `load_dataset.py::data_loader_eval()` | One of its two transform pipelines used `transforms.CenterCrop` as a class, not an instance (`transforms.CenterCrop` instead of `transforms.CenterCrop(224)`) — silently wrong preprocessing, not an error, since `Compose` just calls whatever's handed to it | `archive/legacy_pipeline/data.py` has exactly one `_eval_transform()` builder used everywhere eval-style preprocessing is needed |
@@ -123,8 +118,8 @@ smaller model.
 
 - **Kernel-level pruning** (as opposed to channel-level) isn't implemented
   in `prunelib` or `archive/legacy_pipeline` at all. The original
-  `kernel_pruning_saliency.py` / `vgg_kernel_pruning_saliency.py` never got
-  past a placeholder (`GITHUB_AUDIT.md` section 11), and
+  `kernel_pruning_saliency.py` / `vgg_kernel_pruning_saliency.py` were
+  placeholders, and
   `kernel_pruning_similarites.py`'s scoring function
   (`compute_distance_score_kernel`) is correct but has no counterpart here.
   If this is needed, `prunelib.masking`'s primitives (`mask_channels`,

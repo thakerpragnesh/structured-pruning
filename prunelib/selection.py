@@ -16,7 +16,7 @@ Two kinds of rule, behind one entry point (`select_prune_indices_by_method`):
   ascending. `clustering.py` registers `"kmeans"` there (whether a channel
   is pruned depends on which others it clusters with). This module never
   imports `clustering`: plugins depend on the abstraction, not the other way
-  round, so a new cluster-based rule (KT.md section 7) is a
+  round, so a new cluster-based rule (docs/KT.md section 7) is a
   `register_selection_method` call, not an edit here.
 
 A callable can be passed as `method=` directly too, with the selector
@@ -126,7 +126,7 @@ def select_prune_indices_among(
     Iterative masking needs this for correctness: an already-masked
     channel's weight is zero, the lowest score under every criterion, so
     selecting over all channels would pick it again every iteration and the
-    schedule would advance far slower than its budget (KT.md section 3).
+    schedule would advance far slower than its budget (docs/ARCHITECTURE.md).
     Pass the unmasked channels (`masking.surviving_channels`) as
     `candidates`. This used to live inside `vgg.mask_vgg_layer`, out of
     reach of any other masking loop."""

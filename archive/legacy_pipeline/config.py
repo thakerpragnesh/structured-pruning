@@ -7,7 +7,7 @@ global mutable state (`dataset_dir`, `logDir`, `layer_number`, `st`, `en`,
 original driver scripts. One dataclass, constructed once, passed explicitly
 to the functions that need it -- no module-level globals for another
 function to forget to update (that's what caused the `layer_number` bug:
-see LEGACY_PIPELINE_MIGRATION.md).
+see docs/LEGACY_PIPELINE_MIGRATION.md).
 """
 from __future__ import annotations
 

@@ -11,7 +11,7 @@ drop, on CIFAR-10.
 `build_vgg16` and `prune_vgg_layer` live in `prunelib.vgg` -- shared with
 `archive/legacy_pipeline/pipeline.py`, the corrected replacement for the old
 `channel_pruning_saliency.py` / `channel_pruning_distance.py` drivers. See
-`LEGACY_PIPELINE_MIGRATION.md` for why that pipeline is a rebuild rather than
+`docs/LEGACY_PIPELINE_MIGRATION.md` for why that pipeline is a rebuild rather than
 a line-by-line bug fix of the original.
 """
 import argparse
